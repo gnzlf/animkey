@@ -1,0 +1,21 @@
+# Python / Maya runtime artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary/log files
+*.log
+*.tmp
+*.bak
+
