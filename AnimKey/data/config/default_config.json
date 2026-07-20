@@ -1,0 +1,20 @@
+{
+    "theme": "maya_classic",
+    "toolbar_icon_size": 28,
+    "toolbar_height": 38,
+    "show_tooltips": true,
+    "show_labels": false,
+    "tween_slider_width": 140,
+    "blend_slider_width": 160,
+    "curve_slider_width": 140,
+    "auto_key": false,
+    "use_animation_layers": true,
+    "remember_last_selection": true,
+    "window_opacity": 1.0,
+    "always_on_top": false,
+    "custom_graph_enabled": true,
+    "custom_graph_auto_load": true,
+    "hotkeys_enabled": true,
+    "debug_mode": false,
+    "check_updates": true
+}
