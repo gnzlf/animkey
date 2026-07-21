@@ -21,6 +21,15 @@ except ImportError:
     from PySide6 import QtWidgets, QtCore, QtGui
     from shiboken6 import wrapInstance
 
+from AnimKey.core.animation_offset_session import (
+    ANIMATION_OFFSET_ENGINE_REVISION,
+    OffsetSession,
+    get_active_session,
+    get_selected_animation_layer as _session_selected_animation_layer,
+    has_active_session,
+)
+from AnimKey.core.animation_offset_math import time_slider_range_to_inclusive
+
 
 # Global state for animation offset
 _anim_offset_active = False
@@ -1258,12 +1267,12 @@ def _round_frame(value):
 
 
 def _normalize_inclusive_time_range(time_range):
-    """Return an inclusive whole-frame [start, end] range."""
-    start = _round_frame(time_range[0])
-    end = _round_frame(time_range[1])
+    """Return an ordered inclusive [start, end] range."""
+    start = float(time_range[0])
+    end = float(time_range[1])
     if end < start:
         start, end = end, start
-    return [float(start), float(end)]
+    return [start, end]
 
 
 def _normalize_time_slider_range(time_range):
@@ -1273,12 +1282,8 @@ def _normalize_time_slider_range(time_range):
     The time slider stores the right edge of a dragged range, so selecting
     frames 10-20 usually comes back as [10, 21]. Internally we use [10, 20].
     """
-    start = _round_frame(time_range[0])
-    end_edge = _round_frame(time_range[1])
-    end = end_edge - 1
-    if end < start:
-        end = start
-    return [float(start), float(end)]
+    start, end = time_slider_range_to_inclusive(time_range)
+    return [start, end]
 
 
 def _time_slider_range_from_inclusive(time_range):
@@ -1734,6 +1739,11 @@ def apply_slider_offset_changes(changes):
     preview. Passing the slider's original/final values here lets the offset
     use that new key as the protected anchor immediately.
     """
+    session = get_active_session()
+    if session is None:
+        return False
+    return session.apply_slider_changes(changes)
+
     global _chunk_is_open, _prev_tick_snapshot, _prev_tick_time
 
     if not _anim_offset_active or not _anim_offset_run_timer:
@@ -1926,6 +1936,14 @@ def adjust_keyframes(scan_changed_keys=False):
     Long DAG paths avoid duplicate-reference ambiguity, and relative key edits
     preserve animCurve tangents better than rebuilding keys with setKeyframe.
     """
+    session = get_active_session()
+    if session is None:
+        return False
+    return session.commit_dirty(
+        reason="legacy_adjust",
+        scan_changed_keys=bool(scan_changed_keys),
+    )
+
     global _animation_offset_original_values, _anim_offset_time_range
     global _anim_offset_original_selection, _anim_offset_diff_cache
     global _anim_offset_frozen_baseline, _anim_offset_activation_values
@@ -2140,6 +2158,10 @@ def offset_animation_deferred(interval, generation):
     Execute keyframe adjustment in a separate thread with specific interval.
     This allows offset to update continuously while user moves the object.
     """
+    # Legacy entry point. Engine revision 2 is event-driven and has no polling
+    # thread, so direct external calls should do nothing.
+    return
+
     global _anim_offset_run_timer
     
     def adjust_offset_animation():
@@ -2160,6 +2182,163 @@ def offset_animation_deferred(interval, generation):
                 utils.executeDeferred(adjust_offset_animation)
             except:
                 adjust_offset_animation()
+
+
+def _selected_offset_time_range():
+    """Return the inclusive Animation Offset range from Maya's time slider."""
+    try:
+        aTimeSlider = mel.eval('$tmpVar=$gPlayBackSlider')
+        time_range = cmds.timeControl(aTimeSlider, q=True, rangeArray=True)
+        range_visible = cmds.timeControl(
+            aTimeSlider,
+            q=True,
+            rangeVisible=True,
+        )
+    except Exception:
+        time_range = None
+        range_visible = None
+
+    if not time_range:
+        return _normalize_inclusive_time_range([
+            cmds.playbackOptions(q=True, minTime=True),
+            cmds.playbackOptions(q=True, maxTime=True),
+        ])
+
+    if range_visible is False:
+        return _normalize_inclusive_time_range([
+            cmds.playbackOptions(q=True, minTime=True),
+            cmds.playbackOptions(q=True, maxTime=True),
+        ])
+    if range_visible is None and abs(float(time_range[1]) - float(time_range[0])) <= 1.0001:
+        return _normalize_inclusive_time_range([
+            cmds.playbackOptions(q=True, minTime=True),
+            cmds.playbackOptions(q=True, maxTime=True),
+        ])
+    return _normalize_time_slider_range(time_range)
+
+
+def _clear_legacy_offset_state():
+    """Clear globals kept for compatibility with older AnimKey call-sites."""
+    global _anim_offset_active, _anim_offset_thread, _anim_offset_run_timer
+    global _animation_offset_original_values, _anim_offset_time_range
+    global _anim_offset_original_selection, _anim_offset_diff_cache
+    global _anim_offset_frozen_baseline, _anim_offset_activation_values
+    global _anim_offset_evaluated_baseline
+    global _prev_tick_time, _anim_offset_syncing_time
+    global _anim_offset_flush_scheduled
+    global _anim_offset_applying_offset
+    global _anim_offset_target_layer, _anim_offset_target_curve_cache
+    global _chunk_is_open
+
+    _anim_offset_active = False
+    _anim_offset_run_timer = False
+    _anim_offset_thread = None
+    _animation_offset_original_values.clear()
+    _anim_offset_frozen_baseline.clear()
+    _anim_offset_activation_values.clear()
+    _anim_offset_evaluated_baseline.clear()
+    _anim_offset_time_range = None
+    _anim_offset_original_selection = []
+    _anim_offset_diff_cache.clear()
+    _prev_tick_snapshot.clear()
+    _anim_offset_live_values.clear()
+    _prev_tick_time = None
+    _anim_offset_syncing_time = False
+    _anim_offset_flush_scheduled = False
+    _anim_offset_applying_offset = False
+    _anim_offset_target_layer = None
+    _anim_offset_target_curve_cache.clear()
+    _chunk_is_open = False
+
+
+def _tracked_objects_from_session(session):
+    seen = set()
+    objects = []
+    for track in session.tracks.values():
+        if track.node_path in seen:
+            continue
+        seen.add(track.node_path)
+        objects.append(track.node_path)
+    return objects
+
+
+def _execute_session_v2(button=None):
+    """Toggle the event-driven Animation Offset engine."""
+    global _anim_offset_active, _anim_offset_run_timer
+    global _anim_offset_button_ref, _anim_offset_time_range
+    global _anim_offset_original_selection, _anim_offset_target_layer
+
+    if button is not None:
+        _anim_offset_button_ref = button
+    active_button = button if button is not None else _anim_offset_button_ref
+
+    session = get_active_session()
+    if session is not None:
+        session.stop(commit=True)
+        _stop_offset_key_nav_filter()
+        _stop_offset_time_job()
+        _stop_offset_undo_jobs()
+        _stop_offset_attr_jobs()
+        hide_anim_offset_timeline_bar()
+        _clear_legacy_offset_state()
+        set_button_active(active_button, False)
+        _anim_offset_button_ref = None
+        return
+
+    selection = _selected_objects_long()
+    if not selection:
+        cmds.warning("AnimKey: Please select at least one object.")
+        return
+
+    has_keyframes = False
+    for obj in selection:
+        try:
+            if cmds.objExists(obj) and cmds.keyframe(obj, query=True):
+                has_keyframes = True
+                break
+        except Exception:
+            continue
+
+    if not has_keyframes:
+        cmds.warning("AnimKey: Selected objects do not have any keyframes.")
+        return
+
+    _stop_offset_key_nav_filter()
+    _stop_offset_time_job()
+    _stop_offset_undo_jobs()
+    _stop_offset_attr_jobs()
+    _clear_legacy_offset_state()
+
+    time_range = _selected_offset_time_range()
+    target_layer = _session_selected_animation_layer()
+    new_session = OffsetSession()
+
+    try:
+        new_session.start(selection, time_range, target_layer=target_layer)
+    except RuntimeError:
+        if _has_any_animation_layers():
+            cmds.warning(
+                "AnimKey: Selected objects have no keyframes on the active "
+                "animation layer ({0}) within the selected time range."
+                .format(target_layer or "BaseAnimation")
+            )
+        else:
+            cmds.warning("AnimKey: No keyframes found in the selected time range.")
+        set_button_active(active_button, False)
+        return
+    except Exception as exc:
+        cmds.warning("AnimKey: Animation Offset could not start: {0}".format(exc))
+        set_button_active(active_button, False)
+        return
+
+    _anim_offset_active = True
+    _anim_offset_run_timer = True
+    _anim_offset_time_range = list(new_session.time_range)
+    _anim_offset_target_layer = target_layer
+    _anim_offset_original_selection = _tracked_objects_from_session(new_session)
+
+    show_anim_offset_timeline_bar()
+    set_button_active(active_button, True)
 
 
 def execute(*args, button=None):
@@ -2186,6 +2365,8 @@ def execute(*args, button=None):
     global _anim_offset_applying_offset
     global _anim_offset_generation
     global _anim_offset_target_layer, _anim_offset_target_curve_cache
+
+    return _execute_session_v2(button=button)
 
     # FIX 1: Update the stored button reference whenever a real widget is given.
     # This keeps the reference current even if the toolbar is rebuilt.
@@ -2339,7 +2520,7 @@ def execute(*args, button=None):
 
 def is_active():
     """Check if animation offset is currently active"""
-    return _anim_offset_active
+    return has_active_session()
 
 
 def has_active_offset():
@@ -2349,7 +2530,7 @@ def has_active_offset():
     Returns:
         bool: True if animation offset is active, False otherwise
     """
-    return _anim_offset_active
+    return has_active_session()
 
 
 def set_button_active(button, is_active):
