@@ -823,19 +823,29 @@ class SetButton(QtWidgets.QFrame):
         self.label = QtWidgets.QLabel(self.set_name)
         self.label.setAlignment(QtCore.Qt.AlignCenter)
         self.label.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
-        layout.addWidget(self.label)
+        layout.addWidget(self.label, 1)
+
+        self.visibility_btn = QtWidgets.QToolButton(self)
+        self.visibility_btn.setAutoRaise(True)
+        self.visibility_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.visibility_btn.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.visibility_btn.setFixedSize(20, 20)
+        self.visibility_btn.setIconSize(QtCore.QSize(16, 16))
+        self.visibility_btn.clicked.connect(self.do_toggle_visibility)
+        layout.addWidget(self.visibility_btn)
 
         self.resize_grip = ButtonResizeGrip(self)
         self.resize_grip.hide()
         
         self.apply_style()
         self.update_size()
+        self._update_visibility_button()
         self.update_tooltip()
 
     def _default_size_for_scale(self, scale=None):
         scale = self.size_scale if scale is None else float(scale or 1.0)
         fm = self.fontMetrics()
-        w = fm.horizontalAdvance(self.set_name) + 24
+        w = fm.horizontalAdvance(self.set_name) + 44
         return QtCore.QSize(
             int(max(SET_BUTTON_MIN_WIDTH, w) * scale),
             int(max(26, SET_BUTTON_MIN_HEIGHT) * scale)
@@ -843,7 +853,7 @@ class SetButton(QtWidgets.QFrame):
 
     def _row_size(self):
         fm = self.fontMetrics()
-        width = max(SET_BUTTON_MIN_WIDTH, fm.horizontalAdvance(self.set_name) + 24)
+        width = max(SET_BUTTON_MIN_WIDTH, fm.horizontalAdvance(self.set_name) + 44)
         return QtCore.QSize(int(width), max(26, SET_BUTTON_MIN_HEIGHT))
 
     def _size_from_data(self, data):
@@ -947,6 +957,15 @@ class SetButton(QtWidgets.QFrame):
                 font-size: {font_size}px;
                 font-weight: 500;
                 background: transparent;
+            }}
+            QToolButton {{
+                background: transparent;
+                border: none;
+                border-radius: 3px;
+                padding: 1px;
+            }}
+            QToolButton:hover {{
+                background: rgba(255, 255, 255, 45);
             }}
         """)
         
@@ -1068,6 +1087,15 @@ class SetButton(QtWidgets.QFrame):
                     seen.add(full_name)
         return resolved
 
+    def _resolved_members_for_action(self):
+        resolved = self.get_resolved_members()
+        if resolved or not self._uses_dynamic_namespace():
+            return resolved
+
+        # A dynamic target may not contain matching controls. In that case the
+        # set must remain usable on the rig, prop, or geometry it was made from.
+        return self._resolve_static_members()
+
     def get_resolved_domains(self):
         return {
             scene_item_domain(member)
@@ -1115,8 +1143,8 @@ class SetButton(QtWidgets.QFrame):
         """)
         
         m.addAction("Select", self.do_select)
-        m.addAction("Hide Set Members", self.do_hide_members)
-        m.addAction("Show Set Members", self.do_show_members)
+        m.addAction("Hide Members", self.do_hide_members)
+        m.addAction("Show Members", self.do_show_members)
         m.addAction("Add Selection to Set", self.do_add_sel)
         m.addAction("Remove Selection from Set", self.do_rem_sel)
         m.addSeparator()
@@ -1285,13 +1313,8 @@ class SetButton(QtWidgets.QFrame):
                     self._was_dragged = False
                     e.accept()
                     return
-            mods = QtWidgets.QApplication.keyboardModifiers()
-            if mods == QtCore.Qt.ShiftModifier:
-                self.do_add()
-            elif mods == QtCore.Qt.ControlModifier:
-                self.do_toggle()
-            else:
-                self.do_select()
+            mods = e.modifiers() if hasattr(e, "modifiers") else QtWidgets.QApplication.keyboardModifiers()
+            self._dispatch_selection_action(mods)
         self._drag_pos = None
         self._drag_start_global = None
         super(SetButton, self).mouseReleaseEvent(e)
@@ -1315,9 +1338,17 @@ class SetButton(QtWidgets.QFrame):
         drag.setPixmap(self.grab())
         drag.setHotSpot(QtCore.QPoint(self.width()//2, self.height()//2))
         drag.exec_(QtCore.Qt.MoveAction)
+
+    def _dispatch_selection_action(self, modifiers):
+        if modifiers & QtCore.Qt.ShiftModifier:
+            self.do_add()
+        elif modifiers & QtCore.Qt.ControlModifier:
+            self.do_toggle()
+        else:
+            self.do_select()
         
     def do_select(self):
-        v = self.get_resolved_members()
+        v = self._resolved_members_for_action()
         if v:
             target_domains = {
                 scene_item_domain(member)
@@ -1341,15 +1372,57 @@ class SetButton(QtWidgets.QFrame):
             cmds.warning(f"No valid objects found")
         
     def do_add(self):
-        v = self.get_resolved_members()
-        if v: cmds.select(v, add=True)
+        v = self._resolved_members_for_action()
+        if v:
+            cmds.select(v, add=True)
+        else:
+            cmds.warning("No valid objects found")
         
     def do_toggle(self):
-        v = self.get_resolved_members()
-        if v: cmds.select(v, tgl=True)
+        v = self._resolved_members_for_action()
+        if v:
+            cmds.select(v, tgl=True)
+        else:
+            cmds.warning("No valid objects found")
 
-    def _set_members_hidden(self, hidden):
-        members = self.get_resolved_members()
+    def _component_is_hidden(self, member):
+        try:
+            assigned_sets = cmds.listSets(object=member) or []
+        except Exception:
+            assigned_sets = []
+        return any("Hidden" in node_set for node_set in assigned_sets)
+
+    def _members_are_hidden(self, members):
+        states = []
+        for member in members:
+            node, component = split_member_component(member)
+            if component:
+                states.append(self._component_is_hidden(member))
+                continue
+            try:
+                states.append(not bool(cmds.getAttr(node + ".visibility")))
+            except Exception:
+                states.append(False)
+        return bool(states) and all(states)
+
+    def _update_visibility_button(self, hidden=None):
+        if not hasattr(self, "visibility_btn"):
+            return
+        if hidden is None:
+            hidden = self._members_are_hidden(self._resolved_members_for_action())
+        icon_name = ":/over_show.png" if hidden else ":/over_hide.png"
+        self.visibility_btn.setIcon(QtGui.QIcon(icon_name))
+        self.visibility_btn.setToolTip("Show set members" if hidden else "Hide set members")
+
+    def do_toggle_visibility(self):
+        members = self._resolved_members_for_action()
+        if not members:
+            cmds.warning("No valid set members found.")
+            return
+        self._set_members_hidden(not self._members_are_hidden(members), members=members)
+
+    def _set_members_hidden(self, hidden, members=None):
+        members = members or self._resolved_members_for_action()
         if not members:
             cmds.warning("No valid set members found.")
             return
@@ -1363,6 +1436,7 @@ class SetButton(QtWidgets.QFrame):
             cmds.warning("Could not update set visibility: {}".format(exc))
         finally:
             cmds.undoInfo(closeChunk=True)
+        self._update_visibility_button(hidden)
 
     def do_hide_members(self):
         self._set_members_hidden(True)

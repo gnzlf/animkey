@@ -1,9 +1,9 @@
 import unittest
 
 try:
-    from PySide2 import QtWidgets
+    from PySide2 import QtCore, QtWidgets
 except ImportError:
-    from PySide6 import QtWidgets
+    from PySide6 import QtCore, QtWidgets
 
 _APP = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
@@ -98,6 +98,37 @@ class SelectionSetNamespaceTests(unittest.TestCase):
         self.assertEqual(
             set(button.get_resolved_members()),
             set(cmds.ls([source, target], long=True)),
+        )
+
+    def test_dynamic_shift_add_falls_back_to_the_sets_saved_rig(self):
+        self._namespace("rigA")
+        self._namespace("propB")
+        selected_rig = cmds.createNode("transform", name="rigA:body_CTRL")
+        prop = cmds.createNode("transform", name="propB:prop_CTRL")
+        prop_set = self._button("Prop", [prop], dynamic=True, targets=["rigA"])
+
+        cmds.select(selected_rig, replace=True)
+        prop_set.do_add()
+
+        self.assertEqual(
+            self._selected(),
+            set(cmds.ls([selected_rig, prop], long=True)),
+        )
+
+    def test_shift_with_an_additional_modifier_still_adds_the_second_set(self):
+        self._namespace("rigA")
+        self._namespace("rigB")
+        first = cmds.createNode("transform", name="rigA:first_CTRL")
+        second = cmds.createNode("transform", name="rigB:second_CTRL")
+        second_set = self._button("Second", [second])
+
+        cmds.select(first, replace=True)
+        modifiers = QtCore.Qt.ShiftModifier | QtCore.Qt.KeypadModifier
+        second_set._dispatch_selection_action(modifiers)
+
+        self.assertEqual(
+            self._selected(),
+            set(cmds.ls([first, second], long=True)),
         )
 
     def test_one_locked_set_can_contain_rig_and_prop_namespaces(self):
@@ -210,7 +241,7 @@ class SelectionSetNamespaceTests(unittest.TestCase):
         face_range = geometry + ".f[0:2]"
         face_set = self._button("Arm Faces", [face_range])
 
-        face_set.do_hide_members()
+        face_set.do_toggle_visibility()
         hidden_sets = [
             node
             for node in (cmds.ls(type="objectSet") or [])
@@ -222,12 +253,28 @@ class SelectionSetNamespaceTests(unittest.TestCase):
             hidden_members.extend(cmds.sets(hidden_set, query=True) or [])
         self.assertTrue(any("f[0:2]" in member for member in hidden_members))
 
-        face_set.do_show_members()
+        self.assertEqual(face_set.visibility_btn.toolTip(), "Show set members")
+
+        face_set.do_toggle_visibility()
         remaining_members = []
         for hidden_set in cmds.ls(type="objectSet") or []:
             if "HiddenFacesSet" in hidden_set:
                 remaining_members.extend(cmds.sets(hidden_set, query=True) or [])
         self.assertFalse(any("f[0:2]" in member for member in remaining_members))
+        self.assertEqual(face_set.visibility_btn.toolTip(), "Hide set members")
+
+    def test_visibility_button_toggles_geometry(self):
+        geometry = cmds.polyCube(name="bodyGeo")[0]
+        geometry_set = self._button("Body", [geometry])
+        self.assertFalse(geometry_set.visibility_btn.icon().isNull())
+
+        geometry_set.do_toggle_visibility()
+        self.assertFalse(cmds.getAttr(geometry + ".visibility"))
+        self.assertEqual(geometry_set.visibility_btn.toolTip(), "Show set members")
+
+        geometry_set.do_toggle_visibility()
+        self.assertTrue(cmds.getAttr(geometry + ".visibility"))
+        self.assertEqual(geometry_set.visibility_btn.toolTip(), "Hide set members")
 
 
 if __name__ == "__main__":
