@@ -244,6 +244,161 @@ def unique_namespaces_from_member_map(member_namespaces):
     return namespaces
 
 
+def split_member_component(item):
+    """Return (node, component suffix) for DAG objects and components."""
+    item = str(item or "")
+    component_index = item.find(".")
+    if component_index < 0:
+        return item, ""
+    return item[:component_index], item[component_index:]
+
+
+def member_template(item):
+    """Return a namespace-free leaf name while preserving component ranges."""
+    node, component = split_member_component(item)
+    short_node = node.split("|")[-1]
+    return "{}{}".format(strip_namespace(short_node), component)
+
+
+def _node_uuid(node):
+    try:
+        values = cmds.ls(node, uuid=True) or []
+    except Exception:
+        values = []
+    if not values:
+        return ""
+    return str(values[0]).split(".", 1)[0]
+
+
+def _long_member(item):
+    try:
+        matches = cmds.ls(item, long=True) or []
+    except Exception:
+        matches = []
+    return matches[0] if len(matches) == 1 else ""
+
+
+def _binding_kind(component):
+    if component.startswith(".f["):
+        return "face"
+    if component:
+        return "component"
+    return "object"
+
+
+def make_member_binding(item):
+    """Capture a stable identity plus a reusable namespace template."""
+    resolved = _long_member(item) or str(item or "")
+    node, component = split_member_component(resolved)
+    short_node = node.split("|")[-1]
+    return {
+        "member": "{}{}".format(strip_namespace(short_node), component),
+        "namespace": get_namespace(short_node),
+        "uuid": _node_uuid(node),
+        "path": node,
+        "component": component,
+        "kind": _binding_kind(component),
+    }
+
+
+def normalize_member_binding(binding):
+    if not isinstance(binding, dict):
+        return None
+    path = str(binding.get("path") or "")
+    component = str(binding.get("component") or "")
+    member = str(binding.get("member") or "")
+    if not member and path:
+        member = member_template(path + component)
+    if not component:
+        _member_node, component = split_member_component(member)
+    member = member_template(member)
+    if not member:
+        return None
+    namespace = str(binding.get("namespace") or "")
+    return {
+        "member": member,
+        "namespace": namespace,
+        "uuid": str(binding.get("uuid") or "").split(".", 1)[0],
+        "path": path,
+        "component": component,
+        "kind": str(binding.get("kind") or _binding_kind(component)),
+    }
+
+
+def binding_identity(binding):
+    uuid_value = binding.get("uuid") or ""
+    component = binding.get("component") or ""
+    if uuid_value:
+        return "uuid:{}{}".format(uuid_value, component)
+    return "name:{}:{}".format(
+        binding.get("namespace") or "",
+        binding.get("member") or "",
+    )
+
+
+def _resolve_uuid_member(binding):
+    uuid_value = binding.get("uuid") or ""
+    if not uuid_value:
+        return ""
+    try:
+        matches = cmds.ls(uuid_value, long=True) or []
+    except Exception:
+        matches = []
+    if len(matches) != 1:
+        return ""
+    candidate = matches[0] + (binding.get("component") or "")
+    return candidate if cmds.objExists(candidate) else ""
+
+
+def _resolve_named_member(template, namespace):
+    candidate = apply_namespace(template, namespace or "")
+    try:
+        matches = cmds.ls(candidate, long=True) or []
+    except Exception:
+        matches = []
+    if len(matches) == 1 and cmds.objExists(matches[0]):
+        return matches[0]
+    return ""
+
+
+def resolve_static_binding(binding):
+    """Resolve a pinned member; namespace-less members never jump objects."""
+    resolved = _resolve_uuid_member(binding)
+    if resolved:
+        return resolved
+
+    namespace = binding.get("namespace") or ""
+    if not namespace:
+        return ""
+
+    path = binding.get("path") or ""
+    component = binding.get("component") or ""
+    if path:
+        candidate = path + component
+        if cmds.objExists(candidate):
+            return _long_member(candidate) or candidate
+
+    return _resolve_named_member(binding.get("member") or "", namespace)
+
+
+def scene_item_domain(item):
+    """Group selection by namespace, or by top DAG root without namespaces."""
+    node, _component = split_member_component(item)
+    short_node = node.split("|")[-1]
+    namespace = get_namespace(short_node)
+    if namespace:
+        return "namespace:{}".format(namespace)
+
+    long_node = _long_member(node) or node
+    if long_node.startswith("|"):
+        parts = [part for part in long_node.split("|") if part]
+        root = "|{}".format(parts[0]) if parts else long_node
+    else:
+        root = long_node
+    root_uuid = _node_uuid(root)
+    return "root:{}".format(root_uuid or root)
+
+
 # ============================================================================
 # CUSTOM TITLE BAR
 # ============================================================================
@@ -521,33 +676,69 @@ class SetButton(QtWidgets.QFrame):
         self, name, members, color=DEFAULT_COLOR, get_namespace_func=None,
         get_namespaces_func=None, board_pos=None, namespaces=None, size_scale=1.0,
         board_size=None, namespace_mode="page", member_namespaces=None,
-        namespace_dynamic_func=None
+        namespace_dynamic_func=None, member_bindings=None
     ):
         super(SetButton, self).__init__()
         self.set_name = name
         self.members = []
         self.member_namespaces = {}
+        self.member_bindings = []
         saved_member_namespaces = member_namespaces if isinstance(member_namespaces, dict) else {}
-        for member in members:
-            short_name = member.split('|')[-1]
-            base = strip_namespace(short_name)
-            if base not in self.members:
-                self.members.append(base)
-            ns = get_namespace(short_name)
-            if ns:
-                self.member_namespaces.setdefault(base, [])
-                if ns not in self.member_namespaces[base]:
-                    self.member_namespaces[base].append(ns)
+        saved_bindings = member_bindings if isinstance(member_bindings, list) else []
+        for binding in saved_bindings:
+            self._add_member_binding(binding)
 
-        for base, ns_list in saved_member_namespaces.items():
-            base = strip_namespace(str(base).split('|')[-1])
-            if base not in self.members:
-                self.members.append(base)
-            self.member_namespaces.setdefault(base, [])
-            for ns in ns_list or []:
-                ns = ns or ""
-                if ns not in self.member_namespaces[base]:
-                    self.member_namespaces[base].append(ns)
+        for raw_member in members or []:
+            template = member_template(raw_member)
+            explicit_namespace = get_namespace(split_member_component(raw_member)[0].split("|")[-1])
+            saved_targets = saved_member_namespaces.get(template)
+            if saved_targets is not None and not explicit_namespace:
+                for namespace in saved_targets or [""]:
+                    candidate = _resolve_named_member(template, namespace or "")
+                    if candidate:
+                        self._add_member_binding(make_member_binding(candidate))
+                    else:
+                        self._add_member_binding({
+                            "member": template,
+                            "namespace": namespace or "",
+                        })
+                continue
+
+            resolved = _long_member(raw_member)
+            if resolved:
+                self._add_member_binding(make_member_binding(resolved))
+                continue
+
+            fallback_namespaces = saved_targets
+            if fallback_namespaces is None:
+                fallback_namespaces = namespaces or [explicit_namespace or ""]
+            for namespace in fallback_namespaces or [""]:
+                candidate = _resolve_named_member(template, namespace or "")
+                self._add_member_binding(
+                    make_member_binding(candidate) if candidate else {
+                        "member": template,
+                        "namespace": namespace or "",
+                    }
+                )
+
+        for raw_base, ns_list in saved_member_namespaces.items():
+            template = member_template(raw_base)
+            for namespace in ns_list or [""]:
+                if any(
+                    binding.get("member") == template
+                    and (binding.get("namespace") or "") == (namespace or "")
+                    for binding in self.member_bindings
+                ):
+                    continue
+                candidate = _resolve_named_member(template, namespace or "")
+                self._add_member_binding(
+                    make_member_binding(candidate) if candidate else {
+                        "member": template,
+                        "namespace": namespace or "",
+                    }
+                )
+
+        self._rebuild_member_metadata()
 
         self.color = color
         self.get_namespace = get_namespace_func or (lambda: "")
@@ -584,6 +775,28 @@ class SetButton(QtWidgets.QFrame):
         if isinstance(board_pos, dict):
             self.board_pos = QtCore.QPoint(int(board_pos.get("x", 0)), int(board_pos.get("y", 0)))
         self.setup_ui()
+
+    def _add_member_binding(self, binding):
+        binding = normalize_member_binding(binding)
+        if not binding:
+            return False
+        identity = binding_identity(binding)
+        if any(binding_identity(existing) == identity for existing in self.member_bindings):
+            return False
+        self.member_bindings.append(binding)
+        return True
+
+    def _rebuild_member_metadata(self):
+        self.members = []
+        self.member_namespaces = {}
+        for binding in self.member_bindings:
+            template = binding.get("member") or ""
+            namespace = binding.get("namespace") or ""
+            if template and template not in self.members:
+                self.members.append(template)
+            self.member_namespaces.setdefault(template, [])
+            if namespace not in self.member_namespaces[template]:
+                self.member_namespaces[template].append(namespace)
         
     def set_free_move_mode(self, enabled):
         self.free_move_mode = bool(enabled)
@@ -771,7 +984,7 @@ class SetButton(QtWidgets.QFrame):
                 ns_display = f"Dynamic: {fallback if fallback else '(no namespace)'}"
         self.setToolTip(
             f"{self.set_name}\n"
-            f"{len(self.members)} controls\n"
+            f"{len(self.member_bindings)} members\n"
             f"Targets: {ns_display}\n"
             f"Button size: {self.width()} x {self.height()} px\n"
             f"Board: drag bottom-right corner to resize"
@@ -806,14 +1019,21 @@ class SetButton(QtWidgets.QFrame):
     def _resolve_static_members(self):
         resolved = []
         seen = set()
+        for binding in self.member_bindings:
+            full_name = resolve_static_binding(binding)
+            if not full_name or full_name in seen:
+                continue
+            resolved.append(full_name)
+            seen.add(full_name)
+
+        if resolved or self.member_bindings:
+            return resolved
+
         fallback_namespaces = self.namespaces or [self.get_namespace() or ""]
         for member in self.members:
-            namespaces = self.member_namespaces.get(member) or fallback_namespaces
-            for ns in namespaces:
-                full_name = apply_namespace(member, ns or "")
-                if full_name in seen:
-                    continue
-                if cmds.objExists(full_name):
+            for namespace in self.member_namespaces.get(member) or fallback_namespaces:
+                full_name = _resolve_named_member(member, namespace or "")
+                if full_name and full_name not in seen:
                     resolved.append(full_name)
                     seen.add(full_name)
         return resolved
@@ -824,15 +1044,36 @@ class SetButton(QtWidgets.QFrame):
 
         resolved = []
         seen = set()
-        for ns in self._target_namespaces():
-            for m in self.members:
-                full_name = apply_namespace(m, ns)
-                if full_name in seen:
-                    continue
-                if cmds.objExists(full_name):
+        reusable_members = []
+        for binding in self.member_bindings:
+            if binding.get("namespace"):
+                template = binding.get("member") or ""
+                if template and template not in reusable_members:
+                    reusable_members.append(template)
+                continue
+
+            full_name = resolve_static_binding(binding)
+            if full_name and full_name not in seen:
+                resolved.append(full_name)
+                seen.add(full_name)
+
+        if not self.member_bindings:
+            reusable_members = list(self.members)
+
+        for namespace in self._target_namespaces():
+            for template in reusable_members:
+                full_name = _resolve_named_member(template, namespace)
+                if full_name and full_name not in seen:
                     resolved.append(full_name)
                     seen.add(full_name)
         return resolved
+
+    def get_resolved_domains(self):
+        return {
+            scene_item_domain(member)
+            for member in self.get_resolved_members()
+            if member
+        }
 
     def _add_dimension_slider_action(self, menu, title, value, minimum, maximum, on_changed):
         widget = QtWidgets.QWidget(menu)
@@ -874,10 +1115,12 @@ class SetButton(QtWidgets.QFrame):
         """)
         
         m.addAction("Select", self.do_select)
+        m.addAction("Hide Set Members", self.do_hide_members)
+        m.addAction("Show Set Members", self.do_show_members)
         m.addAction("Add Selection to Set", self.do_add_sel)
         m.addAction("Remove Selection from Set", self.do_rem_sel)
         m.addSeparator()
-        follow_action = m.addAction("Follow Panel Namespace", self.do_follow_panel_namespace)
+        follow_action = m.addAction("Use Panel Lock Mode", self.do_follow_panel_namespace)
         follow_action.setCheckable(True)
         follow_action.setChecked(self.namespace_mode != "custom")
         m.addAction("Use Selection Namespaces", self.do_use_selection_namespaces)
@@ -1076,7 +1319,24 @@ class SetButton(QtWidgets.QFrame):
     def do_select(self):
         v = self.get_resolved_members()
         if v:
-            cmds.select(v, r=True)
+            target_domains = {
+                scene_item_domain(member)
+                for member in v
+                if member
+            }
+            current = cmds.ls(sl=True, long=True) or []
+            preserved = [
+                member
+                for member in current
+                if scene_item_domain(member) not in target_domains
+            ]
+            combined = []
+            seen = set()
+            for member in preserved + v:
+                if member not in seen:
+                    combined.append(member)
+                    seen.add(member)
+            cmds.select(combined, r=True)
         else:
             cmds.warning(f"No valid objects found")
         
@@ -1088,6 +1348,28 @@ class SetButton(QtWidgets.QFrame):
         v = self.get_resolved_members()
         if v: cmds.select(v, tgl=True)
 
+    def _set_members_hidden(self, hidden):
+        members = self.get_resolved_members()
+        if not members:
+            cmds.warning("No valid set members found.")
+            return
+        cmds.undoInfo(openChunk=True, chunkName="AnimKey_SetVisibility")
+        try:
+            if hidden:
+                cmds.hide(members)
+            else:
+                cmds.showHidden(members)
+        except Exception as exc:
+            cmds.warning("Could not update set visibility: {}".format(exc))
+        finally:
+            cmds.undoInfo(closeChunk=True)
+
+    def do_hide_members(self):
+        self._set_members_hidden(True)
+
+    def do_show_members(self):
+        self._set_members_hidden(False)
+
     def _selection_namespaces(self):
         return get_namespaces_from_selection()
 
@@ -1097,7 +1379,7 @@ class SetButton(QtWidgets.QFrame):
             self.namespaces = unique_namespaces_from_member_map(self.member_namespaces)
         self.update_tooltip()
         self._auto_save()
-        cmds.inViewMessage(msg=f"{self.set_name}: follows page namespace mode", pos='midCenter', fade=True)
+        cmds.inViewMessage(msg=f"{self.set_name}: uses panel lock mode", pos='midCenter', fade=True)
 
     def do_use_selection_namespaces(self):
         namespaces = self._selection_namespaces()
@@ -1146,18 +1428,12 @@ class SetButton(QtWidgets.QFrame):
         sel = cmds.ls(sl=True, long=True)
         if sel:
             added = 0
-            for s in sel:
-                short_name = s.split('|')[-1]
-                base = strip_namespace(short_name)
-                ns = get_namespace(short_name)
-                self.member_namespaces.setdefault(base, [])
-                if ns not in self.member_namespaces[base]:
-                    self.member_namespaces[base].append(ns)
-                if ns not in self.namespaces:
-                    self.namespaces.append(ns)
-                if base not in self.members:
-                    self.members.append(base)
+            for member in sel:
+                if self._add_member_binding(make_member_binding(member)):
                     added += 1
+            self._rebuild_member_metadata()
+            if self.namespace_mode != "custom":
+                self.namespaces = unique_namespaces_from_member_map(self.member_namespaces)
             self.update_tooltip()
             self._auto_save()
             cmds.inViewMessage(msg=f"Added {added}", pos='midCenter', fade=True)
@@ -1165,17 +1441,31 @@ class SetButton(QtWidgets.QFrame):
     def do_rem_sel(self):
         sel = cmds.ls(sl=True, long=True)
         if sel:
-            c = 0
-            for s in sel:
-                base = strip_namespace(s.split('|')[-1])
-                if base in self.members:
-                    self.members.remove(base)
-                    self.member_namespaces.pop(base, None)
-                    c += 1
-            self.namespaces = unique_namespaces_from_member_map(self.member_namespaces) or self.namespaces
+            selected_bindings = [make_member_binding(member) for member in sel]
+            selected_ids = {binding_identity(binding) for binding in selected_bindings}
+            selected_names = {
+                (binding.get("member"), binding.get("namespace") or "")
+                for binding in selected_bindings
+            }
+            kept = []
+            removed = 0
+            for binding in self.member_bindings:
+                exact_match = binding_identity(binding) in selected_ids
+                name_match = (
+                    not binding.get("uuid")
+                    and (binding.get("member"), binding.get("namespace") or "") in selected_names
+                )
+                if exact_match or name_match:
+                    removed += 1
+                else:
+                    kept.append(binding)
+            self.member_bindings = kept
+            self._rebuild_member_metadata()
+            if self.namespace_mode != "custom":
+                self.namespaces = unique_namespaces_from_member_map(self.member_namespaces)
             self.update_tooltip()
             self._auto_save()
-            cmds.inViewMessage(msg=f"Removed {c}", pos='midCenter', fade=True)
+            cmds.inViewMessage(msg=f"Removed {removed}", pos='midCenter', fade=True)
             
     def do_rename(self):
         n, ok = QtWidgets.QInputDialog.getText(self, "Rename", "Name:", text=self.set_name)
@@ -1206,6 +1496,7 @@ class SetButton(QtWidgets.QFrame):
             "namespace_mode": self.namespace_mode,
             "namespaces": self.namespaces,
             "member_namespaces": self.member_namespaces,
+            "member_bindings": self.member_bindings,
             "size_scale": self.size_scale,
             "board_size": {"w": int(self.board_size.width()), "h": int(self.board_size.height())},
             "board_pos": {"x": int(self.board_pos.x()), "y": int(self.board_pos.y())}
@@ -2078,10 +2369,11 @@ class TabPage(QtWidgets.QWidget):
         self.namespace_lock_btn.setChecked(locked)
         self.namespace_lock_btn.setText(u"\U0001F512" if locked else u"\U0001F513")
         self.namespace_lock_btn.setToolTip(
-            "Static namespaces: sets use saved rig namespaces"
+            "Locked: each set uses its saved rig, prop, or geometry"
             if locked else
-            "Dynamic namespaces: sets follow the active/selected rig namespace"
+            "Unlocked: sets follow all namespaces in the current selection"
         )
+        self.ns_combo.setEnabled(not locked)
         self.namespace_lock_btn.blockSignals(False)
 
     def set_namespace_dynamic(self, dynamic, save=True):
@@ -2092,8 +2384,7 @@ class TabPage(QtWidgets.QWidget):
         if self.namespace_dynamic:
             self.auto_namespace_from_selection()
         else:
-            current = self.current_namespace or "(no namespace)"
-            self.ns_combo.setToolTip(f"Static namespace mode: {current}")
+            self.ns_combo.setToolTip("Locked: every set keeps its own saved target")
             self.container.update_all_tooltips()
         self.namespace_changed.emit()
         if save:
@@ -2103,8 +2394,7 @@ class TabPage(QtWidgets.QWidget):
 
     def auto_namespace_from_selection(self):
         if not self.namespace_dynamic:
-            current = self.current_namespace or "(no namespace)"
-            self.ns_combo.setToolTip(f"Static namespace mode: {current}")
+            self.ns_combo.setToolTip("Locked: every set keeps its own saved target")
             self.container.update_all_tooltips()
             return
         namespaces = get_namespaces_from_selection()
@@ -2228,7 +2518,7 @@ class TabPage(QtWidgets.QWidget):
             name = f"Set{len(self.container.buttons)+1}"
         member_namespaces = get_member_namespace_map(sel)
         namespaces = unique_namespaces_from_member_map(member_namespaces)
-        if len(namespaces) == 1:
+        if self.namespace_dynamic and len(namespaces) == 1:
             self.set_namespace(namespaces[0])
         btn = SetButton(
             name,
@@ -2287,6 +2577,7 @@ class TabPage(QtWidgets.QWidget):
                 namespaces=saved_namespaces,
                 namespace_mode=s.get("namespace_mode", "page"),
                 member_namespaces=saved_member_namespaces,
+                member_bindings=s.get("member_bindings"),
                 size_scale=s.get("size_scale", 1.0),
                 board_size=s.get("board_size")
             )
@@ -2952,7 +3243,7 @@ def export_sets(*args):
     
     # Add version for export
     export_data = {
-        "version": "1.3",
+        "version": "1.4",
         "sort_mode": data.get("sort_mode", "Manual"),
         "current_tab": data.get("current_tab", 0),
         "tabs": data.get("tabs", []),
