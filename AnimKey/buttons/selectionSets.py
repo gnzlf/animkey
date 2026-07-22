@@ -39,6 +39,15 @@ SET_BUTTON_MAX_HEIGHT = 320
 # Global window instance
 _win = None
 
+
+def _maya_ui_icon(icon_name):
+    maya_location = os.environ.get("MAYA_LOCATION", "")
+    if maya_location:
+        path = os.path.join(maya_location, "icons", icon_name)
+        if os.path.exists(path):
+            return QtGui.QIcon(path)
+    return QtGui.QIcon(":/" + icon_name)
+
 def _get_icon_path(icon_name=None):
     """
     Get path to AnimKey icon file for outliner display.
@@ -771,6 +780,8 @@ class SetButton(QtWidgets.QFrame):
         self._resize_start_size = None
         self._resize_handle_size = 22
         self.free_move_mode = False
+        self.ui_selected = False
+        self.members_hidden = False
         self.board_pos = QtCore.QPoint(0, 0)
         if isinstance(board_pos, dict):
             self.board_pos = QtCore.QPoint(int(board_pos.get("x", 0)), int(board_pos.get("y", 0)))
@@ -825,27 +836,18 @@ class SetButton(QtWidgets.QFrame):
         self.label.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
         layout.addWidget(self.label, 1)
 
-        self.visibility_btn = QtWidgets.QToolButton(self)
-        self.visibility_btn.setAutoRaise(True)
-        self.visibility_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self.visibility_btn.setFocusPolicy(QtCore.Qt.NoFocus)
-        self.visibility_btn.setFixedSize(20, 20)
-        self.visibility_btn.setIconSize(QtCore.QSize(16, 16))
-        self.visibility_btn.clicked.connect(self.do_toggle_visibility)
-        layout.addWidget(self.visibility_btn)
-
         self.resize_grip = ButtonResizeGrip(self)
         self.resize_grip.hide()
         
         self.apply_style()
         self.update_size()
-        self._update_visibility_button()
+        self.refresh_visibility_state()
         self.update_tooltip()
 
     def _default_size_for_scale(self, scale=None):
         scale = self.size_scale if scale is None else float(scale or 1.0)
         fm = self.fontMetrics()
-        w = fm.horizontalAdvance(self.set_name) + 44
+        w = fm.horizontalAdvance(self.set_name) + 24
         return QtCore.QSize(
             int(max(SET_BUTTON_MIN_WIDTH, w) * scale),
             int(max(26, SET_BUTTON_MIN_HEIGHT) * scale)
@@ -853,7 +855,7 @@ class SetButton(QtWidgets.QFrame):
 
     def _row_size(self):
         fm = self.fontMetrics()
-        width = max(SET_BUTTON_MIN_WIDTH, fm.horizontalAdvance(self.set_name) + 44)
+        width = max(SET_BUTTON_MIN_WIDTH, fm.horizontalAdvance(self.set_name) + 24)
         return QtCore.QSize(int(width), max(26, SET_BUTTON_MIN_HEIGHT))
 
     def _size_from_data(self, data):
@@ -939,18 +941,22 @@ class SetButton(QtWidgets.QFrame):
             self._auto_save()
         
     def apply_style(self):
-        tc = text_color_for_bg(self.color)
-        hover = QtGui.QColor(self.color).lighter(115).name()
+        background = "#555A60" if self.members_hidden else self.color
+        tc = "#D5D9DE" if self.members_hidden else text_color_for_bg(background)
+        hover = QtGui.QColor(background).lighter(115).name()
+        border = "#78BFFF" if self.ui_selected else "transparent"
         zoom = self._board_zoom() if self.free_move_mode else 1.0
         font_size = max(4, min(28, int(round(11 * zoom))))
         radius = max(1, min(18, int(round(6 * zoom))))
         self.setStyleSheet(f"""
             SetButton {{
-                background-color: {self.color};
+                background-color: {background};
+                border: 2px solid {border};
                 border-radius: {radius}px;
             }}
             SetButton:hover {{
                 background-color: {hover};
+                border-color: #78BFFF;
             }}
             QLabel {{
                 color: {tc};
@@ -958,16 +964,15 @@ class SetButton(QtWidgets.QFrame):
                 font-weight: 500;
                 background: transparent;
             }}
-            QToolButton {{
-                background: transparent;
-                border: none;
-                border-radius: 3px;
-                padding: 1px;
-            }}
-            QToolButton:hover {{
-                background: rgba(255, 255, 255, 45);
-            }}
         """)
+
+    def set_ui_selected(self, selected):
+        selected = bool(selected)
+        if self.ui_selected == selected:
+            return
+        self.ui_selected = selected
+        self.apply_style()
+        self.update()
         
     def update_size(self):
         if not self.custom_size:
@@ -1187,23 +1192,37 @@ class SetButton(QtWidgets.QFrame):
 
     def paintEvent(self, event):
         super(SetButton, self).paintEvent(event)
-        if not self.free_move_mode:
-            return
-        if hasattr(self, "resize_grip") and self.resize_grip.isVisible():
-            return
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        tc = QtGui.QColor(text_color_for_bg(self.color))
-        tc.setAlpha(150)
-        painter.setPen(QtGui.QPen(tc, 1.2))
-        rect = self._resize_handle_rect().adjusted(1, 1, -3, -3)
-        for offset in (0, 4, 8):
-            painter.drawLine(
-                rect.right() - offset,
-                rect.bottom(),
-                rect.right(),
-                rect.bottom() - offset
-            )
+
+        if self.members_hidden:
+            zoom = self._board_zoom() if self.free_move_mode else 1.0
+            radius = max(1, min(18, int(round(6 * zoom))))
+            hatch_rect = QtCore.QRectF(self.rect().adjusted(2, 2, -2, -2))
+            clip_path = QtGui.QPainterPath()
+            clip_path.addRoundedRect(hatch_rect, radius, radius)
+            painter.setClipPath(clip_path)
+            hatch = QtGui.QColor(235, 238, 242, 48)
+            painter.setPen(QtGui.QPen(hatch, max(1.0, zoom)))
+            spacing = max(5, int(round(7 * zoom)))
+            for x in range(-self.height(), self.width() + self.height(), spacing):
+                painter.drawLine(x, self.height(), x + self.height(), 0)
+            painter.setClipping(False)
+
+        if self.free_move_mode and not (
+            hasattr(self, "resize_grip") and self.resize_grip.isVisible()
+        ):
+            tc = QtGui.QColor(text_color_for_bg(self.color))
+            tc.setAlpha(150)
+            painter.setPen(QtGui.QPen(tc, 1.2))
+            rect = self._resize_handle_rect().adjusted(1, 1, -3, -3)
+            for offset in (0, 4, 8):
+                painter.drawLine(
+                    rect.right() - offset,
+                    rect.bottom(),
+                    rect.right(),
+                    rect.bottom() - offset
+                )
         painter.end()
         
     def mousePressEvent(self, e):
@@ -1340,6 +1359,9 @@ class SetButton(QtWidgets.QFrame):
         drag.exec_(QtCore.Qt.MoveAction)
 
     def _dispatch_selection_action(self, modifiers):
+        parent = self.parentWidget()
+        if hasattr(parent, "select_button"):
+            parent.select_button(self, modifiers)
         if modifiers & QtCore.Qt.ShiftModifier:
             self.do_add()
         elif modifiers & QtCore.Qt.ControlModifier:
@@ -1405,14 +1427,13 @@ class SetButton(QtWidgets.QFrame):
                 states.append(False)
         return bool(states) and all(states)
 
-    def _update_visibility_button(self, hidden=None):
-        if not hasattr(self, "visibility_btn"):
-            return
-        if hidden is None:
-            hidden = self._members_are_hidden(self._resolved_members_for_action())
-        icon_name = ":/over_show.png" if hidden else ":/over_hide.png"
-        self.visibility_btn.setIcon(QtGui.QIcon(icon_name))
-        self.visibility_btn.setToolTip("Show set members" if hidden else "Hide set members")
+    def refresh_visibility_state(self):
+        hidden = self._members_are_hidden(self._resolved_members_for_action())
+        if self.members_hidden != hidden:
+            self.members_hidden = hidden
+            self.apply_style()
+            self.update()
+        return self.members_hidden
 
     def do_toggle_visibility(self):
         members = self._resolved_members_for_action()
@@ -1421,22 +1442,30 @@ class SetButton(QtWidgets.QFrame):
             return
         self._set_members_hidden(not self._members_are_hidden(members), members=members)
 
-    def _set_members_hidden(self, hidden, members=None):
+    def _set_members_hidden(self, hidden, members=None, manage_undo=True):
         members = members or self._resolved_members_for_action()
         if not members:
             cmds.warning("No valid set members found.")
-            return
-        cmds.undoInfo(openChunk=True, chunkName="AnimKey_SetVisibility")
+            return False
+        if manage_undo:
+            cmds.undoInfo(openChunk=True, chunkName="AnimKey_SetVisibility")
+        succeeded = True
         try:
             if hidden:
                 cmds.hide(members)
             else:
                 cmds.showHidden(members)
         except Exception as exc:
+            succeeded = False
             cmds.warning("Could not update set visibility: {}".format(exc))
         finally:
-            cmds.undoInfo(closeChunk=True)
-        self._update_visibility_button(hidden)
+            if manage_undo:
+                cmds.undoInfo(closeChunk=True)
+        if succeeded:
+            self.members_hidden = bool(hidden)
+            self.apply_style()
+            self.update()
+        return succeeded
 
     def do_hide_members(self):
         self._set_members_hidden(True)
@@ -1583,6 +1612,7 @@ class SetButton(QtWidgets.QFrame):
 
 class FlowContainer(QtWidgets.QWidget):
     layout_mode_changed = QtCore.Signal(str)
+    selection_changed = QtCore.Signal()
 
     def __init__(self):
         super(FlowContainer, self).__init__()
@@ -1893,19 +1923,48 @@ class FlowContainer(QtWidgets.QWidget):
             btn.board_pos = self._next_board_position()
         btn.set_free_move_mode(self.layout_mode == "board")
         self.reflow()
+
+    def selected_buttons(self):
+        return [btn for btn in self.buttons if btn.ui_selected]
+
+    def select_buttons(self, buttons, modifiers=QtCore.Qt.NoModifier):
+        requested = set(buttons or [])
+        changed = False
+        for btn in self.buttons:
+            if modifiers & QtCore.Qt.ShiftModifier:
+                selected = btn.ui_selected or btn in requested
+            elif modifiers & QtCore.Qt.ControlModifier:
+                selected = (not btn.ui_selected) if btn in requested else btn.ui_selected
+            else:
+                selected = btn in requested
+            if selected != btn.ui_selected:
+                btn.set_ui_selected(selected)
+                changed = True
+        if changed:
+            self.selection_changed.emit()
+
+    def select_button(self, button, modifiers=QtCore.Qt.NoModifier):
+        if button in self.buttons:
+            self.select_buttons([button], modifiers)
         
     def remove_button(self, btn):
         if btn in self.buttons:
+            was_selected = btn.ui_selected
             self.buttons.remove(btn)
             btn.hide()
             btn.deleteLater()
             self.reflow()
+            if was_selected:
+                self.selection_changed.emit()
             
     def clear_all(self):
+        had_selection = bool(self.selected_buttons())
         for b in self.buttons[:]:
             b.deleteLater()
         self.buttons = []
         self.reflow()
+        if had_selection:
+            self.selection_changed.emit()
 
     def _auto_save(self):
         try:
@@ -2050,10 +2109,11 @@ class FlowContainer(QtWidgets.QWidget):
 
     def _select_buttons_in_rect(self, rect, modifiers):
         buttons = [btn for btn in self.buttons if rect.intersects(btn.geometry())]
+        self.select_buttons(buttons, modifiers)
         members = []
         seen = set()
         for btn in buttons:
-            for member in btn.get_resolved_members():
+            for member in btn._resolved_members_for_action():
                 if member not in seen:
                     members.append(member)
                     seen.add(member)
@@ -2101,6 +2161,8 @@ class FlowContainer(QtWidgets.QWidget):
             self.update()
             if rect.width() > 4 and rect.height() > 4:
                 self._select_buttons_in_rect(rect, e.modifiers())
+            elif not (e.modifiers() & (QtCore.Qt.ShiftModifier | QtCore.Qt.ControlModifier)):
+                self.select_buttons([], QtCore.Qt.NoModifier)
             e.accept()
             return
         super(FlowContainer, self).mouseReleaseEvent(e)
@@ -2281,6 +2343,7 @@ class TabPage(QtWidgets.QWidget):
         self.namespace_lock_btn.setFixedSize(28, 28)
         self.namespace_lock_btn.setCheckable(True)
         self.namespace_lock_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.namespace_lock_btn.setIconSize(QtCore.QSize(16, 16))
         self.namespace_lock_btn.setStyleSheet("""
             QPushButton {
                 background-color: #383838;
@@ -2291,34 +2354,32 @@ class TabPage(QtWidgets.QWidget):
             }
             QPushButton:hover { background-color: #3D3D3D; color: #FFF; border-color: #555; }
             QPushButton:checked {
-                background-color: #E67E22;
-                color: white;
-                border-color: #E67E22;
+                background-color: #303438;
+                color: #F5F5F7;
+                border-color: #68717A;
             }
         """)
         self.namespace_lock_btn.clicked.connect(lambda checked=False: self.set_namespace_dynamic(not checked))
         ns_row.addWidget(self.namespace_lock_btn)
         self._update_namespace_lock_button()
-        
-        pick_btn = QtWidgets.QPushButton("◎")
-        pick_btn.setFixedSize(28, 28)
-        pick_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        pick_btn.setToolTip("Get namespace from selection")
-        pick_btn.setStyleSheet("""
+
+        self.set_visibility_btn = QtWidgets.QPushButton()
+        self.set_visibility_btn.setFixedSize(28, 28)
+        self.set_visibility_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.set_visibility_btn.setIconSize(QtCore.QSize(17, 17))
+        self.set_visibility_btn.setStyleSheet("""
             QPushButton {
-                background-color: #E67E22;
-                color: white;
-                font-size: 14px;
-                border: none;
+                background-color: #383838;
+                border: 1px solid #444444;
                 border-radius: 6px;
             }
-            QPushButton:hover { background-color: #D35400; }
+            QPushButton:hover { background-color: #3D3D3D; border-color: #78BFFF; }
+            QPushButton:pressed { background-color: #303438; }
+            QPushButton:disabled { background-color: #343434; border-color: #3B3B3B; }
         """)
-        pick_btn.clicked.connect(self.pick_from_selection)
-        ns_row.addWidget(pick_btn)
-        pick_btn.setVisible(False)
-        pick_btn.setFixedSize(0, 0)
-        
+        self.set_visibility_btn.clicked.connect(self.toggle_selected_set_visibility)
+        ns_row.addWidget(self.set_visibility_btn)
+
         ns_row.addSpacing(4)
 
         mode_style = """
@@ -2394,9 +2455,11 @@ class TabPage(QtWidgets.QWidget):
         self.container = FlowContainer()
         self.container.setStyleSheet("background-color: #333333;")
         self.container.layout_mode_changed.connect(self._sync_layout_mode_buttons)
+        self.container.selection_changed.connect(self._update_set_visibility_button)
         self.scroll.setWidget(self.container)
         self.scroll.viewport().installEventFilter(self)
         self.container.installEventFilter(self)
+        self._update_set_visibility_button()
         
         layout.addWidget(self.scroll)
 
@@ -2441,7 +2504,10 @@ class TabPage(QtWidgets.QWidget):
         locked = not bool(self.namespace_dynamic)
         self.namespace_lock_btn.blockSignals(True)
         self.namespace_lock_btn.setChecked(locked)
-        self.namespace_lock_btn.setText(u"\U0001F512" if locked else u"\U0001F513")
+        self.namespace_lock_btn.setText("")
+        self.namespace_lock_btn.setIcon(
+            _maya_ui_icon("lock_mono.xpm" if locked else "unlock_mono.xpm")
+        )
         self.namespace_lock_btn.setToolTip(
             "Locked: each set uses its saved rig, prop, or geometry"
             if locked else
@@ -2449,6 +2515,36 @@ class TabPage(QtWidgets.QWidget):
         )
         self.ns_combo.setEnabled(not locked)
         self.namespace_lock_btn.blockSignals(False)
+
+    def _update_set_visibility_button(self):
+        if not hasattr(self, "set_visibility_btn") or not hasattr(self, "container"):
+            return
+        selected = self.container.selected_buttons()
+        for button in selected:
+            button.refresh_visibility_state()
+        all_hidden = bool(selected) and all(button.members_hidden for button in selected)
+        icon_name = "over_show.png" if all_hidden else "over_hide.png"
+        self.set_visibility_btn.setIcon(_maya_ui_icon(icon_name))
+        self.set_visibility_btn.setEnabled(bool(selected))
+        self.set_visibility_btn.setToolTip(
+            "Show selected sets" if all_hidden else "Hide selected sets"
+        )
+
+    def toggle_selected_set_visibility(self):
+        selected = self.container.selected_buttons()
+        if not selected:
+            cmds.warning("Select one or more sets first.")
+            return
+        for button in selected:
+            button.refresh_visibility_state()
+        hidden = not all(button.members_hidden for button in selected)
+        cmds.undoInfo(openChunk=True, chunkName="AnimKey_SetVisibility")
+        try:
+            for button in selected:
+                button._set_members_hidden(hidden, manage_undo=False)
+        finally:
+            cmds.undoInfo(closeChunk=True)
+        self._update_set_visibility_button()
 
     def set_namespace_dynamic(self, dynamic, save=True):
         self.namespace_dynamic = bool(dynamic)

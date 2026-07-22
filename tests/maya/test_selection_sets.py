@@ -181,6 +181,7 @@ class SelectionSetNamespaceTests(unittest.TestCase):
         try:
             self.assertFalse(page.is_namespace_dynamic())
             self.assertFalse(page.ns_combo.isEnabled())
+            self.assertNotIn("#E67E22", page.namespace_lock_btn.styleSheet())
             page.set_namespace_dynamic(True, save=False)
             self.assertTrue(page.is_namespace_dynamic())
             self.assertTrue(page.ns_combo.isEnabled())
@@ -242,6 +243,7 @@ class SelectionSetNamespaceTests(unittest.TestCase):
         face_set = self._button("Arm Faces", [face_range])
 
         face_set.do_toggle_visibility()
+        self.assertTrue(face_set.members_hidden)
         hidden_sets = [
             node
             for node in (cmds.ls(type="objectSet") or [])
@@ -253,28 +255,70 @@ class SelectionSetNamespaceTests(unittest.TestCase):
             hidden_members.extend(cmds.sets(hidden_set, query=True) or [])
         self.assertTrue(any("f[0:2]" in member for member in hidden_members))
 
-        self.assertEqual(face_set.visibility_btn.toolTip(), "Show set members")
-
         face_set.do_toggle_visibility()
         remaining_members = []
         for hidden_set in cmds.ls(type="objectSet") or []:
             if "HiddenFacesSet" in hidden_set:
                 remaining_members.extend(cmds.sets(hidden_set, query=True) or [])
         self.assertFalse(any("f[0:2]" in member for member in remaining_members))
-        self.assertEqual(face_set.visibility_btn.toolTip(), "Hide set members")
+        self.assertFalse(face_set.members_hidden)
 
-    def test_visibility_button_toggles_geometry(self):
-        geometry = cmds.polyCube(name="bodyGeo")[0]
-        geometry_set = self._button("Body", [geometry])
-        self.assertFalse(geometry_set.visibility_btn.icon().isNull())
+    def test_set_selection_highlight_supports_shift_and_control(self):
+        first_node = cmds.createNode("transform", name="first_CTRL")
+        second_node = cmds.createNode("transform", name="second_CTRL")
+        page = TabPage()
+        page._auto_ns_timer.stop()
+        first = SetButton("First", [first_node], namespace_dynamic_func=lambda: False)
+        second = SetButton("Second", [second_node], namespace_dynamic_func=lambda: False)
+        page.container.add_button(first)
+        page.container.add_button(second)
+        try:
+            first._dispatch_selection_action(QtCore.Qt.NoModifier)
+            self.assertTrue(first.ui_selected)
+            self.assertFalse(second.ui_selected)
+            self.assertIn("#78BFFF", first.styleSheet())
 
-        geometry_set.do_toggle_visibility()
-        self.assertFalse(cmds.getAttr(geometry + ".visibility"))
-        self.assertEqual(geometry_set.visibility_btn.toolTip(), "Show set members")
+            second._dispatch_selection_action(QtCore.Qt.ShiftModifier)
+            self.assertEqual(page.container.selected_buttons(), [first, second])
 
-        geometry_set.do_toggle_visibility()
-        self.assertTrue(cmds.getAttr(geometry + ".visibility"))
-        self.assertEqual(geometry_set.visibility_btn.toolTip(), "Hide set members")
+            first._dispatch_selection_action(QtCore.Qt.ControlModifier)
+            self.assertEqual(page.container.selected_buttons(), [second])
+        finally:
+            page.deleteLater()
+
+    def test_toolbar_eye_toggles_selected_geometry_sets(self):
+        first_geo = cmds.polyCube(name="bodyGeo")[0]
+        second_geo = cmds.polyCube(name="propGeo")[0]
+        page = TabPage()
+        page._auto_ns_timer.stop()
+        first = SetButton("Body", [first_geo], namespace_dynamic_func=lambda: False)
+        second = SetButton("Prop", [second_geo], namespace_dynamic_func=lambda: False)
+        page.container.add_button(first)
+        page.container.add_button(second)
+        try:
+            self.assertFalse(hasattr(first, "visibility_btn"))
+            self.assertFalse(page.set_visibility_btn.isEnabled())
+            self.assertFalse(page.set_visibility_btn.icon().isNull())
+
+            page.container.select_button(first, QtCore.Qt.NoModifier)
+            page.container.select_button(second, QtCore.Qt.ShiftModifier)
+            self.assertTrue(page.set_visibility_btn.isEnabled())
+
+            page.toggle_selected_set_visibility()
+            self.assertFalse(cmds.getAttr(first_geo + ".visibility"))
+            self.assertFalse(cmds.getAttr(second_geo + ".visibility"))
+            self.assertTrue(first.members_hidden)
+            self.assertTrue(second.members_hidden)
+            self.assertIn("#555A60", first.styleSheet())
+            self.assertEqual(page.set_visibility_btn.toolTip(), "Show selected sets")
+
+            page.toggle_selected_set_visibility()
+            self.assertTrue(cmds.getAttr(first_geo + ".visibility"))
+            self.assertTrue(cmds.getAttr(second_geo + ".visibility"))
+            self.assertFalse(first.members_hidden)
+            self.assertFalse(second.members_hidden)
+        finally:
+            page.deleteLater()
 
 
 if __name__ == "__main__":
