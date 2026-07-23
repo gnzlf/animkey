@@ -390,24 +390,6 @@ def resolve_static_binding(binding):
     return _resolve_named_member(binding.get("member") or "", namespace)
 
 
-def scene_item_domain(item):
-    """Group selection by namespace, or by top DAG root without namespaces."""
-    node, _component = split_member_component(item)
-    short_node = node.split("|")[-1]
-    namespace = get_namespace(short_node)
-    if namespace:
-        return "namespace:{}".format(namespace)
-
-    long_node = _long_member(node) or node
-    if long_node.startswith("|"):
-        parts = [part for part in long_node.split("|") if part]
-        root = "|{}".format(parts[0]) if parts else long_node
-    else:
-        root = long_node
-    root_uuid = _node_uuid(root)
-    return "root:{}".format(root_uuid or root)
-
-
 # ============================================================================
 # CUSTOM TITLE BAR
 # ============================================================================
@@ -1101,13 +1083,6 @@ class SetButton(QtWidgets.QFrame):
         # set must remain usable on the rig, prop, or geometry it was made from.
         return self._resolve_static_members()
 
-    def get_resolved_domains(self):
-        return {
-            scene_item_domain(member)
-            for member in self.get_resolved_members()
-            if member
-        }
-
     def _add_dimension_slider_action(self, menu, title, value, minimum, maximum, on_changed):
         widget = QtWidgets.QWidget(menu)
         layout = QtWidgets.QVBoxLayout(widget)
@@ -1372,24 +1347,7 @@ class SetButton(QtWidgets.QFrame):
     def do_select(self):
         v = self._resolved_members_for_action()
         if v:
-            target_domains = {
-                scene_item_domain(member)
-                for member in v
-                if member
-            }
-            current = cmds.ls(sl=True, long=True) or []
-            preserved = [
-                member
-                for member in current
-                if scene_item_domain(member) not in target_domains
-            ]
-            combined = []
-            seen = set()
-            for member in preserved + v:
-                if member not in seen:
-                    combined.append(member)
-                    seen.add(member)
-            cmds.select(combined, r=True)
+            cmds.select(v, r=True)
         else:
             cmds.warning(f"No valid objects found")
         

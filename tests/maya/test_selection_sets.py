@@ -47,7 +47,7 @@ class SelectionSetNamespaceTests(unittest.TestCase):
     def _selected(self):
         return set(cmds.ls(selection=True, long=True) or [])
 
-    def test_clicking_a_second_rig_preserves_the_first_rig(self):
+    def test_normal_click_replaces_previous_sets_across_rigs(self):
         self._namespace("rigA")
         self._namespace("propB")
         arm = cmds.createNode("transform", name="rigA:arm_CTRL")
@@ -62,14 +62,17 @@ class SelectionSetNamespaceTests(unittest.TestCase):
         prop_set.do_select()
         self.assertEqual(
             self._selected(),
-            set(cmds.ls([arm, prop], long=True)),
+            set(cmds.ls(prop, long=True)),
         )
 
         torso_set.do_select()
         self.assertEqual(
             self._selected(),
-            set(cmds.ls([torso, prop], long=True)),
+            set(cmds.ls(torso, long=True)),
         )
+
+        arm_set.do_select()
+        self.assertEqual(self._selected(), set(cmds.ls(arm, long=True)))
 
     def test_unlocked_set_retargets_to_another_namespace(self):
         self._namespace("charA")
@@ -204,7 +207,7 @@ class SelectionSetNamespaceTests(unittest.TestCase):
         self.assertTrue(resolved[0].endswith("|RENAMED_CTRL"))
         self.assertTrue(resolved[0].startswith("|rigRootA|"))
 
-    def test_namespace_less_rig_and_prop_can_be_selected_together(self):
+    def test_namespace_less_rig_and_prop_can_be_added_with_shift(self):
         rig_root = cmds.createNode("transform", name="rigRoot")
         prop_root = cmds.createNode("transform", name="propRoot")
         rig_ctrl = cmds.createNode("transform", name="rig_CTRL", parent=rig_root)
@@ -213,7 +216,7 @@ class SelectionSetNamespaceTests(unittest.TestCase):
         prop_set = self._button("Prop", [cmds.ls(prop_ctrl, long=True)[0]])
 
         rig_set.do_select()
-        prop_set.do_select()
+        prop_set.do_add()
         self.assertEqual(
             self._selected(),
             set(cmds.ls([rig_ctrl, prop_ctrl], long=True)),
@@ -277,12 +280,22 @@ class SelectionSetNamespaceTests(unittest.TestCase):
             self.assertTrue(first.ui_selected)
             self.assertFalse(second.ui_selected)
             self.assertIn("#78BFFF", first.styleSheet())
+            self.assertEqual(self._selected(), set(cmds.ls(first_node, long=True)))
 
             second._dispatch_selection_action(QtCore.Qt.ShiftModifier)
             self.assertEqual(page.container.selected_buttons(), [first, second])
+            self.assertEqual(
+                self._selected(),
+                set(cmds.ls([first_node, second_node], long=True)),
+            )
 
             first._dispatch_selection_action(QtCore.Qt.ControlModifier)
             self.assertEqual(page.container.selected_buttons(), [second])
+            self.assertEqual(self._selected(), set(cmds.ls(second_node, long=True)))
+
+            first._dispatch_selection_action(QtCore.Qt.NoModifier)
+            self.assertEqual(page.container.selected_buttons(), [first])
+            self.assertEqual(self._selected(), set(cmds.ls(first_node, long=True)))
         finally:
             page.deleteLater()
 
