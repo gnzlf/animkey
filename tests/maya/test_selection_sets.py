@@ -16,7 +16,12 @@ except RuntimeError:
 
 import maya.cmds as cmds
 
-from AnimKey.buttons.selectionSets import SetButton, TabPage
+from AnimKey.buttons.selectionSets import (
+    PopupInput,
+    SET_COLOR_PALETTE,
+    SetButton,
+    TabPage,
+)
 
 
 class SelectionSetNamespaceTests(unittest.TestCase):
@@ -330,6 +335,105 @@ class SelectionSetNamespaceTests(unittest.TestCase):
             self.assertTrue(cmds.getAttr(second_geo + ".visibility"))
             self.assertFalse(first.members_hidden)
             self.assertFalse(second.members_hidden)
+        finally:
+            page.deleteLater()
+
+    def test_toolbar_eye_restores_faces_after_reloading_hidden_state(self):
+        geometry = cmds.polyCube(name="bodyGeo")[0]
+        face_range = geometry + ".f[0:2]"
+        page = TabPage()
+        page._auto_ns_timer.stop()
+        face_set = SetButton(
+            "Arm Faces", [face_range], namespace_dynamic_func=lambda: False
+        )
+        page.container.add_button(face_set)
+        page.container.select_button(face_set, QtCore.Qt.NoModifier)
+        try:
+            page.toggle_selected_set_visibility()
+            self.assertTrue(face_set.members_hidden)
+            self.assertIn("#555A60", face_set.styleSheet())
+            self.assertTrue(face_set.get_data()["members_hidden"])
+
+            saved = face_set.get_data()
+            restored = SetButton(
+                saved["name"],
+                saved["members"],
+                color=saved["color"],
+                member_bindings=saved["member_bindings"],
+                namespace_dynamic_func=lambda: False,
+                members_hidden=saved["members_hidden"],
+            )
+            self.buttons.append(restored)
+            self.assertTrue(restored.members_hidden)
+            self.assertIn("#555A60", restored.styleSheet())
+
+            page.toggle_selected_set_visibility()
+            self.assertFalse(face_set.members_hidden)
+            remaining = []
+            for hidden_set in cmds.ls(type="objectSet") or []:
+                if "HiddenFacesSet" in hidden_set:
+                    remaining.extend(cmds.sets(hidden_set, query=True) or [])
+            self.assertFalse(any("f[0:2]" in member for member in remaining))
+        finally:
+            page.deleteLater()
+
+    def test_palette_is_limited_to_thirty_colors(self):
+        self.assertEqual(len(SET_COLOR_PALETTE), 30)
+        self.assertEqual(len(set(SET_COLOR_PALETTE)), 30)
+
+        node = cmds.createNode("transform", name="palette_CTRL")
+        button = self._button("Palette", [node])
+        button._set_color("#123456")
+        self.assertIn(button.color, SET_COLOR_PALETTE)
+
+        popup = PopupInput(palette=SET_COLOR_PALETTE)
+        try:
+            self.assertEqual(len(popup._color_buttons), 30)
+            popup.set_selected_color(SET_COLOR_PALETTE[-1])
+            self.assertEqual(popup.selected_color, SET_COLOR_PALETTE[-1])
+        finally:
+            popup.deleteLater()
+
+    def test_color_dots_filter_sets_and_shift_combines_filters(self):
+        nodes = [
+            cmds.createNode("transform", name="redA_CTRL"),
+            cmds.createNode("transform", name="redB_CTRL"),
+            cmds.createNode("transform", name="blue_CTRL"),
+        ]
+        red = SET_COLOR_PALETTE[0]
+        blue = SET_COLOR_PALETTE[14]
+        green = SET_COLOR_PALETTE[9]
+        page = TabPage()
+        page._auto_ns_timer.stop()
+        buttons = [
+            SetButton("Red A", [nodes[0]], color=red),
+            SetButton("Red B", [nodes[1]], color=red),
+            SetButton("Blue", [nodes[2]], color=blue),
+        ]
+        for button in buttons:
+            page.container.add_button(button)
+        try:
+            self.assertEqual(set(page.color_filter_dots), {red, blue})
+
+            page._on_color_filter_clicked(red, QtCore.Qt.NoModifier)
+            self.assertFalse(buttons[0].filtered_out)
+            self.assertFalse(buttons[1].filtered_out)
+            self.assertTrue(buttons[2].filtered_out)
+
+            page._on_color_filter_clicked(blue, QtCore.Qt.ShiftModifier)
+            self.assertFalse(any(button.filtered_out for button in buttons))
+            self.assertEqual(set(page.container.active_color_filters), {red, blue})
+
+            page._on_color_filter_clicked(red, QtCore.Qt.ShiftModifier)
+            self.assertTrue(buttons[0].filtered_out)
+            self.assertTrue(buttons[1].filtered_out)
+            self.assertFalse(buttons[2].filtered_out)
+
+            page._on_color_filter_clicked(blue, QtCore.Qt.NoModifier)
+            self.assertFalse(any(button.filtered_out for button in buttons))
+
+            buttons[2]._set_color(green)
+            self.assertEqual(set(page.color_filter_dots), {red, green})
         finally:
             page.deleteLater()
 

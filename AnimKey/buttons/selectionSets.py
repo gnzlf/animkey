@@ -20,6 +20,13 @@ except ImportError:
 
 WINDOW_OBJECT = "setManagerV7"
 DEFAULT_COLOR = "#3498DB"
+SET_COLOR_PALETTE = (
+    "#E74C3C", "#C0392B", "#D46A6A", "#B56576", "#D35400", "#E67E22",
+    "#F39C12", "#F1C40F", "#A3BE8C", "#2ECC71", "#27AE60", "#16A085",
+    "#1ABC9C", "#4DB6AC", "#3498DB", "#2980B9", "#5B8DEF", "#3F51B5",
+    "#607D8B", "#7F8C8D", "#9B59B6", "#8E44AD", "#6C5CE7", "#D46A9A",
+    "#E91E63", "#C2185B", "#8D6E63", "#795548", "#95A5A6", "#ECF0F1",
+)
 UI_BG = "#2B2B2B"
 UI_PANEL = "#333333"
 UI_CONTROL = "#383838"
@@ -47,6 +54,26 @@ def _maya_ui_icon(icon_name):
         if os.path.exists(path):
             return QtGui.QIcon(path)
     return QtGui.QIcon(":/" + icon_name)
+
+
+def _palette_color(color):
+    candidate = QtGui.QColor(color or DEFAULT_COLOR)
+    if not candidate.isValid():
+        return DEFAULT_COLOR
+    normalized = candidate.name().upper()
+    if normalized in SET_COLOR_PALETTE:
+        return normalized
+
+    red, green, blue, _alpha = candidate.getRgb()
+    return min(
+        SET_COLOR_PALETTE,
+        key=lambda value: (
+            (QtGui.QColor(value).red() - red) ** 2
+            + (QtGui.QColor(value).green() - green) ** 2
+            + (QtGui.QColor(value).blue() - blue) ** 2
+        ),
+    )
+
 
 def _get_icon_path(icon_name=None):
     """
@@ -520,12 +547,18 @@ class ResizeGrip(QtWidgets.QWidget):
 class PopupInput(QtWidgets.QWidget):
     submitted = QtCore.Signal(str)
     
-    def __init__(self, parent=None, placeholder="Set name...", initial_text=""):
+    def __init__(
+        self, parent=None, placeholder="Set name...", initial_text="",
+        palette=None, initial_color=DEFAULT_COLOR
+    ):
         super(PopupInput, self).__init__(parent)
         self.setWindowFlags(QtCore.Qt.Popup | QtCore.Qt.FramelessWindowHint)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
         self._initial_text = initial_text
         self._placeholder = placeholder
+        self._palette = tuple(palette or ())
+        self.selected_color = _palette_color(initial_color)
+        self._color_buttons = []
         self.setup_ui()
         
     def setup_ui(self):
@@ -541,9 +574,12 @@ class PopupInput(QtWidgets.QWidget):
             }
         """)
         
-        c_layout = QtWidgets.QHBoxLayout(container)
+        c_layout = QtWidgets.QVBoxLayout(container)
         c_layout.setContentsMargins(12, 12, 12, 12)
         c_layout.setSpacing(8)
+
+        input_row = QtWidgets.QHBoxLayout()
+        input_row.setSpacing(8)
         
         self.input = QtWidgets.QLineEdit()
         self.input.setPlaceholderText(self._placeholder)
@@ -561,7 +597,7 @@ class PopupInput(QtWidgets.QWidget):
             QLineEdit:focus { border-color: #3498DB; }
         """)
         self.input.returnPressed.connect(self.submit)
-        c_layout.addWidget(self.input)
+        input_row.addWidget(self.input)
         
         ok_btn = QtWidgets.QPushButton("✓")
         ok_btn.setFixedSize(36, 36)
@@ -578,9 +614,46 @@ class PopupInput(QtWidgets.QWidget):
             QPushButton:hover { background-color: #4AA3DF; border-color: #4AA3DF; }
         """)
         ok_btn.clicked.connect(self.submit)
-        c_layout.addWidget(ok_btn)
+        input_row.addWidget(ok_btn)
+        c_layout.addLayout(input_row)
+
+        if self._palette:
+            palette_widget = QtWidgets.QWidget(container)
+            palette_grid = QtWidgets.QGridLayout(palette_widget)
+            palette_grid.setContentsMargins(0, 2, 0, 0)
+            palette_grid.setHorizontalSpacing(5)
+            palette_grid.setVerticalSpacing(5)
+            for index, color in enumerate(self._palette):
+                button = QtWidgets.QToolButton(palette_widget)
+                button.setFixedSize(24, 24)
+                button.setCursor(QtCore.Qt.PointingHandCursor)
+                button.setToolTip(color)
+                button.clicked.connect(
+                    lambda checked=False, value=color: self.set_selected_color(value)
+                )
+                palette_grid.addWidget(button, index // 10, index % 10)
+                self._color_buttons.append((button, color))
+            c_layout.addWidget(palette_widget)
+            self._update_color_buttons()
         
         layout.addWidget(container)
+
+    def _update_color_buttons(self):
+        for button, color in self._color_buttons:
+            selected = color == self.selected_color
+            button.setStyleSheet(
+                "QToolButton {{ background-color: {}; border: {}px solid {}; "
+                "border-radius: 4px; }} "
+                "QToolButton:hover {{ border-color: #78BFFF; }}".format(
+                    color,
+                    2 if selected else 1,
+                    "#F5F5F7" if selected else "#222222",
+                )
+            )
+
+    def set_selected_color(self, color):
+        self.selected_color = _palette_color(color)
+        self._update_color_buttons()
         
     def submit(self):
         self.submitted.emit(self.input.text().strip())
@@ -595,6 +668,47 @@ class PopupInput(QtWidgets.QWidget):
         if e.key() == QtCore.Qt.Key_Escape:
             self.close()
         super(PopupInput, self).keyPressEvent(e)
+
+
+class ColorFilterDot(QtWidgets.QAbstractButton):
+    activated = QtCore.Signal(str, object)
+
+    def __init__(self, color, parent=None):
+        super(ColorFilterDot, self).__init__(parent)
+        self.color = _palette_color(color)
+        self.selected = False
+        self.setFixedSize(16, 20)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.setToolTip("Filter " + self.color)
+
+    def set_selected(self, selected):
+        self.selected = bool(selected)
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        modifiers = event.modifiers()
+        inside = self.rect().contains(event.pos())
+        super(ColorFilterDot, self).mouseReleaseEvent(event)
+        if event.button() == QtCore.Qt.LeftButton and inside:
+            self.activated.emit(self.color, modifiers)
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        center = self.rect().center()
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(QtGui.QColor(self.color))
+        painter.drawEllipse(center, 5, 5)
+        if self.selected:
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.setPen(QtGui.QPen(QtGui.QColor("#78BFFF"), 2))
+            painter.drawEllipse(center, 7, 7)
+        elif self.underMouse():
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.setPen(QtGui.QPen(QtGui.QColor("#D8DEE9"), 1.5))
+            painter.drawEllipse(center, 6, 6)
+        painter.end()
 
 
 # ============================================================================
@@ -667,7 +781,7 @@ class SetButton(QtWidgets.QFrame):
         self, name, members, color=DEFAULT_COLOR, get_namespace_func=None,
         get_namespaces_func=None, board_pos=None, namespaces=None, size_scale=1.0,
         board_size=None, namespace_mode="page", member_namespaces=None,
-        namespace_dynamic_func=None, member_bindings=None
+        namespace_dynamic_func=None, member_bindings=None, members_hidden=None
     ):
         super(SetButton, self).__init__()
         self.set_name = name
@@ -731,7 +845,7 @@ class SetButton(QtWidgets.QFrame):
 
         self._rebuild_member_metadata()
 
-        self.color = color
+        self.color = _palette_color(color)
         self.get_namespace = get_namespace_func or (lambda: "")
         self.get_namespaces = get_namespaces_func or (lambda: [self.get_namespace()])
         self.get_namespace_dynamic = namespace_dynamic_func or (lambda: True)
@@ -763,7 +877,9 @@ class SetButton(QtWidgets.QFrame):
         self._resize_handle_size = 22
         self.free_move_mode = False
         self.ui_selected = False
-        self.members_hidden = False
+        self.filtered_out = False
+        self._visibility_state_explicit = members_hidden is not None
+        self.members_hidden = bool(members_hidden)
         self.board_pos = QtCore.QPoint(0, 0)
         if isinstance(board_pos, dict):
             self.board_pos = QtCore.QPoint(int(board_pos.get("x", 0)), int(board_pos.get("y", 0)))
@@ -823,7 +939,8 @@ class SetButton(QtWidgets.QFrame):
         
         self.apply_style()
         self.update_size()
-        self.refresh_visibility_state()
+        if not self._visibility_state_explicit:
+            self.refresh_visibility_state()
         self.update_tooltip()
 
     def _default_size_for_scale(self, scale=None):
@@ -1177,7 +1294,7 @@ class SetButton(QtWidgets.QFrame):
             clip_path = QtGui.QPainterPath()
             clip_path.addRoundedRect(hatch_rect, radius, radius)
             painter.setClipPath(clip_path)
-            hatch = QtGui.QColor(235, 238, 242, 48)
+            hatch = QtGui.QColor(235, 238, 242, 88)
             painter.setPen(QtGui.QPen(hatch, max(1.0, zoom)))
             spacing = max(5, int(round(7 * zoom)))
             for x in range(-self.height(), self.width() + self.height(), spacing):
@@ -1398,9 +1515,9 @@ class SetButton(QtWidgets.QFrame):
         if not members:
             cmds.warning("No valid set members found.")
             return
-        self._set_members_hidden(not self._members_are_hidden(members), members=members)
+        self._set_members_hidden(not self.members_hidden, members=members)
 
-    def _set_members_hidden(self, hidden, members=None, manage_undo=True):
+    def _set_members_hidden(self, hidden, members=None, manage_undo=True, save=True):
         members = members or self._resolved_members_for_action()
         if not members:
             cmds.warning("No valid set members found.")
@@ -1420,9 +1537,12 @@ class SetButton(QtWidgets.QFrame):
             if manage_undo:
                 cmds.undoInfo(closeChunk=True)
         if succeeded:
+            self._visibility_state_explicit = True
             self.members_hidden = bool(hidden)
             self.apply_style()
             self.update()
+            if save:
+                self._auto_save()
         return succeeded
 
     def do_hide_members(self):
@@ -1474,15 +1594,10 @@ class SetButton(QtWidgets.QFrame):
     def _auto_save(self):
         """Trigger auto-save on the parent window"""
         try:
-            # Navigate up to the SetManagerWindow
-            parent = self.parent()  # FlowContainer
-            if parent:
-                tab_page = parent.parent()  # TabPage's scroll area's widget
-                if tab_page:
-                    window = tab_page.window()  # SetManagerWindow
-                    if hasattr(window, 'save_data'):
-                        window.save_data()
-        except:
+            window = self.window()
+            if hasattr(window, "save_data"):
+                window.save_data()
+        except Exception:
             pass
         
     def do_add_sel(self):
@@ -1539,11 +1654,49 @@ class SetButton(QtWidgets.QFrame):
             self._auto_save()
             
     def do_color(self):
-        c = QtWidgets.QColorDialog.getColor(QtGui.QColor(self.color), self)
-        if c.isValid():
-            self.color = c.name()
-            self.apply_style()
-            self._auto_save()
+        menu = QtWidgets.QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background: #333333; border: 1px solid #444444; padding: 7px; }"
+        )
+        palette_widget = QtWidgets.QWidget(menu)
+        grid = QtWidgets.QGridLayout(palette_widget)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(5)
+        for index, color in enumerate(SET_COLOR_PALETTE):
+            swatch = QtWidgets.QToolButton(palette_widget)
+            swatch.setFixedSize(24, 24)
+            swatch.setCursor(QtCore.Qt.PointingHandCursor)
+            swatch.setToolTip(color)
+            swatch.setStyleSheet(
+                "QToolButton {{ background-color: {}; border: {}px solid {}; "
+                "border-radius: 4px; }} "
+                "QToolButton:hover {{ border-color: #78BFFF; }}".format(
+                    color,
+                    2 if color == self.color else 1,
+                    "#F5F5F7" if color == self.color else "#222222",
+                )
+            )
+            swatch.clicked.connect(
+                lambda checked=False, value=color, popup=menu: (
+                    self._set_color(value), popup.close()
+                )
+            )
+            grid.addWidget(swatch, index // 10, index % 10)
+        action = QtWidgets.QWidgetAction(menu)
+        action.setDefaultWidget(palette_widget)
+        menu.addAction(action)
+        menu.exec_(QtGui.QCursor.pos())
+
+    def _set_color(self, color):
+        color = _palette_color(color)
+        if color == self.color:
+            return
+        self.color = color
+        self.apply_style()
+        parent = self.parentWidget()
+        if hasattr(parent, "on_button_color_changed"):
+            parent.on_button_color_changed(self)
+        self._auto_save()
             
     def do_delete(self):
         self.deleted.emit(self)
@@ -1554,6 +1707,7 @@ class SetButton(QtWidgets.QFrame):
             "name": self.set_name,
             "members": self.members,
             "color": self.color,
+            "members_hidden": self.members_hidden,
             "namespace_mode": self.namespace_mode,
             "namespaces": self.namespaces,
             "member_namespaces": self.member_namespaces,
@@ -1571,10 +1725,12 @@ class SetButton(QtWidgets.QFrame):
 class FlowContainer(QtWidgets.QWidget):
     layout_mode_changed = QtCore.Signal(str)
     selection_changed = QtCore.Signal()
+    colors_changed = QtCore.Signal()
 
     def __init__(self):
         super(FlowContainer, self).__init__()
         self.buttons = []
+        self.active_color_filters = []
         self.manual_mode = True
         self.layout_mode = "ordered"
         self.drop_index = -1
@@ -1873,17 +2029,63 @@ class FlowContainer(QtWidgets.QWidget):
         
     def add_button(self, btn):
         btn.setParent(self)
-        btn.show()
         btn.deleted.connect(self.remove_button)
         btn.position_changed.connect(self.on_button_position_changed)
         self.buttons.append(btn)
+        btn.filtered_out = (
+            bool(self.active_color_filters)
+            and btn.color not in self.active_color_filters
+        )
+        btn.setVisible(not btn.filtered_out)
         if self.layout_mode == "board" and btn.board_pos == QtCore.QPoint(0, 0):
             btn.board_pos = self._next_board_position()
         btn.set_free_move_mode(self.layout_mode == "board")
         self.reflow()
+        self.colors_changed.emit()
+
+    def available_colors(self):
+        colors = []
+        for button in self.buttons:
+            if button.color not in colors:
+                colors.append(button.color)
+        return colors
+
+    def set_color_filters(self, colors):
+        available = self.available_colors()
+        self.active_color_filters = []
+        for color in colors or []:
+            color = _palette_color(color)
+            if color in available and color not in self.active_color_filters:
+                self.active_color_filters.append(color)
+        selection_changed = False
+        for button in self.buttons:
+            filtered_out = (
+                bool(self.active_color_filters)
+                and button.color not in self.active_color_filters
+            )
+            button.filtered_out = filtered_out
+            button.setVisible(not filtered_out)
+            if filtered_out and button.ui_selected:
+                button.set_ui_selected(False)
+                selection_changed = True
+        self.reflow()
+        if selection_changed:
+            self.selection_changed.emit()
+
+    def on_button_color_changed(self, button):
+        available = self.available_colors()
+        self.active_color_filters = [
+            color for color in self.active_color_filters
+            if color in available
+        ]
+        self.set_color_filters(self.active_color_filters)
+        self.colors_changed.emit()
 
     def selected_buttons(self):
-        return [btn for btn in self.buttons if btn.ui_selected]
+        return [
+            btn for btn in self.buttons
+            if btn.ui_selected and not btn.filtered_out
+        ]
 
     def select_buttons(self, buttons, modifiers=QtCore.Qt.NoModifier):
         requested = set(buttons or [])
@@ -1914,15 +2116,18 @@ class FlowContainer(QtWidgets.QWidget):
             self.reflow()
             if was_selected:
                 self.selection_changed.emit()
+            self.on_button_color_changed(btn)
             
     def clear_all(self):
         had_selection = bool(self.selected_buttons())
         for b in self.buttons[:]:
             b.deleteLater()
         self.buttons = []
+        self.active_color_filters = []
         self.reflow()
         if had_selection:
             self.selection_changed.emit()
+        self.colors_changed.emit()
 
     def _auto_save(self):
         try:
@@ -1959,7 +2164,10 @@ class FlowContainer(QtWidgets.QWidget):
         spacing = 10
         zoom = max(0.05, float(self.board_zoom or 1.0))
         max_width = max(int(round(max(self.width(), 220) / zoom)), 220)
-        placed = [btn for btn in self.buttons if btn.board_pos != QtCore.QPoint(0, 0)]
+        placed = [
+            btn for btn in self.buttons
+            if not btn.filtered_out and btn.board_pos != QtCore.QPoint(0, 0)
+        ]
         if not placed:
             return QtCore.QPoint(margin, margin)
         last = placed[-1]
@@ -1984,6 +2192,8 @@ class FlowContainer(QtWidgets.QWidget):
             bottom = max(bottom, bg_h + margin)
             right = max(right, bg_w + margin)
         for btn in self.buttons:
+            if btn.filtered_out:
+                continue
             btn_right = int(round((btn.board_pos.x() + btn.board_size.width()) * zoom))
             btn_bottom = int(round((btn.board_pos.y() + btn.board_size.height()) * zoom))
             bottom = max(bottom, btn_bottom + margin)
@@ -2001,11 +2211,12 @@ class FlowContainer(QtWidgets.QWidget):
         self._auto_save()
         
     def reflow(self):
+        visible_buttons = [btn for btn in self.buttons if not btn.filtered_out]
         if self.layout_mode == "board":
-            if not self.buttons:
+            if not visible_buttons:
                 self.update_board_bounds()
                 return
-            for btn in self.buttons:
+            for btn in visible_buttons:
                 if btn.free_move_mode:
                     btn._apply_button_size()
                 else:
@@ -2021,7 +2232,7 @@ class FlowContainer(QtWidgets.QWidget):
             self.update_board_bounds()
             return
 
-        if not self.buttons:
+        if not visible_buttons:
             self.setMinimumWidth(0)
             self.setMinimumHeight(50)
             return
@@ -2033,7 +2244,7 @@ class FlowContainer(QtWidgets.QWidget):
         row_height = 0
         max_width = max(self.width(), 200)
         
-        for btn in self.buttons:
+        for btn in visible_buttons:
             btn.set_free_move_mode(False)
             bw = btn.width()
             bh = btn.height()
@@ -2066,7 +2277,10 @@ class FlowContainer(QtWidgets.QWidget):
         return None
 
     def _select_buttons_in_rect(self, rect, modifiers):
-        buttons = [btn for btn in self.buttons if rect.intersects(btn.geometry())]
+        buttons = [
+            btn for btn in self.buttons
+            if not btn.filtered_out and rect.intersects(btn.geometry())
+        ]
         self.select_buttons(buttons, modifiers)
         members = []
         seen = set()
@@ -2159,22 +2373,28 @@ class FlowContainer(QtWidgets.QWidget):
         painter.end()
         
     def get_insert_index(self, pos):
-        if not self.buttons:
+        visible_buttons = [btn for btn in self.buttons if not btn.filtered_out]
+        if not visible_buttons:
             return 0
-        for i, btn in enumerate(self.buttons):
+        for btn in visible_buttons:
             geo = btn.geometry()
             if abs(pos.y() - geo.center().y()) < geo.height() * 0.7:
                 if pos.x() < geo.center().x():
-                    return i
+                    return self.buttons.index(btn)
         return len(self.buttons)
         
     def get_indicator_pos(self, index):
-        if not self.buttons:
+        visible_buttons = [btn for btn in self.buttons if not btn.filtered_out]
+        if not visible_buttons:
             return QtCore.QPoint(8, 8)
         if index >= len(self.buttons):
-            btn = self.buttons[-1]
+            btn = visible_buttons[-1]
             return QtCore.QPoint(btn.geometry().right() + 4, btn.y())
-        return QtCore.QPoint(self.buttons[index].x() - 4, self.buttons[index].y())
+        for btn in self.buttons[index:]:
+            if not btn.filtered_out:
+                return QtCore.QPoint(btn.x() - 4, btn.y())
+        btn = visible_buttons[-1]
+        return QtCore.QPoint(btn.geometry().right() + 4, btn.y())
             
     def dragEnterEvent(self, e):
         if self.layout_mode == "ordered" and self.manual_mode and e.mimeData().hasText():
@@ -2375,6 +2595,13 @@ class TabPage(QtWidgets.QWidget):
         self.board_mode_btn.clicked.connect(lambda: self.set_layout_mode("board"))
         ns_row.addWidget(self.board_mode_btn)
 
+        self.color_filter_widget = QtWidgets.QWidget(self)
+        self.color_filter_layout = QtWidgets.QHBoxLayout(self.color_filter_widget)
+        self.color_filter_layout.setContentsMargins(2, 0, 2, 0)
+        self.color_filter_layout.setSpacing(1)
+        self.color_filter_dots = {}
+        ns_row.addWidget(self.color_filter_widget)
+
         ns_row.addStretch()
         
         # Add set button
@@ -2414,10 +2641,12 @@ class TabPage(QtWidgets.QWidget):
         self.container.setStyleSheet("background-color: #333333;")
         self.container.layout_mode_changed.connect(self._sync_layout_mode_buttons)
         self.container.selection_changed.connect(self._update_set_visibility_button)
+        self.container.colors_changed.connect(self._rebuild_color_filter_dots)
         self.scroll.setWidget(self.container)
         self.scroll.viewport().installEventFilter(self)
         self.container.installEventFilter(self)
         self._update_set_visibility_button()
+        self._rebuild_color_filter_dots()
         
         layout.addWidget(self.scroll)
 
@@ -2478,8 +2707,6 @@ class TabPage(QtWidgets.QWidget):
         if not hasattr(self, "set_visibility_btn") or not hasattr(self, "container"):
             return
         selected = self.container.selected_buttons()
-        for button in selected:
-            button.refresh_visibility_state()
         all_hidden = bool(selected) and all(button.members_hidden for button in selected)
         icon_name = "over_show.png" if all_hidden else "over_hide.png"
         self.set_visibility_btn.setIcon(_maya_ui_icon(icon_name))
@@ -2493,15 +2720,49 @@ class TabPage(QtWidgets.QWidget):
         if not selected:
             cmds.warning("Select one or more sets first.")
             return
-        for button in selected:
-            button.refresh_visibility_state()
         hidden = not all(button.members_hidden for button in selected)
         cmds.undoInfo(openChunk=True, chunkName="AnimKey_SetVisibility")
         try:
             for button in selected:
-                button._set_members_hidden(hidden, manage_undo=False)
+                button._set_members_hidden(
+                    hidden, manage_undo=False, save=False
+                )
         finally:
             cmds.undoInfo(closeChunk=True)
+        self._update_set_visibility_button()
+        window = self.window()
+        if hasattr(window, "save_data"):
+            window.save_data()
+
+    def _rebuild_color_filter_dots(self):
+        if not hasattr(self, "color_filter_layout") or not hasattr(self, "container"):
+            return
+        while self.color_filter_layout.count():
+            item = self.color_filter_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.color_filter_dots = {}
+        for color in self.container.available_colors():
+            dot = ColorFilterDot(color, self.color_filter_widget)
+            dot.set_selected(color in self.container.active_color_filters)
+            dot.activated.connect(self._on_color_filter_clicked)
+            self.color_filter_layout.addWidget(dot)
+            self.color_filter_dots[color] = dot
+        self.color_filter_widget.setVisible(bool(self.color_filter_dots))
+
+    def _on_color_filter_clicked(self, color, modifiers=QtCore.Qt.NoModifier):
+        color = _palette_color(color)
+        active = list(self.container.active_color_filters)
+        if modifiers & QtCore.Qt.ShiftModifier:
+            if color in active:
+                active.remove(color)
+            else:
+                active.append(color)
+        else:
+            active = [] if active == [color] else [color]
+        self.container.set_color_filters(active)
+        for dot_color, dot in self.color_filter_dots.items():
+            dot.set_selected(dot_color in self.container.active_color_filters)
         self._update_set_visibility_button()
 
     def set_namespace_dynamic(self, dynamic, save=True):
@@ -2635,13 +2896,22 @@ class TabPage(QtWidgets.QWidget):
             cmds.warning("Nothing selected!")
             return
             
-        popup = PopupInput(self, "Set name...")
-        popup.submitted.connect(lambda name: self.create_set(name, sel))
+        popup = PopupInput(
+            self,
+            "Set name...",
+            palette=SET_COLOR_PALETTE,
+            initial_color=DEFAULT_COLOR,
+        )
+        popup.submitted.connect(
+            lambda name, editor=popup: self.create_set(
+                name, sel, editor.selected_color
+            )
+        )
         btn_pos = self.add_btn.mapToGlobal(QtCore.QPoint(0, self.add_btn.height() + 5))
         popup.move(btn_pos.x() - 150, btn_pos.y())
         popup.show()
         
-    def create_set(self, name, sel):
+    def create_set(self, name, sel, color=DEFAULT_COLOR):
         if not name:
             name = f"Set{len(self.container.buttons)+1}"
         member_namespaces = get_member_namespace_map(sel)
@@ -2651,7 +2921,7 @@ class TabPage(QtWidgets.QWidget):
         btn = SetButton(
             name,
             sel,
-            DEFAULT_COLOR,
+            _palette_color(color),
             get_namespace_func=self.get_namespace,
             get_namespaces_func=self.get_target_namespaces,
             namespace_dynamic_func=self.is_namespace_dynamic,
@@ -2707,7 +2977,8 @@ class TabPage(QtWidgets.QWidget):
                 member_namespaces=saved_member_namespaces,
                 member_bindings=s.get("member_bindings"),
                 size_scale=s.get("size_scale", 1.0),
-                board_size=s.get("board_size")
+                board_size=s.get("board_size"),
+                members_hidden=s.get("members_hidden"),
             )
             self.container.add_button(btn)
         self.container.reflow()
@@ -3371,7 +3642,7 @@ def export_sets(*args):
     
     # Add version for export
     export_data = {
-        "version": "1.4",
+        "version": "1.5",
         "sort_mode": data.get("sort_mode", "Manual"),
         "current_tab": data.get("current_tab", 0),
         "tabs": data.get("tabs", []),
