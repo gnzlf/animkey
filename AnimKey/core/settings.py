@@ -1126,7 +1126,7 @@ class SettingsWindow(QtWidgets.QWidget):
             ("LKN", "Link Objects"),
             ("CAM", "Follow Cam"),
             ("WS", "World Space Copy"),
-            ("PIV", "Temp Control"),
+            ("PIV", "TEMP"),
             ("RUL", "Ruler"),
             ("RTM", "Retimer"),
         ])
@@ -1429,7 +1429,7 @@ class SettingsWindow(QtWidgets.QWidget):
             "RST": "Reset Values", "OFF": "Anim Offset",  "HIR": "Hierarchy",  "MIR": "Mirror",
             # Group 3
             "C":   "Copy Anim",    "LKN": "Link Objects", "CAM": "Follow Cam",
-            "WS":  "Worldspace",   "PIV": "Temp Control", "RUL": "Micro Move",
+            "WS":  "Worldspace",   "PIV": "TEMP",         "RUL": "Micro Move",
             # Group 4 – Tangents
             "PLT": "Plateau",      "STP": "Step",         "FLT": "Flat",
             "LIN": "Linear",       "CLP": "Clamped",      "SPL": "Spline",     "AUT": "Auto",

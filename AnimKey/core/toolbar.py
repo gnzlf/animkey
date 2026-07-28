@@ -2535,7 +2535,7 @@ class AnimKeyToolbar:
             ("LKN", "Link Objects", link_objects_execute, "#b48ead"),      # Purple - Link Objects
             ("CAM", "Follow Cam", follow_cam_execute, "#5e81ac"),          # Dark Blue - Follow Cam
             ("WS", "World Space Copy", copy_worldspace_execute, "#a3be8c"), # Green - Copy Worldspace
-            ("PIV", "Temp Pivot (Right-click: Temp Control)", temp_pivot_quick_execute, "#bf616a"),
+            ("PIV", "TEMP (Right-click: Temp Control)", temp_pivot_quick_execute, "#bf616a"),
             ("RUL", "Micro Move", None, "#ebcb8b"),                        # Yellow - Micro Move (callback set separately)
         ]
         
@@ -2655,9 +2655,11 @@ class AnimKeyToolbar:
             # Special handling for PIV button (temp control)
             elif text == "PIV":
                 piv_btn = btn
-                btn.clicked.connect(picking_wrapper(temp_pivot_quick_execute))
-                if is_temp_pivot_active():
-                    set_temp_pivot_button_active(btn, True)
+                btn.clicked.connect(
+                    picking_wrapper(
+                        lambda checked=False, b=piv_btn: temp_pivot_quick_execute(button=b)
+                    )
+                )
             # Special handling for C button (copy animation) – pass button ref for popup anchoring
             elif text == "C":
                 copy_btn = btn
@@ -2772,6 +2774,9 @@ class AnimKeyToolbar:
                     background-color: {theme["button_pressed"]};
                 }}
             ''')
+
+            if text == "PIV" and is_temp_pivot_active():
+                set_temp_pivot_button_active(btn, True)
             
             # Register in the button widget map for live hide/show
             self._button_widgets[text] = btn

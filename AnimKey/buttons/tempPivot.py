@@ -127,6 +127,34 @@ def activate_temp_pivot(objects=None, pivot_mode="last", edit_pivot=True):
     }
 
 
+def deactivate_temp_pivot():
+    """Reset Maya's custom manipulator pivot to its normal behavior."""
+    undo_open = False
+    try:
+        cmds.undoInfo(openChunk=True, chunkName="AnimKey Temp Pivot Off")
+        undo_open = True
+
+        if cmds.manipRotateContext("Rotate", query=True, editPivotMode=True):
+            cmds.ctxEditMode()
+        cmds.manipPivot(pinPivot=False)
+        cmds.manipPivot(reset=True)
+        cmds.manipRotateContext(
+            "Rotate",
+            edit=True,
+            pinPivot=False,
+            useManipPivot=False,
+            useCenterPivot=False,
+            useObjectPivot=False,
+        )
+        return True
+    except Exception as exc:
+        om.MGlobal.displayError("Temp Pivot reset error: {}".format(exc))
+        return False
+    finally:
+        if undo_open:
+            cmds.undoInfo(closeChunk=True)
+
+
 # ============================================================
 # CORE LOGIC (Matrix-Based)
 # ============================================================
@@ -1742,22 +1770,80 @@ def execute_temp_pivot(*args, **kwargs):
     from AnimKey.core.executionGuard import require_animkey_context
     if not require_animkey_context("AnimKey.buttons.tempPivot.execute_temp_pivot"):
         return None
-    return activate_temp_pivot(
+    button = kwargs.get("button")
+    if is_active():
+        deactivated = deactivate_temp_pivot()
+        if deactivated:
+            set_button_active(button, False)
+        return False if deactivated else None
+
+    result = activate_temp_pivot(
         objects=kwargs.get("objects"),
         pivot_mode=kwargs.get("pivot_mode", "last"),
         edit_pivot=kwargs.get("edit_pivot", True),
     )
+    set_button_active(button, bool(result))
+    return bool(result)
 
 
 def is_active():
-    return len(get_controlled_objects()) > 0
+    try:
+        return bool(
+            cmds.manipPivot(query=True, valid=True)
+            and cmds.manipPivot(query=True, pinPivot=True)
+            and cmds.manipRotateContext("Rotate", query=True, useManipPivot=True)
+        )
+    except Exception:
+        return False
 
 def cleanup_orphans():
     delete_temp_system()
     
 def set_button_active(button, active):
-    # This is for toolbar integration, not really used in this window-based tool
-    pass
+    if button is None:
+        return
+
+    try:
+        from AnimKey.mods.themes import ThemeManager
+        theme = ThemeManager.get_current_theme()
+        color = "#bf616a"
+
+        if active:
+            active_bg = "#8f454d"
+            button.setStyleSheet(f'''
+                QPushButton {{
+                    color: #ffffff;
+                    background-color: {active_bg};
+                    border: 2px solid {color};
+                    border-radius: 4px;
+                    font-size: 9px;
+                    font-weight: bold;
+                }}
+                QPushButton:hover {{
+                    background-color: {active_bg};
+                    border-color: {color};
+                }}
+                QPushButton:pressed {{
+                    background-color: {theme["button_pressed"]};
+                }}
+            ''')
+        else:
+            button.setStyleSheet(f'''
+                QPushButton {{
+                    background-color: {theme["button_bg"]};
+                    border: 1px solid {theme["border_color"]};
+                    border-radius: 4px;
+                }}
+                QPushButton:hover {{
+                    background-color: {theme["button_hover"]};
+                    border-color: {color};
+                }}
+                QPushButton:pressed {{
+                    background-color: {theme["button_pressed"]};
+                }}
+            ''')
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     show()

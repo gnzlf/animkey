@@ -88,6 +88,69 @@ class TempPivotTests(unittest.TestCase):
         open_maya.MGlobal.displayWarning.assert_called_once()
         set_tool.assert_not_called()
 
+    def test_deactivate_resets_custom_pivot_and_exits_edit_mode(self):
+        with mock.patch.object(tempPivot.cmds, "manipPivot") as manip_pivot:
+            with mock.patch.object(
+                tempPivot.cmds, "manipRotateContext", return_value=True
+            ) as rotate_context:
+                with mock.patch.object(tempPivot.cmds, "ctxEditMode") as edit_mode:
+                    result = tempPivot.deactivate_temp_pivot()
+
+        self.assertTrue(result)
+        edit_mode.assert_called_once_with()
+        manip_pivot.assert_has_calls(
+            [
+                mock.call(pinPivot=False),
+                mock.call(reset=True),
+            ]
+        )
+        rotate_context.assert_has_calls(
+            [
+                mock.call("Rotate", query=True, editPivotMode=True),
+                mock.call(
+                    "Rotate",
+                    edit=True,
+                    pinPivot=False,
+                    useManipPivot=False,
+                    useCenterPivot=False,
+                    useObjectPivot=False,
+                ),
+            ]
+        )
+
+    def test_execute_temp_pivot_toggles_button_state(self):
+        button = mock.Mock()
+
+        with mock.patch.object(tempPivot, "is_active", return_value=False):
+            with mock.patch.object(
+                tempPivot, "activate_temp_pivot", return_value={"pivot": [0, 0, 0]}
+            ) as activate:
+                with mock.patch.object(tempPivot, "set_button_active") as set_active:
+                    with mock.patch(
+                        "AnimKey.core.executionGuard.require_animkey_context",
+                        return_value=True,
+                    ):
+                        result = tempPivot.execute_temp_pivot(button=button)
+
+        self.assertTrue(result)
+        activate.assert_called_once()
+        set_active.assert_called_once_with(button, True)
+
+        with mock.patch.object(tempPivot, "is_active", return_value=True):
+            with mock.patch.object(
+                tempPivot, "deactivate_temp_pivot", return_value=True
+            ) as deactivate:
+                with mock.patch.object(tempPivot, "set_button_active") as set_active:
+                    with mock.patch(
+                        "AnimKey.core.executionGuard.require_animkey_context",
+                        return_value=True,
+                    ):
+                        result = tempPivot.execute_temp_pivot(button=button)
+
+        self.assertFalse(result)
+        deactivate.assert_called_once_with()
+        set_active.assert_called_once_with(button, False)
+
 
 if __name__ == "__main__":
     unittest.main()

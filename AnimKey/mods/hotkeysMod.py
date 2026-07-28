@@ -218,7 +218,7 @@ def get_action_function(action_name):
         "LKN": "import AnimKey.buttons.linkObjects as mod; mod.execute()",
         "CAM": "import AnimKey.buttons.followCam as mod; mod.execute()",
         "WS": "import AnimKey.buttons.copyWorldspace as mod; mod.execute()",
-        "PIV": "# Temp Control - not implemented yet",
+        "PIV": "import AnimKey.buttons.tempPivot as mod; mod.execute_temp_pivot()",
         "RUL": "import AnimKey.buttons.microMove as mod; mod.execute()",
         "RTM": "import AnimKey.buttons.retimer as mod; mod.execute()",
         
