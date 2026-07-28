@@ -16,6 +16,7 @@ from AnimKey.buttons import tempPivot
 class TempPivotTests(unittest.TestCase):
     def setUp(self):
         cmds.file(new=True, force=True)
+        tempPivot._temp_pivot_restore_state = None
         self.first = cmds.polyCube(name="pivot_first")[0]
         self.last = cmds.polyCube(name="pivot_last")[0]
         cmds.xform(self.first, worldSpace=True, translation=(1.0, 2.0, 3.0))
@@ -89,12 +90,26 @@ class TempPivotTests(unittest.TestCase):
         set_tool.assert_not_called()
 
     def test_deactivate_resets_custom_pivot_and_exits_edit_mode(self):
+        tempPivot._temp_pivot_restore_state = {
+            "object_pivots": {},
+            "tool_context": "moveSuperContext",
+            "manip_valid": False,
+            "rotate_context": {
+                "pinPivot": False,
+                "useManipPivot": False,
+                "useCenterPivot": False,
+                "useObjectPivot": False,
+                "editPivotMode": False,
+            },
+        }
         with mock.patch.object(tempPivot.cmds, "manipPivot") as manip_pivot:
             with mock.patch.object(
                 tempPivot.cmds, "manipRotateContext", return_value=True
             ) as rotate_context:
-                with mock.patch.object(tempPivot.cmds, "ctxEditMode") as edit_mode:
-                    result = tempPivot.deactivate_temp_pivot()
+                with mock.patch.object(tempPivot.cmds, "currentCtx", return_value="RotateSuperContext"):
+                    with mock.patch.object(tempPivot.cmds, "setToolTo") as set_tool:
+                        with mock.patch.object(tempPivot.cmds, "ctxEditMode") as edit_mode:
+                            result = tempPivot.deactivate_temp_pivot()
 
         self.assertTrue(result)
         edit_mode.assert_called_once_with()
@@ -117,6 +132,60 @@ class TempPivotTests(unittest.TestCase):
                 ),
             ]
         )
+        set_tool.assert_called_once_with("moveSuperContext")
+        self.assertIsNone(tempPivot._temp_pivot_restore_state)
+
+    def test_restore_returns_object_pivot_without_changing_current_pose(self):
+        original_rotate_pivot = cmds.xform(
+            self.last, query=True, objectSpace=True, rotatePivot=True
+        )
+        original_scale_pivot = cmds.xform(
+            self.last, query=True, objectSpace=True, scalePivot=True
+        )
+        original_rotate_pivot_translate = cmds.getAttr(
+            self.last + ".rotatePivotTranslate"
+        )[0]
+        original_scale_pivot_translate = cmds.getAttr(
+            self.last + ".scalePivotTranslate"
+        )[0]
+        state = tempPivot._capture_temp_pivot_state([self.last])
+
+        cmds.xform(
+            self.last,
+            objectSpace=True,
+            preserve=True,
+            pivots=(3.0, -2.0, 5.0),
+        )
+        cmds.rotate(17.0, -8.0, 11.0, self.last, relative=True, objectSpace=True)
+        world_matrix_before_restore = cmds.xform(
+            self.last, query=True, worldSpace=True, matrix=True
+        )
+
+        tempPivot._restore_object_pivots(state)
+
+        self.assertEqual(
+            cmds.xform(self.last, query=True, objectSpace=True, rotatePivot=True),
+            original_rotate_pivot,
+        )
+        self.assertEqual(
+            cmds.xform(self.last, query=True, objectSpace=True, scalePivot=True),
+            original_scale_pivot,
+        )
+        self.assertEqual(
+            cmds.getAttr(self.last + ".rotatePivotTranslate")[0],
+            original_rotate_pivot_translate,
+        )
+        self.assertEqual(
+            cmds.getAttr(self.last + ".scalePivotTranslate")[0],
+            original_scale_pivot_translate,
+        )
+        world_matrix_after_restore = cmds.xform(
+            self.last, query=True, worldSpace=True, matrix=True
+        )
+        for actual, expected in zip(
+            world_matrix_after_restore, world_matrix_before_restore
+        ):
+            self.assertAlmostEqual(actual, expected, places=6)
 
     def test_execute_temp_pivot_toggles_button_state(self):
         button = mock.Mock()

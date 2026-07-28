@@ -33,6 +33,7 @@ TEMP_BAKE_ATTRS = [
 
 # Global window reference
 _temp_pivot_window = None
+_temp_pivot_restore_state = None
 
 def get_maya_main_window():
     return wrapInstance(int(omui.MQtUtil.mainWindow()), QtWidgets.QWidget)
@@ -84,14 +85,106 @@ def _temp_pivot_position(objects, pivot_mode="last"):
     return list(cmds.xform(objects[-1], query=True, worldSpace=True, rotatePivot=True))
 
 
+def _flat_vector(value):
+    if value and isinstance(value[0], (list, tuple)):
+        value = value[0]
+    return list(value) if value else None
+
+
+def _query_rotate_context_flag(flag, default=False):
+    try:
+        return cmds.manipRotateContext("Rotate", query=True, **{flag: True})
+    except Exception:
+        return default
+
+
+def _capture_temp_pivot_state(objects):
+    object_pivots = {}
+    for obj in objects:
+        try:
+            object_pivots[obj] = {
+                "rotate_pivot": list(
+                    cmds.xform(obj, query=True, objectSpace=True, rotatePivot=True)
+                ),
+                "scale_pivot": list(
+                    cmds.xform(obj, query=True, objectSpace=True, scalePivot=True)
+                ),
+                "rotate_pivot_translate": list(
+                    cmds.getAttr(obj + ".rotatePivotTranslate")[0]
+                ),
+                "scale_pivot_translate": list(
+                    cmds.getAttr(obj + ".scalePivotTranslate")[0]
+                ),
+            }
+        except Exception:
+            pass
+
+    manip_valid = bool(cmds.manipPivot(query=True, valid=True))
+    return {
+        "objects": list(objects),
+        "object_pivots": object_pivots,
+        "tool_context": cmds.currentCtx(),
+        "manip_valid": manip_valid,
+        "manip_position": (
+            _flat_vector(cmds.manipPivot(query=True, position=True))
+            if manip_valid
+            else None
+        ),
+        "manip_orientation": (
+            _flat_vector(cmds.manipPivot(query=True, orientation=True))
+            if manip_valid
+            else None
+        ),
+        "manip_pinned": bool(cmds.manipPivot(query=True, pinPivot=True)),
+        "rotate_context": {
+            "useManipPivot": bool(_query_rotate_context_flag("useManipPivot")),
+            "useCenterPivot": bool(_query_rotate_context_flag("useCenterPivot")),
+            "useObjectPivot": bool(_query_rotate_context_flag("useObjectPivot")),
+            "pinPivot": bool(_query_rotate_context_flag("pinPivot")),
+            "editPivotMode": bool(_query_rotate_context_flag("editPivotMode")),
+        },
+    }
+
+
+def _restore_object_pivots(state):
+    for obj, pivots in (state or {}).get("object_pivots", {}).items():
+        if not cmds.objExists(obj):
+            continue
+        try:
+            world_matrix = cmds.xform(
+                obj, query=True, worldSpace=True, matrix=True
+            )
+            for attr, value_key in (
+                ("rotatePivot", "rotate_pivot"),
+                ("scalePivot", "scale_pivot"),
+                ("rotatePivotTranslate", "rotate_pivot_translate"),
+                ("scalePivotTranslate", "scale_pivot_translate"),
+            ):
+                value = pivots.get(value_key)
+                if value is not None:
+                    cmds.setAttr(
+                        "{}.{}".format(obj, attr),
+                        *value,
+                        type="double3"
+                    )
+            cmds.xform(obj, worldSpace=True, matrix=world_matrix)
+        except Exception as exc:
+            cmds.warning(
+                "Temp Pivot: could not restore pivot for {}: {}".format(obj, exc)
+            )
+
+
 def activate_temp_pivot(objects=None, pivot_mode="last", edit_pivot=True):
     """Activate Maya's non-destructive custom manipulator pivot."""
+    global _temp_pivot_restore_state
+
     selected_objects = _selected_temp_pivot_objects(objects)
     if not selected_objects:
         om.MGlobal.displayWarning("Select one or more controls for Temp Pivot.")
         return None
 
     pivot_position = _temp_pivot_position(selected_objects, pivot_mode=pivot_mode)
+    _temp_pivot_restore_state = _capture_temp_pivot_state(selected_objects)
     undo_open = False
     try:
         cmds.undoInfo(openChunk=True, chunkName="AnimKey Temp Pivot")
@@ -128,24 +221,59 @@ def activate_temp_pivot(objects=None, pivot_mode="last", edit_pivot=True):
 
 
 def deactivate_temp_pivot():
-    """Reset Maya's custom manipulator pivot to its normal behavior."""
+    """Restore object pivots and Maya's manipulator state from before activation."""
+    global _temp_pivot_restore_state
+
+    restore_state = _temp_pivot_restore_state or {}
+    rotate_state = restore_state.get("rotate_context", {})
     undo_open = False
     try:
         cmds.undoInfo(openChunk=True, chunkName="AnimKey Temp Pivot Off")
         undo_open = True
 
         if cmds.manipRotateContext("Rotate", query=True, editPivotMode=True):
+            if cmds.currentCtx() != "RotateSuperContext":
+                cmds.setToolTo("RotateSuperContext")
             cmds.ctxEditMode()
+
+        _restore_object_pivots(restore_state)
+
         cmds.manipPivot(pinPivot=False)
         cmds.manipPivot(reset=True)
         cmds.manipRotateContext(
             "Rotate",
             edit=True,
-            pinPivot=False,
-            useManipPivot=False,
-            useCenterPivot=False,
-            useObjectPivot=False,
+            pinPivot=bool(rotate_state.get("pinPivot", False)),
+            useManipPivot=bool(rotate_state.get("useManipPivot", False)),
+            useCenterPivot=bool(rotate_state.get("useCenterPivot", False)),
+            useObjectPivot=bool(rotate_state.get("useObjectPivot", False)),
         )
+
+        if restore_state.get("manip_valid"):
+            position = restore_state.get("manip_position")
+            orientation = restore_state.get("manip_orientation")
+            if position:
+                cmds.manipPivot(position=position)
+            if orientation:
+                cmds.manipPivot(orientation=orientation)
+            cmds.manipPivot(
+                pinPivot=bool(restore_state.get("manip_pinned", False))
+            )
+
+        original_context = restore_state.get("tool_context")
+        if original_context:
+            cmds.setToolTo(original_context)
+
+        if (
+            rotate_state.get("editPivotMode")
+            and original_context == "RotateSuperContext"
+            and not cmds.manipRotateContext(
+                "Rotate", query=True, editPivotMode=True
+            )
+        ):
+            cmds.ctxEditMode()
+
+        _temp_pivot_restore_state = None
         return True
     except Exception as exc:
         om.MGlobal.displayError("Temp Pivot reset error: {}".format(exc))
