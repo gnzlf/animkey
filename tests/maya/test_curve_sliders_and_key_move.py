@@ -11,6 +11,7 @@ except RuntimeError:
 import maya.cmds as cmds
 
 from AnimKey.buttons import keyframe_move
+from AnimKey.core.animation_offset_session import resolve_target_curve_for_layer
 from AnimKey.sliders import (
     curve_ease_in_out,
     curve_flat,
@@ -96,14 +97,24 @@ class KeyframeMoveTests(unittest.TestCase):
         values = cmds.keyframe(attr_full, query=True, valueChange=True) or []
         return list(zip([float(time) for time in times], [float(value) for value in values]))
 
+    def _curve_keys(self, curve):
+        times = cmds.keyframe(curve, query=True, timeChange=True) or []
+        values = cmds.keyframe(curve, query=True, valueChange=True) or []
+        return list(zip([float(time) for time in times], [float(value) for value in values]))
+
+    def _select_layer(self, selected_layer):
+        for layer in cmds.ls(type="animLayer") or []:
+            cmds.animLayer(layer, edit=True, selected=False, preferred=False)
+        cmds.animLayer(selected_layer, edit=True, selected=True, preferred=True)
+
     def test_left_arrow_pulls_nearest_right_key_to_current_frame(self):
         self._set_keys("translateX", ((1.0, 1.0), (10.0, 10.0), (20.0, 20.0)))
         cmds.currentTime(12.0)
         cmds.select(self.control, replace=True)
 
-        moved = keyframe_move.move_neighbor_key_to_current(-1)
+        result = keyframe_move.move_key_with_arrow(-1, frame_amount=4)
 
-        self.assertEqual(moved, 1)
+        self.assertEqual(result, {"mode": "neighbor", "moved": 1})
         self.assertEqual(self._keys("translateX"), [(1.0, 1.0), (10.0, 10.0), (12.0, 20.0)])
 
     def test_right_arrow_pulls_nearest_left_key_to_current_frame(self):
@@ -111,10 +122,30 @@ class KeyframeMoveTests(unittest.TestCase):
         cmds.currentTime(12.0)
         cmds.select(self.control, replace=True)
 
-        moved = keyframe_move.move_neighbor_key_to_current(1)
+        result = keyframe_move.move_key_with_arrow(1, frame_amount=4)
 
-        self.assertEqual(moved, 1)
+        self.assertEqual(result, {"mode": "neighbor", "moved": 1})
         self.assertEqual(self._keys("translateX"), [(1.0, 1.0), (12.0, 10.0), (20.0, 20.0)])
+
+    def test_left_arrow_on_current_key_moves_it_by_spinbox_amount(self):
+        self._set_keys("translateX", ((1.0, 1.0), (10.0, 10.0), (20.0, 20.0)))
+        cmds.currentTime(10.0)
+        cmds.select(self.control, replace=True)
+
+        result = keyframe_move.move_key_with_arrow(-1, frame_amount=4)
+
+        self.assertEqual(result, {"mode": "current", "moved": 1})
+        self.assertEqual(self._keys("translateX"), [(1.0, 1.0), (6.0, 10.0), (20.0, 20.0)])
+
+    def test_right_arrow_on_current_key_moves_it_by_spinbox_amount(self):
+        self._set_keys("translateX", ((1.0, 1.0), (10.0, 10.0), (20.0, 20.0)))
+        cmds.currentTime(10.0)
+        cmds.select(self.control, replace=True)
+
+        result = keyframe_move.move_key_with_arrow(1, frame_amount=4)
+
+        self.assertEqual(result, {"mode": "current", "moved": 1})
+        self.assertEqual(self._keys("translateX"), [(1.0, 1.0), (14.0, 10.0), (20.0, 20.0)])
 
     def test_arrow_move_respects_selected_channel_filter(self):
         self._set_keys("translateX", ((1.0, 1.0), (20.0, 20.0)))
@@ -128,6 +159,43 @@ class KeyframeMoveTests(unittest.TestCase):
         self.assertEqual(moved, 1)
         self.assertEqual(self._keys("translateX"), [(1.0, 1.0), (12.0, 20.0)])
         self.assertEqual(self._keys("translateY"), [(1.0, 2.0), (20.0, 40.0)])
+
+    def test_current_key_move_respects_selected_channel_filter(self):
+        self._set_keys("translateX", ((1.0, 1.0), (10.0, 10.0)))
+        self._set_keys("translateY", ((1.0, 2.0), (10.0, 20.0)))
+        cmds.currentTime(10.0)
+        cmds.select(self.control, replace=True)
+
+        with mock.patch.object(keyframe_move, "get_selected_channels", return_value=["translateX"]):
+            result = keyframe_move.move_key_with_arrow(1, frame_amount=4)
+
+        self.assertEqual(result, {"mode": "current", "moved": 1})
+        self.assertEqual(self._keys("translateX"), [(1.0, 1.0), (14.0, 10.0)])
+        self.assertEqual(self._keys("translateY"), [(1.0, 2.0), (10.0, 20.0)])
+
+    def test_current_key_move_uses_selected_animation_layer(self):
+        self._set_keys("translateX", ((1.0, 1.0), (10.0, 10.0), (20.0, 20.0)))
+        attr_full = "{}.translateX".format(self.control)
+        base_curve = resolve_target_curve_for_layer(attr_full, "BaseAnimation")
+        layer = cmds.animLayer("MoveLayer")
+        cmds.animLayer(layer, edit=True, attribute=attr_full)
+        self._select_layer(layer)
+        cmds.setKeyframe(
+            self.control,
+            attribute="translateX",
+            time=10.0,
+            value=5.0,
+            animLayer=layer,
+        )
+        layer_curve = resolve_target_curve_for_layer(attr_full, layer)
+        cmds.currentTime(10.0)
+        cmds.select(self.control, replace=True)
+
+        result = keyframe_move.move_key_with_arrow(1, frame_amount=4)
+
+        self.assertEqual(result, {"mode": "current", "moved": 1})
+        self.assertEqual(self._curve_keys(base_curve), [(1.0, 1.0), (10.0, 10.0), (20.0, 20.0)])
+        self.assertEqual([time for time, _value in self._curve_keys(layer_curve)], [14.0])
 
 
 if __name__ == "__main__":

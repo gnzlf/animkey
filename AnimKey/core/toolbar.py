@@ -2138,8 +2138,8 @@ class AnimKeyToolbar:
         btn_left.setFixedSize(int(26 * float(self.config.get("toolbar_scale", 1.0))), int(26 * float(self.config.get("toolbar_scale", 1.0))))
         btn_left.setToolTip(ui.create_tooltip_text(
             "Move Keys Left",
-            "Pull the nearest key on the right to the current timeline frame",
-            {"Shift+Click": "Nudge selected/current keys left by the frame amount"}
+            "On a keyed frame, move that key left by the frame amount. Otherwise pull the nearest key on the right.",
+            {"Shift+Click": "Move selected/current keys left by 5x the frame amount"}
         ))
         btn_left.clicked.connect(lambda: self._move_keyframes(-1))
         layout.addWidget(btn_left)
@@ -2182,8 +2182,8 @@ class AnimKeyToolbar:
         btn_right.setFixedSize(int(26 * float(self.config.get("toolbar_scale", 1.0))), int(26 * float(self.config.get("toolbar_scale", 1.0))))
         btn_right.setToolTip(ui.create_tooltip_text(
             "Move Keys Right",
-            "Pull the nearest key on the left to the current timeline frame",
-            {"Shift+Click": "Nudge selected/current keys right by the frame amount"}
+            "On a keyed frame, move that key right by the frame amount. Otherwise pull the nearest key on the left.",
+            {"Shift+Click": "Move selected/current keys right by 5x the frame amount"}
         ))
         btn_right.clicked.connect(lambda: self._move_keyframes(1))
         layout.addWidget(btn_right)
@@ -3237,19 +3237,32 @@ class AnimKeyToolbar:
                 self._nudge_keyframes_relative(direction)
                 return
 
-            from AnimKey.buttons.keyframe_move import move_neighbor_key_to_current
+            from AnimKey.buttons.keyframe_move import move_key_with_arrow
 
-            moved = move_neighbor_key_to_current(direction)
+            frame_amount = int(self.key_offset_spinbox.value())
+            result = move_key_with_arrow(direction, frame_amount=frame_amount)
+            moved = result.get("moved", 0)
+            mode = result.get("mode")
             if moved:
-                side = "right" if direction < 0 else "left"
-                current_time = cmds.currentTime(query=True)
-                cmds.inViewMessage(
-                    amg=(
-                        f"<span style='color:#88c0d0'>Pulled {moved} key(s) "
-                        f"from the {side} to frame {current_time:g}</span>"
-                    ),
-                    pos='topCenter', fade=True, fadeStayTime=1000
-                )
+                if mode in ("current", "selected"):
+                    signed_amount = frame_amount * direction
+                    cmds.inViewMessage(
+                        amg=(
+                            f"<span style='color:#88c0d0'>Moved {moved} key(s) "
+                            f"by {signed_amount} frame(s)</span>"
+                        ),
+                        pos='topCenter', fade=True, fadeStayTime=1000
+                    )
+                else:
+                    side = "right" if direction < 0 else "left"
+                    current_time = cmds.currentTime(query=True)
+                    cmds.inViewMessage(
+                        amg=(
+                            f"<span style='color:#88c0d0'>Pulled {moved} key(s) "
+                            f"from the {side} to frame {current_time:g}</span>"
+                        ),
+                        pos='topCenter', fade=True, fadeStayTime=1000
+                    )
             else:
                 side = "right" if direction < 0 else "left"
                 cmds.warning(f"AnimKey: No keyframes found on the {side} side of the current frame")

@@ -1,4 +1,4 @@
-"""Helpers for moving neighboring keys to the current timeline frame."""
+"""Helpers for moving timeline-neighboring keys."""
 
 import maya.cmds as cmds
 
@@ -129,6 +129,95 @@ def _move_curve_key_to_time(curve, source_frame, destination_frame):
         return False
 
 
+def _curves_for_context(objects=None, attrs=None):
+    selected_curves = _selected_anim_curves()
+    if selected_curves:
+        return selected_curves
+
+    if objects is None:
+        objects = cmds.ls(selection=True) or []
+    selected_channels = get_selected_channels()
+    return _curves_from_objects(
+        objects,
+        attrs=attrs,
+        selected_channels=selected_channels,
+        layer_name=active_animation_layer(),
+    )
+
+
+def _move_current_keys_to_offset(curves, current_time, frame_offset):
+    destination_frame = float(current_time) + float(frame_offset)
+    moved = 0
+    for curve in curves:
+        frames = _as_unique_sorted_frames(cmds.keyframe(curve, query=True, timeChange=True) or [])
+        if not any(abs(frame - current_time) <= FRAME_EPSILON for frame in frames):
+            continue
+        if _move_curve_key_to_time(curve, current_time, destination_frame):
+            moved += 1
+    return moved
+
+
+def _move_selected_keys_by_offset(frame_offset):
+    selected_curves = _selected_anim_curves()
+    if not selected_curves:
+        return 0
+
+    selected_key_count = 0
+    for curve in selected_curves:
+        try:
+            selected_key_count += len(cmds.keyframe(curve, query=True, selected=True, timeChange=True) or [])
+        except Exception:
+            pass
+    if not selected_key_count:
+        return 0
+
+    cmds.keyframe(edit=True, relative=True, timeChange=float(frame_offset))
+    return selected_key_count
+
+
+def move_key_with_arrow(direction, frame_amount=1, objects=None, attrs=None, current_time=None):
+    """
+    Apply the toolbar arrow behavior.
+
+    When the current frame is keyed, the current key moves by frame_amount.
+    Otherwise the nearest key from the arrow side is pulled to the current frame.
+    """
+    if direction == 0:
+        return {"mode": "none", "moved": 0}
+
+    if current_time is None:
+        current_time = float(cmds.currentTime(query=True))
+    else:
+        current_time = float(current_time)
+
+    frame_offset = abs(float(frame_amount)) * (1 if direction > 0 else -1)
+    curves = _curves_for_context(objects=objects, attrs=attrs)
+
+    moved = 0
+    mode = "none"
+    cmds.undoInfo(openChunk=True)
+    try:
+        moved = _move_selected_keys_by_offset(frame_offset)
+        if moved:
+            mode = "selected"
+        else:
+            moved = _move_current_keys_to_offset(curves, current_time, frame_offset)
+            if moved:
+                mode = "current"
+            else:
+                for curve in curves:
+                    frames = _as_unique_sorted_frames(cmds.keyframe(curve, query=True, timeChange=True) or [])
+                    source_frame = _nearest_source_frame(frames, current_time, direction)
+                    if _move_curve_key_to_time(curve, source_frame, current_time):
+                        moved += 1
+                if moved:
+                    mode = "neighbor"
+    finally:
+        cmds.undoInfo(closeChunk=True)
+
+    return {"mode": mode, "moved": moved}
+
+
 def move_neighbor_key_to_current(direction, objects=None, attrs=None, current_time=None):
     """
     Pull the nearest neighboring key to the current frame.
@@ -144,19 +233,7 @@ def move_neighbor_key_to_current(direction, objects=None, attrs=None, current_ti
     else:
         current_time = float(current_time)
 
-    selected_curves = _selected_anim_curves()
-    if selected_curves:
-        curves = selected_curves
-    else:
-        if objects is None:
-            objects = cmds.ls(selection=True) or []
-        selected_channels = get_selected_channels()
-        curves = _curves_from_objects(
-            objects,
-            attrs=attrs,
-            selected_channels=selected_channels,
-            layer_name=active_animation_layer(),
-        )
+    curves = _curves_for_context(objects=objects, attrs=attrs)
 
     moved = 0
     cmds.undoInfo(openChunk=True)
