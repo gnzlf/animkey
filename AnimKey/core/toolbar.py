@@ -109,7 +109,8 @@ from AnimKey.buttons.select_hierarchy import (
     select_visible_nurbs_curves
 )
 from AnimKey.buttons.tempPivot import (
-    execute as temp_pivot_execute, 
+    execute as temp_pivot_execute,
+    execute_temp_pivot as temp_pivot_quick_execute,
     is_active as is_temp_pivot_active, 
     set_button_active as set_temp_pivot_button_active
 )
@@ -2534,7 +2535,7 @@ class AnimKeyToolbar:
             ("LKN", "Link Objects", link_objects_execute, "#b48ead"),      # Purple - Link Objects
             ("CAM", "Follow Cam", follow_cam_execute, "#5e81ac"),          # Dark Blue - Follow Cam
             ("WS", "World Space Copy", copy_worldspace_execute, "#a3be8c"), # Green - Copy Worldspace
-            ("PIV", "Temp Control", temp_pivot_execute, "#bf616a"),        # Red - Temp Control
+            ("PIV", "Temp Pivot (Right-click: Temp Control)", temp_pivot_quick_execute, "#bf616a"),
             ("RUL", "Micro Move", None, "#ebcb8b"),                        # Yellow - Micro Move (callback set separately)
         ]
         
@@ -2654,7 +2655,7 @@ class AnimKeyToolbar:
             # Special handling for PIV button (temp control)
             elif text == "PIV":
                 piv_btn = btn
-                btn.clicked.connect(picking_wrapper(lambda checked=False, b=piv_btn: temp_pivot_execute(button=b)))
+                btn.clicked.connect(picking_wrapper(temp_pivot_quick_execute))
                 if is_temp_pivot_active():
                     set_temp_pivot_button_active(btn, True)
             # Special handling for C button (copy animation) – pass button ref for popup anchoring
@@ -2734,6 +2735,11 @@ class AnimKeyToolbar:
                 btn.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
                 btn.customContextMenuRequested.connect(
                     lambda pos, button=btn: self._show_micro_move_context_menu(button, pos)
+                )
+            elif text == "PIV":
+                btn.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+                btn.customContextMenuRequested.connect(
+                    lambda pos, button=btn: temp_pivot_execute(button=button)
                 )
             elif text == "TRL":
                 btn.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)

@@ -37,6 +37,96 @@ _temp_pivot_window = None
 def get_maya_main_window():
     return wrapInstance(int(omui.MQtUtil.mainWindow()), QtWidgets.QWidget)
 
+
+def _selected_temp_pivot_objects(selection=None):
+    """Return unique selected transforms/joints while preserving selection order."""
+    raw_selection = selection
+    if raw_selection is None:
+        raw_selection = cmds.ls(selection=True, long=True) or []
+    elif isinstance(raw_selection, str):
+        raw_selection = [raw_selection]
+
+    objects = []
+    seen = set()
+    for item in raw_selection or []:
+        nodes = cmds.ls(item, objectsOnly=True, long=True) or []
+        node = nodes[0] if nodes else str(item).split(".", 1)[0]
+        if not cmds.objExists(node):
+            continue
+
+        try:
+            node_type = cmds.nodeType(node)
+        except Exception:
+            continue
+
+        if node_type not in ("transform", "joint"):
+            parents = cmds.listRelatives(node, parent=True, fullPath=True) or []
+            if not parents:
+                continue
+            node = parents[0]
+
+        long_names = cmds.ls(node, long=True) or [node]
+        node = long_names[0]
+        if node not in seen:
+            seen.add(node)
+            objects.append(node)
+    return objects
+
+
+def _temp_pivot_position(objects, pivot_mode="last"):
+    if pivot_mode == "center":
+        bounds = cmds.exactWorldBoundingBox(objects)
+        return [
+            (bounds[0] + bounds[3]) * 0.5,
+            (bounds[1] + bounds[4]) * 0.5,
+            (bounds[2] + bounds[5]) * 0.5,
+        ]
+    return list(cmds.xform(objects[-1], query=True, worldSpace=True, rotatePivot=True))
+
+
+def activate_temp_pivot(objects=None, pivot_mode="last", edit_pivot=True):
+    """Activate Maya's non-destructive custom manipulator pivot."""
+    selected_objects = _selected_temp_pivot_objects(objects)
+    if not selected_objects:
+        om.MGlobal.displayWarning("Select one or more controls for Temp Pivot.")
+        return None
+
+    pivot_position = _temp_pivot_position(selected_objects, pivot_mode=pivot_mode)
+    undo_open = False
+    try:
+        cmds.undoInfo(openChunk=True, chunkName="AnimKey Temp Pivot")
+        undo_open = True
+
+        cmds.setToolTo("RotateSuperContext")
+        cmds.manipPivot(reset=True)
+        cmds.manipRotateContext(
+            "Rotate",
+            edit=True,
+            useManipPivot=True,
+            useCenterPivot=False,
+            useObjectPivot=False,
+        )
+        cmds.manipPivot(position=pivot_position)
+        cmds.manipPivot(pinPivot=True)
+        cmds.manipRotateContext("Rotate", edit=True, pinPivot=True)
+        if edit_pivot and not cmds.manipRotateContext(
+            "Rotate", query=True, editPivotMode=True
+        ):
+            cmds.ctxEditMode()
+    except Exception as exc:
+        om.MGlobal.displayError("Temp Pivot error: {}".format(exc))
+        return None
+    finally:
+        if undo_open:
+            cmds.undoInfo(closeChunk=True)
+
+    return {
+        "objects": selected_objects,
+        "pivot": pivot_position,
+        "mode": pivot_mode,
+    }
+
+
 # ============================================================
 # CORE LOGIC (Matrix-Based)
 # ============================================================
@@ -1646,6 +1736,18 @@ def execute(*args, **kwargs):
     if not require_animkey_context("AnimKey.buttons.tempPivot.execute"):
         return None
     return show(anchor_button=kwargs.get("button"))
+
+
+def execute_temp_pivot(*args, **kwargs):
+    from AnimKey.core.executionGuard import require_animkey_context
+    if not require_animkey_context("AnimKey.buttons.tempPivot.execute_temp_pivot"):
+        return None
+    return activate_temp_pivot(
+        objects=kwargs.get("objects"),
+        pivot_mode=kwargs.get("pivot_mode", "last"),
+        edit_pivot=kwargs.get("edit_pivot", True),
+    )
+
 
 def is_active():
     return len(get_controlled_objects()) > 0
