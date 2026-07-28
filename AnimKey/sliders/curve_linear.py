@@ -53,29 +53,29 @@ def prepare_curve_data(objs=None, attrs=None):
             attr_full = f'{obj}.{attr}'
             all_keyframes = get_keyframes_for_attribute(attr_full, attr, _processing_context)
             
-            if len(all_keyframes) < 2:
-                continue
-            
             frames_to_process = get_frames_to_process(
-                attr_full, all_keyframes, attr, _processing_context,
-                use_neighbor_keys_when_unkeyed=True
+                attr_full, all_keyframes, attr, _processing_context
             )
             if not frames_to_process:
                 continue
 
             first_frame, last_frame = get_selection_guide_frames(all_keyframes, frames_to_process)
 
-            if first_frame is None or last_frame is None or first_frame == last_frame:
-                continue
+            if first_frame is None or last_frame is None:
+                first_frame = min(frames_to_process)
+                last_frame = max(frames_to_process)
             
-            try:
-                first_value = get_value_at_time(attr_full, first_frame)
-                last_value = get_value_at_time(attr_full, last_frame)
-                
-                if isinstance(first_value, (list, tuple)) or isinstance(last_value, (list, tuple)):
+            first_value = None
+            last_value = None
+            if first_frame != last_frame:
+                try:
+                    first_value = get_value_at_time(attr_full, first_frame)
+                    last_value = get_value_at_time(attr_full, last_frame)
+
+                    if isinstance(first_value, (list, tuple)) or isinstance(last_value, (list, tuple)):
+                        continue
+                except:
                     continue
-            except:
-                continue
             
             for frame in frames_to_process:
                 try:
@@ -83,11 +83,11 @@ def prepare_curve_data(objs=None, attrs=None):
                     if isinstance(original_value, (list, tuple)):
                         continue
                     
-                    if last_frame != first_frame:
+                    if last_frame != first_frame and first_value is not None and last_value is not None:
                         t = (frame - first_frame) / (last_frame - first_frame)
                         linear_value = first_value + (last_value - first_value) * t
                     else:
-                        linear_value = first_value
+                        linear_value = original_value
                     
                     cache_key = f"{attr_full}@{frame}"
                     _curve_data_cache[cache_key] = {

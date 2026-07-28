@@ -60,12 +60,8 @@ def prepare_curve_data(objs=None, attrs=None):
             attr_full = f'{obj}.{attr}'
             all_keyframes = get_keyframes_for_attribute(attr_full, attr, _processing_context)
             
-            if not all_keyframes:
-                continue
-            
             frames_to_process = get_frames_to_process(
-                attr_full, all_keyframes, attr, _processing_context,
-                use_neighbor_keys_when_unkeyed=True
+                attr_full, all_keyframes, attr, _processing_context
             )
             if not frames_to_process:
                 continue

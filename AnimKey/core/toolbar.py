@@ -2138,8 +2138,8 @@ class AnimKeyToolbar:
         btn_left.setFixedSize(int(26 * float(self.config.get("toolbar_scale", 1.0))), int(26 * float(self.config.get("toolbar_scale", 1.0))))
         btn_left.setToolTip(ui.create_tooltip_text(
             "Move Keys Left",
-            "Move selected keyframes to the left by the specified amount",
-            {"Shift+Click": "Move by 5x amount"}
+            "Pull the nearest key on the right to the current timeline frame",
+            {"Shift+Click": "Nudge selected/current keys left by the frame amount"}
         ))
         btn_left.clicked.connect(lambda: self._move_keyframes(-1))
         layout.addWidget(btn_left)
@@ -2173,7 +2173,7 @@ class AnimKeyToolbar:
         ''')
         self.key_offset_spinbox.setToolTip(ui.create_tooltip_text(
             "Key Offset Frames",
-            "Number of frames to move keyframes left or right"
+            "Shift-click nudge amount for the arrow buttons"
         ))
         layout.addWidget(self.key_offset_spinbox)
         
@@ -2182,8 +2182,8 @@ class AnimKeyToolbar:
         btn_right.setFixedSize(int(26 * float(self.config.get("toolbar_scale", 1.0))), int(26 * float(self.config.get("toolbar_scale", 1.0))))
         btn_right.setToolTip(ui.create_tooltip_text(
             "Move Keys Right",
-            "Move selected keyframes to the right by the specified amount",
-            {"Shift+Click": "Move by 5x amount"}
+            "Pull the nearest key on the left to the current timeline frame",
+            {"Shift+Click": "Nudge selected/current keys right by the frame amount"}
         ))
         btn_right.clicked.connect(lambda: self._move_keyframes(1))
         layout.addWidget(btn_right)
@@ -3229,56 +3229,74 @@ class AnimKeyToolbar:
     # ═══════════════════════════════════════════════════════════════════════════
     
     def _move_keyframes(self, direction):
-        """Move selected keyframes by the specified frame offset"""
+        """Pull the nearest neighboring key to the current frame."""
         try:
-            # Get frame offset from the key offset spinbox
-            frame_amount = int(self.key_offset_spinbox.value()) * direction
-            
-            # Check for Shift modifier for 5x multiplier
             mods = mel.eval('getModifiers')
             shift_pressed = bool(mods % 2)
             if shift_pressed:
-                frame_amount *= 5
-            
-            # Get selected objects
-            selection = cmds.ls(selection=True)
-            if not selection:
-                cmds.warning("AnimKey: No objects selected")
+                self._nudge_keyframes_relative(direction)
                 return
-            
-            # Get selected keys from Graph Editor
-            selected_curves = cmds.keyframe(query=True, name=True, selected=True)
-            
-            if selected_curves:
-                # Move selected keyframes in Graph Editor
-                cmds.keyframe(edit=True, relative=True, timeChange=frame_amount)
+
+            from AnimKey.buttons.keyframe_move import move_neighbor_key_to_current
+
+            moved = move_neighbor_key_to_current(direction)
+            if moved:
+                side = "right" if direction < 0 else "left"
+                current_time = cmds.currentTime(query=True)
                 cmds.inViewMessage(
-                    amg=f"<span style='color:#88c0d0'>Keys moved by {frame_amount} frame(s)</span>",
+                    amg=(
+                        f"<span style='color:#88c0d0'>Pulled {moved} key(s) "
+                        f"from the {side} to frame {current_time:g}</span>"
+                    ),
                     pos='topCenter', fade=True, fadeStayTime=1000
                 )
             else:
-                # If no keys selected in Graph Editor, try to move keys at current time
-                current_time = cmds.currentTime(query=True)
-                
-                # Check if there are keys at current time
-                keys_found = False
-                for obj in selection:
-                    keyframes = cmds.keyframe(obj, query=True, time=(current_time, current_time))
-                    if keyframes:
-                        keys_found = True
-                        cmds.keyframe(obj, edit=True, time=(current_time, current_time), 
-                                     relative=True, timeChange=frame_amount)
-                
-                if keys_found:
-                    cmds.inViewMessage(
-                        amg=f"<span style='color:#88c0d0'>Keys at frame {int(current_time)} moved by {frame_amount}</span>",
-                        pos='topCenter', fade=True, fadeStayTime=1000
-                    )
-                else:
-                    cmds.warning("AnimKey: No keyframes selected or at current time")
+                side = "right" if direction < 0 else "left"
+                cmds.warning(f"AnimKey: No keyframes found on the {side} side of the current frame")
         
         except Exception as e:
             cmds.warning(f"AnimKey: Error moving keyframes: {e}")
+
+    def _nudge_keyframes_relative(self, direction):
+        """Move selected/current keys by the spinbox amount for legacy shift-click use."""
+        frame_amount = int(self.key_offset_spinbox.value()) * direction * 5
+
+        selection = cmds.ls(selection=True)
+        if not selection:
+            cmds.warning("AnimKey: No objects selected")
+            return
+
+        selected_curves = cmds.keyframe(query=True, name=True, selected=True)
+
+        if selected_curves:
+            cmds.keyframe(edit=True, relative=True, timeChange=frame_amount)
+            cmds.inViewMessage(
+                amg=f"<span style='color:#88c0d0'>Keys moved by {frame_amount} frame(s)</span>",
+                pos='topCenter', fade=True, fadeStayTime=1000
+            )
+            return
+
+        current_time = cmds.currentTime(query=True)
+        keys_found = False
+        for obj in selection:
+            keyframes = cmds.keyframe(obj, query=True, time=(current_time, current_time))
+            if keyframes:
+                keys_found = True
+                cmds.keyframe(
+                    obj,
+                    edit=True,
+                    time=(current_time, current_time),
+                    relative=True,
+                    timeChange=frame_amount,
+                )
+
+        if keys_found:
+            cmds.inViewMessage(
+                amg=f"<span style='color:#88c0d0'>Keys at frame {int(current_time)} moved by {frame_amount}</span>",
+                pos='topCenter', fade=True, fadeStayTime=1000
+            )
+        else:
+            cmds.warning("AnimKey: No keyframes selected or at current time")
     
     def _add_inbetween(self):
         """Increase keyframe/attribute values (like AnimKey increase)"""

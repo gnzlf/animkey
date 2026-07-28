@@ -186,8 +186,7 @@ def prepare_curve_data(objs=None, attrs=None):
             all_keyframes = get_keyframes_for_attribute(attr_full, attr, _processing_context)
             
             frames_to_process = get_frames_to_process(
-                attr_full, all_keyframes, attr, _processing_context,
-                use_neighbor_keys_when_unkeyed=True
+                attr_full, all_keyframes, attr, _processing_context
             )
             if not frames_to_process:
                 continue
@@ -195,8 +194,10 @@ def prepare_curve_data(objs=None, attrs=None):
             guide_start_frame, guide_end_frame = get_selection_guide_frames(
                 all_keyframes, frames_to_process
             )
-            if guide_start_frame is None or guide_end_frame is None or guide_end_frame == guide_start_frame:
-                continue
+            if guide_start_frame is None:
+                guide_start_frame = min(frames_to_process)
+            if guide_end_frame is None:
+                guide_end_frame = max(frames_to_process)
             
             start_value = get_value_at_time(attr_full, guide_start_frame)
             end_value = get_value_at_time(attr_full, guide_end_frame)
@@ -323,4 +324,3 @@ def reset():
     if _is_dragging:
         cmds.undoInfo(closeChunk=True)
         _is_dragging = False
-

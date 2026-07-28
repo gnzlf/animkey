@@ -115,7 +115,9 @@ def get_selected_time_range():
         tuple: (start_time, end_time) or None if no range selected
     """
     try:
-        aTimeSlider = mel.eval('$tmpVar=$gPlayBackSlider')
+        aTimeSlider = mel.eval('global string $gPlayBackSlider; $tmpVar=$gPlayBackSlider')
+        if not aTimeSlider:
+            return None
         time_range = cmds.timeControl(aTimeSlider, query=True, rangeArray=True)
         
         if time_range and len(time_range) == 2:
@@ -827,4 +829,3 @@ def set_value_at_time(attr_full, time, value):
         return True
     except:
         return False
-
