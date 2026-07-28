@@ -40,6 +40,8 @@ import math
 import itertools
 import time
 
+from AnimKey.core import animation_curve_transfer as curve_transfer
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                           MIRROR PATTERNS
@@ -79,6 +81,8 @@ SNAPSHOT_SCHEMA_VERSION = 10
 SNAPSHOT_FOLDER_NAME = "snapshots"
 LEGACY_SNAPSHOT_FOLDER_NAME = "snapshots_v10"
 AKMIRROR_SNAPSHOT_MAGIC = b"AKMIRROR2\x00"
+
+_snapshot_cache = {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1475,6 +1479,7 @@ def _write_snapshot_file(path, snapshot_data):
             with open(tmp_path, "w") as f:
                 json.dump(snapshot_data, f, separators=(",", ":"))
         os.replace(tmp_path, path)
+        _snapshot_cache.pop(path, None)
     finally:
         if os.path.exists(tmp_path):
             try:
@@ -1822,7 +1827,13 @@ def load_snapshot(rig_name=None):
         if not os.path.exists(path):
             continue
         try:
-            data = _read_snapshot_file(path)
+            fingerprint = (os.path.getmtime(path), os.path.getsize(path))
+            cached = _snapshot_cache.get(path)
+            if cached and cached[0] == fingerprint:
+                data = cached[1]
+            else:
+                data = _read_snapshot_file(path)
+                _snapshot_cache[path] = (fingerprint, data)
             if data.get("version", 1) >= SNAPSHOT_SCHEMA_VERSION:
                 controls = data.get("controls", {})
                 if controls and not any("rest_attrs" in c for c in controls.values()):
@@ -2464,10 +2475,22 @@ def _animation_key_times(controls, time_range=None):
         start = cmds.playbackOptions(q=True, min=True)
         end = cmds.playbackOptions(q=True, max=True)
     times = set()
+    layer_name = curve_transfer.active_animation_layer()
     for ctrl in controls:
         for attr in (cmds.listAttr(ctrl, keyable=True) or []):
+            curve = curve_transfer.resolve_anim_curve(
+                f"{ctrl}.{attr}",
+                layer_name=layer_name,
+            )
+            if not curve:
+                continue
             try:
-                keys = cmds.keyframe(ctrl, attribute=attr, q=True, time=(start, end), timeChange=True) or []
+                keys = cmds.keyframe(
+                    curve,
+                    q=True,
+                    time=(start, end),
+                    timeChange=True,
+                ) or []
                 for key in keys:
                     times.add(float(key))
             except:
@@ -2481,9 +2504,15 @@ def _attribute_key_times(control, attr, time_range=None):
     else:
         start = cmds.playbackOptions(q=True, min=True)
         end = cmds.playbackOptions(q=True, max=True)
+    curve = curve_transfer.resolve_anim_curve(
+        f"{control}.{attr}",
+        layer_name=curve_transfer.active_animation_layer(),
+    )
+    if not curve:
+        return []
     try:
         return sorted({float(t) for t in (cmds.keyframe(
-            control, attribute=attr, q=True, time=(start, end), timeChange=True
+            curve, q=True, time=(start, end), timeChange=True
         ) or [])})
     except:
         return []
@@ -2664,7 +2693,77 @@ def _key_touched_controls(controls, attrs_filter=None):
                     pass
 
 
-def mirror_animation(controls=None, attrs_filter=None, time_range=None):
+def _mirror_animation_for_rig(controls, attrs_filter=None, time_range=None):
+    rig_name = get_rig_identifier(controls)
+    snapshot, _ = _load_or_build_basic_snapshot(controls, rig_name=rig_name)
+    sym_plane = _snap_sym_plane(snapshot)
+    if not snapshot:
+        return 0
+
+    controls = _expand_controls_with_opposites(controls, snapshot, sym_plane)
+    jobs = _animation_mirror_channel_jobs(controls, snapshot, sym_plane, attrs_filter)
+    if not jobs:
+        return 0
+
+    layer_name = curve_transfer.active_animation_layer()
+    additive_layer = curve_transfer.is_additive_layer(layer_name)
+    effective_range = time_range or (
+        float(cmds.playbackOptions(query=True, min=True)),
+        float(cmds.playbackOptions(query=True, max=True)),
+    )
+    captures = []
+    capture_cache = {}
+    destinations = set()
+    for job in jobs:
+        destinations.add((job["target"], job["target_attr"]))
+        cache_key = (job["source"], job["source_attr"])
+        if cache_key not in capture_cache:
+            capture_cache[cache_key] = curve_transfer.capture_curve(
+                f"{job['source']}.{job['source_attr']}",
+                time_range=effective_range,
+                layer_name=layer_name,
+            )
+        curve_data = capture_cache.get(cache_key)
+        if not curve_data:
+            continue
+
+        multiplier = float(job.get("mult", 1.0))
+        value_offset = 0.0
+        if not additive_layer and job.get("mode") != "copy_value":
+            value_offset = float(job.get("target_rest", 0.0)) - (
+                float(job.get("source_rest", 0.0)) * multiplier
+            )
+        captures.append((
+            job["target"],
+            job["target_attr"],
+            curve_data,
+            multiplier,
+            value_offset,
+        ))
+
+    for target, attr in destinations:
+        curve_transfer.clear_attr_range(
+            f"{target}.{attr}",
+            effective_range,
+            layer_name=layer_name,
+        )
+
+    total = 0
+    for target, attr, curve_data, multiplier, value_offset in captures:
+        pasted, key_count = curve_transfer.paste_curve(
+            f"{target}.{attr}",
+            curve_data,
+            layer_name=layer_name,
+            clear_existing=False,
+            value_scale=multiplier,
+            value_offset=value_offset,
+        )
+        if pasted:
+            total += key_count
+    return total
+
+
+def mirror_animation(controls=None, attrs_filter=None, time_range=None, manage_undo=True):
     if controls is not None and not isinstance(controls, (list, tuple)):
         controls = None
     controls = list(controls) if controls else (cmds.ls(selection=True) or [])
@@ -2672,81 +2771,31 @@ def mirror_animation(controls=None, attrs_filter=None, time_range=None):
         cmds.warning("AnimKey: Select controls to mirror animation.")
         return 0
     grouped = _group_controls_by_rig(controls)
-    if len(grouped) > 1:
+    if manage_undo:
+        _open_animkey_undo_chunk("AnimKey Mirror Animation")
+    refresh_suspended = False
+    try:
+        try:
+            cmds.refresh(suspend=True)
+            refresh_suspended = True
+        except Exception:
+            pass
         total = 0
         for info in grouped.values():
-            total += mirror_animation(info["controls"], attrs_filter=attrs_filter, time_range=time_range)
+            total += _mirror_animation_for_rig(
+                info["controls"],
+                attrs_filter=attrs_filter,
+                time_range=time_range,
+            )
         return total
-
-    rig_name = get_rig_identifier(controls)
-    snapshot, is_basic_snapshot = _load_or_build_basic_snapshot(controls, rig_name=rig_name)
-    sym_plane = _snap_sym_plane(snapshot)
-    if not snapshot:
-        cmds.warning("AnimKey Mirror: Could not build a mirror snapshot for animation.")
-        return 0
-    controls = _expand_controls_with_opposites(controls, snapshot, sym_plane)
-    jobs = _animation_mirror_channel_jobs(controls, snapshot, sym_plane, attrs_filter)
-    if not jobs:
-        return 0
-
-    jobs_by_time = {}
-    destinations_to_clear = set()
-    for job in jobs:
-        destination = (job["target"], job["target_attr"])
-        destinations_to_clear.add(destination)
-        for t in _attribute_key_times(job["source"], job["source_attr"], time_range=time_range):
-            jobs_by_time.setdefault(t, []).append(job)
-
-    if not jobs_by_time:
-        return 0
-
-    current = cmds.currentTime(q=True)
-    records = {}
-    try:
-        for t in sorted(jobs_by_time):
-            cmds.currentTime(t, edit=True)
-            for job in jobs_by_time[t]:
-                value = _value_from_animation_job(job)
-                if value is None:
-                    continue
-                value_map = _sanitize_mirror_values(
-                    job["source"], job["target"], snapshot, {job["target_attr"]: value}
-                )
-                if job["target_attr"] not in value_map:
-                    continue
-                destination = (job["target"], job["target_attr"])
-                records.setdefault(destination, {})[t] = (
-                    value_map[job["target_attr"]],
-                    _capture_key_tangent(
-                        job["source"], job["source_attr"], t, value_mult=job.get("mult", 1.0)
-                    ),
-                )
     finally:
-        cmds.currentTime(current, edit=True)
-
-    if time_range:
-        start, end = time_range
-    else:
-        start = cmds.playbackOptions(q=True, min=True)
-        end = cmds.playbackOptions(q=True, max=True)
-
-    total = 0
-    for target, attr in sorted(destinations_to_clear):
-        if not _attr_exists(target, attr):
-            continue
-        try:
-            cmds.cutKey(target, attribute=attr, time=(start, end), option="keys")
-        except:
-            pass
-
-        for t, (value, tangent) in sorted(records.get((target, attr), {}).items()):
+        if refresh_suspended:
             try:
-                cmds.setKeyframe(target, attribute=attr, time=(t, t), value=value)
-                _apply_key_tangent(target, attr, t, tangent)
-                total += 1
-            except:
+                cmds.refresh(suspend=False)
+            except Exception:
                 pass
-    return total
+        if manage_undo:
+            _close_animkey_undo_chunk()
 
 
 def _legacy_all_mirror(*args):
@@ -2852,7 +2901,12 @@ def all_mirror(*args):
                 controls_for_keys = _expand_controls_with_opposites(info["controls"], snapshot, sym_plane)
                 key_times = _animation_key_times(controls_for_keys, time_range=time_range)
                 if key_times:
-                    total += mirror_animation(info["controls"], selected_channels, time_range=time_range)
+                    total += mirror_animation(
+                        info["controls"],
+                        selected_channels,
+                        time_range=time_range,
+                        manage_undo=False,
+                    )
                 elif not has_selected_range:
                     count, _ = _mirror_selected_pose_two_phase(
                         info["controls"], snapshot, sym_plane, selected_channels
@@ -2881,7 +2935,12 @@ def all_mirror(*args):
         key_times = _animation_key_times(controls_for_keys, time_range=time_range)
 
         if key_times:
-            anim_total = mirror_animation(selected, selected_channels, time_range=time_range)
+            anim_total = mirror_animation(
+                selected,
+                selected_channels,
+                time_range=time_range,
+                manage_undo=False,
+            )
             label = f"{start:g}-{end:g}" if has_selected_range else "playback range"
             if anim_total:
                 cmds.inViewMessage(
@@ -2913,6 +2972,8 @@ def all_mirror(*args):
 class AutoMirrorState:
     enabled       = False
     script_job_id = None
+    last_run      = 0.0
+    last_signature = None
 
 _auto_mirror_state = AutoMirrorState()
 
@@ -2921,21 +2982,45 @@ def _auto_mirror_callback():
     if not _auto_mirror_state.enabled:
         return
     try:
+        now = time.perf_counter()
+        if now - _auto_mirror_state.last_run < (1.0 / 30.0):
+            return
+        _auto_mirror_state.last_run = now
         selected = cmds.ls(selection=True)
         if not selected:
             return
-        rig_name  = get_rig_identifier(selected)
-        snapshot  = load_snapshot(rig_name)
-        sym_plane = _snap_sym_plane(snapshot)
-        if not snapshot:
-            return
 
+        signature_values = []
         for ctrl in selected:
-            opp = (_snap_opposite(ctrl, snapshot)
-                   if snapshot else find_opposite_smart(ctrl, sym_plane))
-            if not opp or not cmds.objExists(opp):
+            try:
+                matrix = cmds.getAttr(f"{ctrl}.worldMatrix[0]")
+                if matrix and isinstance(matrix[0], (list, tuple)):
+                    matrix = matrix[0]
+                signature_values.extend(round(float(value), 6) for value in matrix)
+            except Exception:
+                pass
+            for attr in (cmds.listAttr(ctrl, userDefined=True, keyable=True) or []):
+                value = _safe_getattr(ctrl, attr)
+                if isinstance(value, (int, float)):
+                    signature_values.append(round(float(value), 6))
+        signature = (
+            tuple(selected),
+            round(float(cmds.currentTime(query=True)), 4),
+            tuple(signature_values),
+        )
+        if signature == _auto_mirror_state.last_signature:
+            return
+        _auto_mirror_state.last_signature = signature
+
+        for rig_name, info in _group_controls_by_rig(selected).items():
+            snapshot = load_snapshot(rig_name)
+            if not snapshot:
                 continue
-            _apply_mirror_to_control(ctrl, opp, sym_plane, snapshot)
+            _mirror_selected_pose_two_phase(
+                info["controls"],
+                snapshot,
+                _snap_sym_plane(snapshot),
+            )
     except:
         pass
 
@@ -2948,6 +3033,8 @@ def enable_auto_mirror(*args):
         event=["idle", _auto_mirror_callback], killWithScene=True
     )
     _auto_mirror_state.enabled = True
+    _auto_mirror_state.last_run = 0.0
+    _auto_mirror_state.last_signature = None
     cmds.inViewMessage(amg="<span style='color:#a3be8c'>Auto Mirror: ON</span>",
                        pos='topCenter', fade=True, fadeStayTime=1000)
 
@@ -2955,6 +3042,7 @@ def enable_auto_mirror(*args):
 def disable_auto_mirror(*args):
     global _auto_mirror_state
     _auto_mirror_state.enabled = False
+    _auto_mirror_state.last_signature = None
     if _auto_mirror_state.script_job_id:
         try:
             if cmds.scriptJob(exists=_auto_mirror_state.script_job_id):
@@ -3051,6 +3139,7 @@ def delete_mirror_snapshot(*args):
     for path in _mirror_snapshot_candidates(rig_name):
         if os.path.exists(path):
             os.remove(path)
+            _snapshot_cache.pop(path, None)
             removed = True
     if removed:
         cmds.warning(f"AnimKey: Snapshot deleted for '{get_rig_label(selected)}'.")
