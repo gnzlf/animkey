@@ -34,6 +34,7 @@ TEMP_BAKE_ATTRS = [
 # Global window reference
 _temp_pivot_window = None
 _temp_pivot_restore_state = None
+_temp_pivot_monitor = None
 
 def get_maya_main_window():
     return wrapInstance(int(omui.MQtUtil.mainWindow()), QtWidgets.QWidget)
@@ -174,6 +175,139 @@ def _restore_object_pivots(state):
             )
 
 
+def _stop_temp_pivot_monitor():
+    global _temp_pivot_monitor
+
+    timer = _temp_pivot_monitor
+    _temp_pivot_monitor = None
+    application = QtWidgets.QApplication.instance()
+    if application is not None:
+        for existing in application.findChildren(
+            QtCore.QTimer, "AnimKeyTempPivotMonitor"
+        ):
+            if existing is not timer:
+                try:
+                    existing.stop()
+                    existing.deleteLater()
+                except RuntimeError:
+                    pass
+    if timer is None:
+        return
+    try:
+        timer.stop()
+        timer.deleteLater()
+    except (RuntimeError, AttributeError):
+        pass
+
+
+def _current_temp_pivot_position(state=None):
+    try:
+        if cmds.manipPivot(query=True, valid=True):
+            position = _flat_vector(cmds.manipPivot(query=True, position=True))
+            if position:
+                return position
+    except Exception:
+        pass
+
+    state = state or {}
+    position = state.get("custom_pivot_position")
+    if position:
+        return list(position)
+
+    for obj in reversed(state.get("objects", [])):
+        if not cmds.objExists(obj):
+            continue
+        try:
+            return list(
+                cmds.xform(obj, query=True, worldSpace=True, rotatePivot=True)
+            )
+        except Exception:
+            continue
+    return None
+
+
+def _finalize_temp_pivot_edit(pivot_position=None):
+    """Keep the custom manipulator pivot while restoring object pivots early."""
+    global _temp_pivot_restore_state
+
+    state = _temp_pivot_restore_state
+    if not state or state.get("pivots_finalized"):
+        return False
+
+    pivot_position = pivot_position or _current_temp_pivot_position(state)
+    _restore_object_pivots(state)
+
+    cmds.manipRotateContext(
+        "Rotate",
+        edit=True,
+        useManipPivot=True,
+        useCenterPivot=False,
+        useObjectPivot=False,
+        pinPivot=True,
+    )
+    if pivot_position:
+        cmds.manipPivot(position=pivot_position)
+    cmds.manipPivot(pinPivot=True)
+
+    state["custom_pivot_position"] = (
+        list(pivot_position) if pivot_position else None
+    )
+    state["pivots_finalized"] = True
+    state["edit_mode_seen"] = False
+    return True
+
+
+def _monitor_temp_pivot_edit_mode():
+    state = _temp_pivot_restore_state
+    if not state:
+        _stop_temp_pivot_monitor()
+        return
+    if state.get("pivots_finalized"):
+        _stop_temp_pivot_monitor()
+        return
+
+    try:
+        editing = bool(
+            cmds.manipRotateContext(
+                "Rotate", query=True, editPivotMode=True
+            )
+        )
+    except Exception:
+        return
+
+    if editing:
+        state["edit_mode_seen"] = True
+        position = _current_temp_pivot_position(state)
+        if position:
+            state["custom_pivot_position"] = position
+        return
+
+    if state.get("edit_mode_seen") and not state.get("pivots_finalized"):
+        try:
+            _finalize_temp_pivot_edit()
+            _stop_temp_pivot_monitor()
+        except Exception as exc:
+            cmds.warning(
+                "Temp Pivot: could not finalize pivot edit: {}".format(exc)
+            )
+
+
+def _start_temp_pivot_monitor():
+    global _temp_pivot_monitor
+
+    _stop_temp_pivot_monitor()
+    application = QtWidgets.QApplication.instance()
+    if application is None:
+        return
+
+    timer = QtCore.QTimer(application)
+    timer.setObjectName("AnimKeyTempPivotMonitor")
+    timer.setInterval(16)
+    timer.timeout.connect(_monitor_temp_pivot_edit_mode)
+    timer.start()
+    _temp_pivot_monitor = timer
+
+
 def activate_temp_pivot(objects=None, pivot_mode="last", edit_pivot=True):
     """Activate Maya's non-destructive custom manipulator pivot."""
     global _temp_pivot_restore_state
@@ -185,6 +319,11 @@ def activate_temp_pivot(objects=None, pivot_mode="last", edit_pivot=True):
 
     pivot_position = _temp_pivot_position(selected_objects, pivot_mode=pivot_mode)
     _temp_pivot_restore_state = _capture_temp_pivot_state(selected_objects)
+    _temp_pivot_restore_state.update({
+        "custom_pivot_position": list(pivot_position),
+        "pivots_finalized": not edit_pivot,
+        "edit_mode_seen": bool(edit_pivot),
+    })
     undo_open = False
     try:
         cmds.undoInfo(openChunk=True, chunkName="AnimKey Temp Pivot")
@@ -207,11 +346,16 @@ def activate_temp_pivot(objects=None, pivot_mode="last", edit_pivot=True):
         ):
             cmds.ctxEditMode()
     except Exception as exc:
+        _stop_temp_pivot_monitor()
+        _temp_pivot_restore_state = None
         om.MGlobal.displayError("Temp Pivot error: {}".format(exc))
         return None
     finally:
         if undo_open:
             cmds.undoInfo(closeChunk=True)
+
+    if edit_pivot:
+        _start_temp_pivot_monitor()
 
     return {
         "objects": selected_objects,
@@ -221,9 +365,10 @@ def activate_temp_pivot(objects=None, pivot_mode="last", edit_pivot=True):
 
 
 def deactivate_temp_pivot():
-    """Restore object pivots and Maya's manipulator state from before activation."""
+    """Clear the custom pivot and restore Maya's previous manipulator state."""
     global _temp_pivot_restore_state
 
+    _stop_temp_pivot_monitor()
     restore_state = _temp_pivot_restore_state or {}
     rotate_state = restore_state.get("rotate_context", {})
     undo_open = False
@@ -236,7 +381,9 @@ def deactivate_temp_pivot():
                 cmds.setToolTo("RotateSuperContext")
             cmds.ctxEditMode()
 
-        _restore_object_pivots(restore_state)
+        if not restore_state.get("pivots_finalized", False):
+            _restore_object_pivots(restore_state)
+            restore_state["pivots_finalized"] = True
 
         cmds.manipPivot(pinPivot=False)
         cmds.manipPivot(reset=True)
