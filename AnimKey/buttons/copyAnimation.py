@@ -144,6 +144,50 @@ def get_animated_channels(control):
     return animated_channels
 
 
+def _control_channel_sets(control):
+    """Return all and locked channel names for one control using bulk queries."""
+    all_attrs = set()
+    locked_attrs = set()
+    for short_names in (False, True):
+        kwargs = {"shortNames": True} if short_names else {}
+        try:
+            all_attrs.update(cmds.listAttr(control, **kwargs) or [])
+        except Exception:
+            pass
+        try:
+            locked_attrs.update(cmds.listAttr(control, locked=True, **kwargs) or [])
+        except Exception:
+            pass
+    return all_attrs, locked_attrs
+
+
+def _channel_exists(channel, all_attrs):
+    return channel in all_attrs or channel.split("[", 1)[0] in all_attrs
+
+
+def _build_animation_transfers(assignments, animation_data):
+    transfers = []
+    prevalidated = set()
+    skipped = 0
+    attr_cache = {}
+    for ctrl_key, control in assignments:
+        if control not in attr_cache:
+            attr_cache[control] = _control_channel_sets(control)
+        all_attrs, locked_attrs = attr_cache[control]
+        for channel, curve_data in animation_data.get(ctrl_key, {}).items():
+            base_channel = channel.split("[", 1)[0]
+            if not _channel_exists(channel, all_attrs):
+                skipped += 1
+                continue
+            if channel in locked_attrs or base_channel in locked_attrs:
+                skipped += 1
+                continue
+            attr_path = f"{control}.{channel}"
+            transfers.append((attr_path, curve_data))
+            prevalidated.add(attr_path)
+    return transfers, prevalidated, skipped
+
+
 def get_control_short_name(control):
     """Return a namespace-agnostic control name."""
     leaf = control.rsplit("|", 1)[-1]
@@ -1255,18 +1299,17 @@ def apply_animation_data_to_scene(
         except Exception:
             pass
 
-        transfers = []
-        for ctrl_name, control in target_assignments:
-            for ch, curve_data in animation_data.get(ctrl_name, {}).items():
-                if not cmds.attributeQuery(ch, node=control, exists=True):
-                    skipped += 1
-                    continue
-                transfers.append((f"{control}.{ch}", curve_data))
+        transfers, prevalidated, skipped_channels = _build_animation_transfers(
+            target_assignments,
+            animation_data,
+        )
+        skipped += skipped_channels
         results = curve_transfer.paste_curves_batch(
             transfers,
             layer_name=target_layer,
             time_offset=float(time_offset or 0.0),
             clear_existing=paste_mode != "insert",
+            prevalidated_attr_paths=prevalidated,
         )
         applied += sum(1 for result in results if result)
         skipped += sum(1 for result in results if not result)
@@ -2643,12 +2686,15 @@ class SmartAnimationLibraryWindow(ContextPopupWindow):
         if original_range:
             source_start = int(original_range[0])
             source_end = int(original_range[1])
-            relative_end = source_start + (selected_end - selected_start)
-            animation_data = trim_animation_data_to_range(
-                animation_data,
-                source_start,
-                relative_end
-            )
+            selected_duration = selected_end - selected_start
+            source_duration = source_end - source_start
+            if selected_duration < source_duration:
+                relative_end = source_start + selected_duration
+                animation_data = trim_animation_data_to_range(
+                    animation_data,
+                    source_start,
+                    relative_end
+                )
 
         time_offset = None
         if original_range:
@@ -2842,18 +2888,17 @@ def _paste_clip_to_targets(target_map, time_offset=0.0, clear_existing=True):
     pasted_count = 0
     skipped_count = 0
     assignments = target_map.items() if hasattr(target_map, "items") else target_map
-    transfers = []
-    for ctrl_key, control in assignments:
-        for channel, curve_data in _anim_buffer.get(ctrl_key, {}).items():
-            if not cmds.attributeQuery(channel, node=control, exists=True):
-                skipped_count += 1
-                continue
-            transfers.append((f"{control}.{channel}", curve_data))
+    transfers, prevalidated, skipped_channels = _build_animation_transfers(
+        assignments,
+        _anim_buffer,
+    )
+    skipped_count += skipped_channels
     results = curve_transfer.paste_curves_batch(
         transfers,
         layer_name=target_layer,
         time_offset=float(time_offset or 0.0),
         clear_existing=clear_existing,
+        prevalidated_attr_paths=prevalidated,
     )
     pasted_count += sum(1 for result in results if result)
     skipped_count += sum(1 for result in results if not result)

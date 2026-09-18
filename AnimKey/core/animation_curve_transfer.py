@@ -687,6 +687,13 @@ def create_temp_curve(curve_data, name="ANIMKEY_TEMP_CURVE"):
     return None
 
 
+def _curve_node_type_for_payload(curve_data):
+    node_type = curve_data.get("curve_node_type") if isinstance(curve_data, dict) else None
+    if node_type not in ANIM_CURVE_TYPES:
+        node_type = "animCurveTU"
+    return node_type
+
+
 def _split_attr(attr_path):
     if not attr_path or "." not in attr_path:
         return None, None
@@ -763,6 +770,47 @@ def _layer_is_locked(layer_name):
         return bool(cmds.getAttr("{}.lock".format(layer_name)))
     except Exception:
         return False
+
+
+def _create_direct_target_curve(attr_path, curve_data, layer_name=None):
+    """Create and connect an empty base-layer curve without seeding a key."""
+    layer_name = active_animation_layer() if layer_name is None else layer_name
+    if not is_base_layer(layer_name):
+        return None
+    node, attr = _split_attr(attr_path)
+    if not node or not attr or not cmds.objExists(attr_path):
+        return None
+    try:
+        if cmds.getAttr(attr_path, lock=True):
+            return None
+    except Exception:
+        return None
+    try:
+        incoming = cmds.listConnections(
+            attr_path,
+            source=True,
+            destination=False,
+            plugs=True,
+            skipConversionNodes=False,
+        ) or []
+    except Exception:
+        incoming = []
+    if incoming:
+        return None
+
+    curve = None
+    node_type = _curve_node_type_for_payload(curve_data)
+    try:
+        curve = cmds.createNode(node_type, name="ANIMKEY_PASTE_CURVE#")
+        cmds.connectAttr("{}.output".format(curve), attr_path, force=False)
+        return curve
+    except Exception:
+        if curve and cmds.objExists(curve):
+            try:
+                cmds.delete(curve)
+            except Exception:
+                pass
+    return None
 
 
 def ensure_target_curve(attr_path, layer_name=None, seed_time=None):
@@ -936,6 +984,7 @@ def paste_curves_batch(
     layer_name=None,
     time_offset=0.0,
     clear_existing=True,
+    prevalidated_attr_paths=None,
 ):
     """Paste many serialized curves with one native clipboard operation.
 
@@ -957,6 +1006,7 @@ def paste_curves_batch(
     temp_curves = []
     layer_name = active_animation_layer() if layer_name is None else layer_name
     offset = float(time_offset or 0.0)
+    prevalidated_attr_paths = set(prevalidated_attr_paths or [])
     curve_map = existing_curve_map(
         [transfer[0] for transfer in transfers if transfer],
         layer_name=layer_name,
@@ -973,12 +1023,18 @@ def paste_curves_batch(
                     continue
 
                 target_curve = curve_map.get(attr_path)
-                if target_curve:
+                if target_curve and attr_path not in prevalidated_attr_paths:
                     try:
                         if cmds.getAttr(attr_path, lock=True):
                             target_curve = None
                     except Exception:
                         target_curve = None
+                if not target_curve:
+                    target_curve = _create_direct_target_curve(
+                        attr_path,
+                        curve_data,
+                        layer_name=layer_name,
+                    )
                 if not target_curve:
                     target_curve = ensure_target_curve(
                         attr_path,

@@ -58,6 +58,14 @@ contains the verified AnimKey package. Draft releases and prereleases are never
 offered by the updater. AnimKey closes its tool windows and reloads the toolbar
 automatically after changing versions; Maya does not need to be restarted.
 
+### AnimKey 1.1.1
+
+- Paste Animation and Paste Selected Animation now prepare destination channels
+  in bulk and avoid slow seed-key creation when a base-layer target curve can be
+  connected directly.
+- Full-range library pastes no longer rebuild a trimmed copy of every saved
+  curve before pasting.
+
 ### AnimKey 1.1.0
 
 - Copy Animation captures selected curves in bulk and writes its cross-instance
