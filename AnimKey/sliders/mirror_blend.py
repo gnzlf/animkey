@@ -11,6 +11,7 @@
 """
 
 import maya.cmds as cmds
+from AnimKey.sliders.slider_utils import apply_slider_value
 from AnimKey.buttons.mirror import (
     find_opposite_name,
     load_snapshot,
@@ -19,7 +20,8 @@ from AnimKey.buttons.mirror import (
     clear_mirror_cache,
     get_opposite_control,
     compute_mirror_values,
-    get_rig_identifier
+    get_rig_identifier,
+    _load_or_build_basic_snapshot,
 )
 
 
@@ -56,13 +58,18 @@ def prepare_mirror_blend_data(objs=None):
     if not objects:
         return _mirror_blend_data_cache
     
-    fallback_snapshot = load_snapshot()
+    profiles = {}
     
     # Process each selected control
     for control in objects:
         if not cmds.objExists(control):
             continue
-        snapshot = load_snapshot(get_rig_identifier([control])) or fallback_snapshot
+        rig_name = get_rig_identifier([control])
+        if rig_name not in profiles:
+            profiles[rig_name] = _load_or_build_basic_snapshot(
+                [control], rig_name=rig_name
+            )[0]
+        snapshot = profiles.get(rig_name)
         
         opposite_name = get_opposite_control(control, snapshot) or find_opposite_name(control)
         is_central = (opposite_name is None or not cmds.objExists(opposite_name))
@@ -122,6 +129,7 @@ def execute(percentage):
     
     # Clamp percentage
     percentage = max(0.0, min(100.0, percentage))
+    current_time = cmds.currentTime(query=True)
     
     # Apply blend to each attribute
     for attr_full, cache in _mirror_blend_data_cache.items():
@@ -165,8 +173,15 @@ def execute(percentage):
                 max_limit = cmds.attributeQuery(attr, node=obj, maximum=True)[0]
                 blended_value = min(blended_value, max_limit)
             
-            # Set the blended value
-            cmds.setAttr(target_attr, blended_value)
+            # Write through the same layer-aware path as the other sliders.
+            # Direct setAttr can edit BaseAnimation (or fail on an animBlend
+            # destination) while another animation layer is active.
+            apply_slider_value(
+                target_attr,
+                current_time,
+                blended_value,
+                current_time,
+            )
             
         except Exception:
             continue
@@ -179,54 +194,12 @@ def reset():
     """
     global _mirror_blend_data_cache, _is_dragging
     
-    current_time = cmds.currentTime(query=True)
-    
-    # Create keyframes for all modified attributes
-    if _mirror_blend_data_cache:
-        for attr_full, cache in _mirror_blend_data_cache.items():
-            try:
-                opposite = cache.get("opposite")
-                is_central = cache.get("is_central", False)
-                
-                # Determine target attribute
-                if is_central or not opposite:
-                    target_attr = attr_full
-                else:
-                    if opposite and cmds.objExists(opposite):
-                        obj, attr = attr_full.split('.', 1)
-                        target_attr = f"{opposite}.{attr}"
-                        
-                        if not is_attribute_modifiable(opposite, attr):
-                            continue
-                    else:
-                        continue
-                
-                # Get current value (already modified by slider)
-                current_value = cmds.getAttr(target_attr)
-                
-                # Handle list/tuple values
-                if isinstance(current_value, (list, tuple)):
-                    if len(current_value) == 1:
-                        current_value = current_value[0]
-                    else:
-                        # For compound attributes, create keyframe for each component
-                        for i in range(len(current_value)):
-                            try:
-                                cmds.setKeyframe(f"{target_attr}[{i}]", time=current_time, value=current_value[i])
-                            except:
-                                pass
-                        continue
-                
-                # Create keyframe at current time with current value
-                cmds.setKeyframe(target_attr, time=current_time, value=current_value)
-                
-            except Exception:
-                continue
-    
+    # apply_slider_value creates/edits the preview key during the drag, so no
+    # second destination-plug keying pass is needed here.  That old pass was
+    # what sent Mirror Blend back to BaseAnimation on layered rigs.
     # Reset cache
     _mirror_blend_data_cache = {}
     
     if _is_dragging:
         cmds.undoInfo(closeChunk=True)
         _is_dragging = False
-

@@ -15,12 +15,14 @@ from AnimKey.sliders.slider_utils import (
     apply_slider_value,
     finalize_slider_value,
     get_frames_to_process,
+    get_curve_target,
     get_keyframes_for_attribute,
     get_slider_value,
     get_previous_next_keyframes,
     get_processing_context,
     get_value_at_time,
     should_process_attribute,
+    slider_attribute_is_editable,
     slider_amount
 )
 
@@ -45,7 +47,7 @@ def prepare_blend_data(objs=None, attrs=None):
     global _frame_data_cache, _left_frame, _right_frame, _processing_context
     _frame_data_cache = {}
     
-    _processing_context = get_processing_context()
+    _processing_context = get_processing_context(explicit_attributes=attrs is not None)
     current_time = _processing_context.get('current_time')
     selected_channels = _processing_context.get('selected_channels')
     
@@ -105,10 +107,7 @@ def prepare_blend_data(objs=None, attrs=None):
             
             for frame in frames_to_process:
                 try:
-                    if frame in all_keyframes:
-                        original_value = get_value_at_time(attr_full, frame)
-                    else:
-                        original_value = cmds.getAttr(attr_full)
+                    original_value = get_value_at_time(attr_full, frame)
                     
                     if isinstance(original_value, (list, tuple)):
                         continue
@@ -118,7 +117,8 @@ def prepare_blend_data(objs=None, attrs=None):
                     prev_frame, _ = get_previous_next_keyframes(all_keyframes, frame)
                     if prev_frame is not None:
                         try:
-                            prev_tan_type = cmds.keyTangent(attr_full, query=True, time=(prev_frame,), outTangentType=True)
+                            tangent_target = get_curve_target(attr_full, prev_frame, attr)
+                            prev_tan_type = cmds.keyTangent(tangent_target, query=True, time=(prev_frame,), outTangentType=True)
                             if prev_tan_type:
                                 prev_tan_type = prev_tan_type[0]
                         except:
@@ -173,7 +173,7 @@ def execute(percentage, objs=None, selection=True):
         try:
             if not cmds.objExists(attr_full):
                 continue
-            if cmds.getAttr(attr_full, lock=True) or not cmds.getAttr(attr_full, settable=True):
+            if not slider_attribute_is_editable(attr_full):
                 continue
             
             original_value = cache.get("original_value")
@@ -227,15 +227,16 @@ def reset():
                 # Apply tangent type
                 if 'prevTanType' in cache_data and cache_data['prevTanType']:
                     prev_tan_type = cache_data['prevTanType']
+                    tangent_target = get_curve_target(attr_full, frame)
                     try:
                         if prev_tan_type == 'step':
-                            cmds.keyTangent(attr_full, edit=True, time=(frame,), 
+                            cmds.keyTangent(tangent_target, edit=True, time=(frame,),
                                           inTangentType='auto', outTangentType='step')
                         elif prev_tan_type == 'stepnext':
-                            cmds.keyTangent(attr_full, edit=True, time=(frame,), 
+                            cmds.keyTangent(tangent_target, edit=True, time=(frame,),
                                           inTangentType='stepnext', outTangentType='auto')
                         else:
-                            cmds.keyTangent(attr_full, edit=True, time=(frame,), 
+                            cmds.keyTangent(tangent_target, edit=True, time=(frame,),
                                           inTangentType=prev_tan_type, outTangentType=prev_tan_type)
                     except:
                         pass

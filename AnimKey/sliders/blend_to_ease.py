@@ -19,12 +19,14 @@ from AnimKey.sliders.slider_utils import (
     apply_slider_value,
     finalize_slider_value,
     get_frames_to_process,
+    get_curve_target,
     get_keyframes_for_attribute,
     get_slider_value,
     get_selection_guide_frames,
     get_processing_context,
     get_value_at_time,
     should_process_attribute,
+    slider_attribute_is_editable,
     slider_amount
 )
 
@@ -72,9 +74,10 @@ def _bounded_lerp(original_value, target_value, amount):
 
 def _capture_tangents(attr_full, frame):
     try:
+        target = get_curve_target(attr_full, frame)
         return {
-            "itt": (cmds.keyTangent(attr_full, q=True, time=(frame, frame), itt=True) or [None])[0],
-            "ott": (cmds.keyTangent(attr_full, q=True, time=(frame, frame), ott=True) or [None])[0],
+            "itt": (cmds.keyTangent(target, q=True, time=(frame, frame), itt=True) or [None])[0],
+            "ott": (cmds.keyTangent(target, q=True, time=(frame, frame), ott=True) or [None])[0],
         }
     except Exception:
         return {}
@@ -91,7 +94,7 @@ def _restore_tangents(attr_full, frame, tangent_data):
     if not kwargs:
         return
     try:
-        cmds.keyTangent(attr_full, edit=True, time=(frame, frame), **kwargs)
+        cmds.keyTangent(get_curve_target(attr_full, frame), edit=True, time=(frame, frame), **kwargs)
     except Exception:
         pass
 
@@ -105,7 +108,8 @@ def _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True):
     if not kwargs:
         return
     try:
-        cmds.keyTangent(attr_full, edit=True, time=(frame, frame), **kwargs)
+        target = get_curve_target(attr_full, frame)
+        cmds.keyTangent(target, edit=True, time=(frame, frame), **kwargs)
     except Exception:
         try:
             kwargs = {}
@@ -113,7 +117,7 @@ def _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True):
                 kwargs["itt"] = "clamped"
             if out_tangent:
                 kwargs["ott"] = "clamped"
-            cmds.keyTangent(attr_full, edit=True, time=(frame, frame), **kwargs)
+            cmds.keyTangent(target, edit=True, time=(frame, frame), **kwargs)
         except Exception:
             pass
 
@@ -156,7 +160,7 @@ def prepare_blend_data(objs=None, attrs=None):
     global _blend_ease_data_cache, _processing_context
     _blend_ease_data_cache = {}
     
-    _processing_context = get_processing_context()
+    _processing_context = get_processing_context(explicit_attributes=attrs is not None)
     selected_channels = _processing_context.get('selected_channels')
     
     objects = objs if objs else cmds.ls(selection=True)
@@ -271,7 +275,7 @@ def execute(percentage):
         try:
             if not cmds.objExists(attr_full):
                 continue
-            if cmds.getAttr(attr_full, lock=True) or not cmds.getAttr(attr_full, settable=True):
+            if not slider_attribute_is_editable(attr_full):
                 continue
             
             original_value = cache.get("originalValue")

@@ -36,6 +36,55 @@ import AnimKey
 AnimKey.show()
 ```
 
+## Maya Compatibility
+
+AnimKey supports Maya 2022 through Maya 2027 on Python 3. The runtime chooses
+the Qt binding installed by Maya, so the same package works across both Qt
+families:
+
+| Maya releases | Qt binding |
+| --- | --- |
+| 2022, 2023, 2024 | PySide2 / Qt5 |
+| 2025, 2026, 2027 | PySide6 / Qt6 |
+
+Maya 2022 must run in its default Python 3 mode. Its optional legacy Python 2
+mode is not supported by AnimKey.
+
+## Stable updates and version history
+
+Settings now includes an **Update** tab. It lists published stable releases
+from `gnzlf/animkey` and can upgrade, downgrade, or reinstall any release that
+contains the verified AnimKey package. Draft releases and prereleases are never
+offered by the updater. AnimKey closes its tool windows and reloads the toolbar
+automatically after changing versions; Maya does not need to be restarted.
+
+### AnimKey 1.1.0
+
+- Copy Animation captures selected curves in bulk and writes its cross-instance
+  cache in the background.
+- Paste Animation transfers all channels through Maya's native multi-curve
+  clipboard while preserving Undo, animation layers, tangents and keys outside
+  the copied range.
+- Copy/Paste Pose keeps an in-memory clipboard and batches layer setup.
+- Updating or uninstalling closes AnimKey windows and reloads the toolbar in the
+  current Maya session without asking for a Maya restart.
+
+Preferences and personal data live outside the installed package and are kept
+when changing versions. Public repositories work without authentication. For a
+private repository, start Maya with an `ANIMKEY_GITHUB_TOKEN` environment
+variable that has read access to the repository.
+
+### Publishing a stable version
+
+1. Set `__version__` in `AnimKey/version.py` using `MAJOR.MINOR.PATCH`.
+2. Commit and push the version you want to publish.
+3. In GitHub, open **Actions → Publish stable AnimKey release → Run workflow**.
+4. Enter the exact version and optional release notes.
+
+The workflow creates the version tag, a normal (non-prerelease) GitHub Release,
+the updater ZIP, and its SHA-256 checksum. Publishing that release is the single
+action that makes the version visible and installable in AnimKey.
+
 ---
 
 ## 📖 Usage
@@ -96,6 +145,27 @@ Apply modifications to selected curves:
 - **Flat** - Flatten to average value
 - **Ease In/Out** - Add easing
 - **Noise** - Add random noise
+
+### Mirror
+
+- Click **MIR** to use a saved precise profile when available, with an automatic
+  in-memory quick fallback when no snapshot exists.
+- Right-click **MIR → Quick Mirror (No Snapshot)** to force the fast pose-only
+  path. It never creates files, changes time, or scans the entire rig.
+- Right-click **MIR → Build Precise Mirror Snapshot** once from the rig's
+  default pose for calibrated FK/IK, custom attributes, rotated rig roots, and
+  all Maya rotation orders.
+- Left/right pairing is shared with Select Opposite and supports common tokens,
+  namespaces, duplicate DAG names, and conservative geometry-based matching.
+- Ambiguous off-plane controls are skipped instead of being mirrored onto the
+  wrong target. Use Mirror diagnosis to review unresolved controls and pairing
+  confidence.
+
+### Crash Recovery
+
+- Recovery is opt-in from the **CRASH** button, keeping normal animation work
+  free from background checkpoint processing.
+- Once enabled, it captures animation checkpoints at the configured interval.
 
 ---
 
@@ -171,8 +241,8 @@ def get_info():
 
 ## 🔧 Requirements
 
-- Autodesk Maya 2020 or later
-- Python 3.x (included with Maya 2022+)
+- Autodesk Maya 2022 through Maya 2027
+- Python 3 (included with Maya)
 - PySide2 or PySide6 (included with Maya)
 
 ---
@@ -192,4 +262,3 @@ AnimKey is an independent animation workflow toolkit for Maya animators.
 <p align="center">
   Made with ❤️ for the animation community
 </p>
-

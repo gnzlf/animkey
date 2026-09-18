@@ -22,6 +22,7 @@ from AnimKey.sliders.slider_utils import (
     get_processing_context,
     get_value_at_time,
     should_process_attribute,
+    slider_attribute_is_editable,
     slider_amount
 )
 
@@ -37,7 +38,7 @@ def prepare_push_pull_data(objs=None, attrs=None):
     global _push_pull_data_cache, _processing_context
     _push_pull_data_cache = {}
     
-    _processing_context = get_processing_context()
+    _processing_context = get_processing_context(explicit_attributes=attrs is not None)
     selected_channels = _processing_context.get('selected_channels')
     
     objects = objs if objs else cmds.ls(selection=True)
@@ -85,10 +86,7 @@ def prepare_push_pull_data(objs=None, attrs=None):
             
             for frame in frames_to_process:
                 try:
-                    if frame in all_keyframes:
-                        original_value = get_value_at_time(attr_full, frame)
-                    else:
-                        original_value = cmds.getAttr(attr_full)
+                    original_value = get_value_at_time(attr_full, frame)
                     
                     if isinstance(original_value, (list, tuple)):
                         continue
@@ -139,7 +137,7 @@ def execute(value, objs=None, selection=True):
         try:
             if not cmds.objExists(attr_full):
                 continue
-            if cmds.getAttr(attr_full, lock=True) or not cmds.getAttr(attr_full, settable=True):
+            if not slider_attribute_is_editable(attr_full):
                 continue
             
             linear_value = cache.get("linearValue")

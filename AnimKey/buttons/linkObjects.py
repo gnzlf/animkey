@@ -15,13 +15,13 @@
 """
 
 import os
-import json
 
 import maya.cmds as cmds
 import maya.mel as mel
 import maya.api.OpenMaya as om
 
 from AnimKey.mods import configMod as config
+from AnimKey.mods.storage import atomic_write_json, read_json
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -66,12 +66,11 @@ def _load_relative_data():
     if not os.path.exists(file_path):
         return False
     
-    try:
-        with open(file_path, 'r') as f:
-            _state.relative_data = json.load(f)
-        return True
-    except (json.JSONDecodeError, IOError):
+    data = read_json(file_path, default=None, backup_corrupt=True)
+    if not isinstance(data, dict):
         return False
+    _state.relative_data = data
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -128,8 +127,7 @@ def copy_link_frame(*args):
     os.makedirs(folder, exist_ok=True)
     
     file_path = _get_link_data_file()
-    with open(file_path, 'w') as f:
-        json.dump(save_dict, f, indent=2)
+    atomic_write_json(file_path, save_dict, indent=2)
     
     # Load into state
     _state.relative_data = save_dict
@@ -201,8 +199,7 @@ def copy_link_playback_range(*args):
     os.makedirs(folder, exist_ok=True)
     
     file_path = _get_link_data_file()
-    with open(file_path, 'w') as f:
-        json.dump(save_dict, f, indent=2)
+    atomic_write_json(file_path, save_dict, indent=2)
     
     _state.relative_data = save_dict
     
@@ -615,5 +612,4 @@ def set_button_active(button, active):
             ''')
     except:
         pass
-
 

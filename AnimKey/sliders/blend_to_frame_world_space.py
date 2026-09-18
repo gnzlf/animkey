@@ -12,12 +12,14 @@
 import maya.cmds as cmds
 import maya.api.OpenMaya as om
 from AnimKey.sliders.slider_utils import (
-    finalize_slider_value,
+    apply_worldspace_slider_values,
     get_keyframes_for_attribute,
     get_object_frames_to_process,
     get_processing_context,
-    should_process_attribute,
-    slider_amount
+    should_process_attribute_at_frame,
+    slider_attribute_is_editable,
+    slider_amount,
+    blend_angle_degrees,
 )
 
 
@@ -77,7 +79,7 @@ def prepare_blend_data(objs=None, attrs=None):
     global _frame_ws_data_cache, _left_frame, _right_frame, _processing_context
     _frame_ws_data_cache = {}
     
-    _processing_context = get_processing_context()
+    _processing_context = get_processing_context(explicit_attributes=attrs is not None)
     current_time = _processing_context.get('current_time')
     selected_channels = _processing_context.get('selected_channels')
     
@@ -155,7 +157,9 @@ def prepare_blend_data(objs=None, attrs=None):
                 if attr not in transform_attrs:
                     continue
                 
-                if not should_process_attribute(obj, attr, selected_channels):
+                if not should_process_attribute_at_frame(
+                    obj, attr, frame, _processing_context, selected_channels
+                ):
                     continue
                 
                 attr_full = f'{obj}.{attr}'
@@ -201,13 +205,10 @@ def execute(percentage, objs=None, selection=True):
         cmds.undoInfo(openChunk=True)
         _is_dragging = True
     
-    current_time = _processing_context.get('current_time', cmds.currentTime(query=True))
+    pending_updates = []
     amount = slider_amount(percentage)
     
     for cache_key, cache in _frame_ws_data_cache.items():
-        if not cache.get("needsCalculation", False):
-            continue
-        
         attr_full = cache.get("attr_full")
         frame = cache.get("frame")
         
@@ -217,7 +218,7 @@ def execute(percentage, objs=None, selection=True):
         try:
             if not cmds.objExists(attr_full):
                 continue
-            if cmds.getAttr(attr_full, lock=True) or not cmds.getAttr(attr_full, settable=True):
+            if not slider_attribute_is_editable(attr_full):
                 continue
             
             original_value = cache.get("original_value")
@@ -228,64 +229,28 @@ def execute(percentage, objs=None, selection=True):
                 continue
             
             if right_value is not None and percentage > 0:
-                difference = right_value - original_value
+                target_value = right_value
             elif left_value is not None:
-                difference = original_value - left_value
+                target_value = left_value
             else:
                 continue
-            
-            weighted_difference = difference * amount
-            blended_value = original_value + weighted_difference if percentage > 0 else original_value - weighted_difference
-            
-            # Apply value in world space
-            obj, attr = attr_full.split('.', 1)
-            
-            if attr.startswith('translate'):
-                axis = attr[-1].lower()
-                pos = list(cmds.xform(obj, query=True, translation=True, worldSpace=True))
-                axis_idx = {'x': 0, 'y': 1, 'z': 2}[axis]
-                pos[axis_idx] = blended_value
-                cmds.xform(obj, translation=pos, worldSpace=True)
-            elif attr.startswith('rotate'):
-                axis = attr[-1].lower()
-                rot = list(cmds.xform(obj, query=True, rotation=True, worldSpace=True))
-                axis_idx = {'x': 0, 'y': 1, 'z': 2}[axis]
-                rot[axis_idx] = blended_value
-                cmds.xform(obj, rotation=rot, worldSpace=True)
+
+            if attr_full.rsplit('.', 1)[-1].startswith('rotate'):
+                blended_value = blend_angle_degrees(original_value, target_value, amount)
             else:
-                cmds.setAttr(attr_full, blended_value)
+                blended_value = original_value + ((target_value - original_value) * amount)
             
+            pending_updates.append((attr_full, frame, blended_value))
+
         except Exception:
             continue
+
+    apply_worldspace_slider_values(pending_updates)
 
 
 def reset():
     """Reset blend to frame world space slider state."""
     global _frame_ws_data_cache, _is_dragging, _processing_context
-    
-    current_time = _processing_context.get('current_time', cmds.currentTime(query=True))
-    
-    if _frame_ws_data_cache:
-        for cache_key, cache_data in _frame_ws_data_cache.items():
-            try:
-                attr_full = cache_data.get("attr_full")
-                frame = cache_data.get("frame")
-                
-                if not attr_full:
-                    continue
-                
-                current_value = cmds.getAttr(attr_full)
-                
-                if isinstance(current_value, (list, tuple)):
-                    if len(current_value) == 1:
-                        current_value = current_value[0]
-                    else:
-                        continue
-                
-                finalize_slider_value(attr_full, frame, current_value, current_time)
-                
-            except Exception:
-                continue
     
     _frame_ws_data_cache = {}
     _processing_context = {}

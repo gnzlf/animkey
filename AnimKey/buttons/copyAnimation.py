@@ -11,15 +11,16 @@ import maya.mel as mel
 import os
 import json
 import re
+import threading
 from datetime import datetime
 from AnimKey.mods.themes import ThemeManager
 from AnimKey.mods.uiMod import ContextPopupWindow
+from AnimKey.mods.storage import atomic_write_json
 from AnimKey.core import animation_curve_transfer as curve_transfer
 
-try:
-    from PySide2 import QtWidgets, QtCore, QtGui
-except ImportError:
-    from PySide6 import QtWidgets, QtCore, QtGui
+from AnimKey.mods.maya_compat import (
+    QtCore, QtGui, QtWidgets, screen_available_geometry,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -249,21 +250,33 @@ def _resolve_from_identity_lookup(source_name, lookup, namespaces=None, used_tar
 
 def list_candidate_controls(selected):
     """Return selected controls plus descendants when useful."""
-    candidates = []
-    seen = set()
-    for node in selected or []:
-        if not cmds.objExists(node):
-            continue
-        transforms = [node]
-        try:
-            descendants = cmds.listRelatives(node, ad=True, fullPath=True, type="transform") or []
-            transforms.extend(descendants)
-        except Exception:
-            pass
-        for item in transforms:
-            if item not in seen:
-                seen.add(item)
-                candidates.append(item)
+    direct = list_selected_transform_targets(selected)
+    if not direct:
+        return []
+
+    candidates = list(direct)
+    seen = set(candidates)
+    direct_set = set(direct)
+    roots = [
+        node for node in direct
+        if not any(
+            node != possible_parent and node.startswith(possible_parent + "|")
+            for possible_parent in direct_set
+        )
+    ]
+    try:
+        descendants = cmds.listRelatives(
+            roots,
+            ad=True,
+            fullPath=True,
+            type="transform",
+        ) or []
+    except Exception:
+        descendants = []
+    for item in descendants:
+        if item not in seen:
+            seen.add(item)
+            candidates.append(item)
     return candidates
 
 
@@ -322,6 +335,41 @@ def resolve_target_controls(source_names, selected=None):
     """
     selected = cmds.ls(selection=True, long=True) if selected is None else selected
     selected = selected or []
+    source_names = list(source_names)
+    direct_selected = list_selected_transform_targets(selected)
+
+    # The common copy/paste case selects the destination controls directly.
+    # Resolve that flat selection first; walking every selected hierarchy made
+    # nested rigs quadratic and was the main paste bottleneck on large scenes.
+    direct_lookup = build_control_identity_lookup(direct_selected)
+    direct_resolved = {}
+    direct_used = set()
+    for source_name in source_names:
+        target = _resolve_from_identity_lookup(
+            source_name,
+            direct_lookup,
+            namespaces=[None],
+            used_targets=direct_used,
+        )
+        if target is not None:
+            direct_resolved[source_name] = target
+            direct_used.add(target)
+    if len(direct_resolved) == len(source_names):
+        return direct_resolved
+
+    if direct_selected and len(direct_selected) == len(source_names):
+        resolved = dict(direct_resolved)
+        used_targets = set(direct_resolved.values())
+        remaining_sources = [
+            source_name for source_name in source_names if source_name not in resolved
+        ]
+        remaining_targets = [
+            target for target in direct_selected if target not in used_targets
+        ]
+        for source_name, target in zip(remaining_sources, remaining_targets):
+            resolved[source_name] = target
+        return resolved
+
     selected_candidates = list_candidate_controls(selected)
     selected_lookup = build_control_identity_lookup(selected_candidates)
 
@@ -331,12 +379,10 @@ def resolve_target_controls(source_names, selected=None):
         if namespace and namespace not in selected_namespaces:
             selected_namespaces.append(namespace)
 
-    scene_controls = cmds.ls(type="transform", long=True) or []
-    scene_lookup = build_control_identity_lookup(scene_controls)
-
-    source_names = list(source_names)
-    direct_selected = list_selected_transform_targets(selected)
-    if direct_selected and len(direct_selected) == len(source_names):
+    if selected_candidates:
+        # An explicit selection is authoritative.  Falling through to a
+        # whole-scene lookup can otherwise paste back onto the copied source
+        # rig when the selected destination has a different hierarchy/name.
         resolved = {}
         used_targets = set()
         for source_name in source_names:
@@ -349,15 +395,22 @@ def resolve_target_controls(source_names, selected=None):
             if target is not None:
                 resolved[source_name] = target
                 used_targets.add(target)
+
         remaining_sources = [
             source_name for source_name in source_names if source_name not in resolved
         ]
         remaining_targets = [
             target for target in direct_selected if target not in used_targets
         ]
-        for source_name, target in zip(remaining_sources, remaining_targets):
-            resolved[source_name] = target
+        if remaining_sources and len(remaining_sources) == len(remaining_targets):
+            for source_name, target in zip(remaining_sources, remaining_targets):
+                resolved[source_name] = target
         return resolved
+
+    # Whole-scene enumeration is only necessary when there is no authoritative
+    # destination selection. Avoid building this large lookup for normal paste.
+    scene_controls = cmds.ls(type="transform", long=True) or []
+    scene_lookup = build_control_identity_lookup(scene_controls)
 
     resolved = {}
     used_targets = set()
@@ -406,6 +459,57 @@ def resolve_target_controls(source_names, selected=None):
     return resolved
 
 
+def resolve_animation_target_assignments(source_names, selected=None):
+    """Return source/destination pairs for animation paste operations.
+
+    A single copied control is intentionally repeatable across several directly
+    selected controls.  Multi-control clips keep the identity/order mapping
+    used by resolve_target_controls().
+    """
+    selected = cmds.ls(selection=True, long=True) if selected is None else selected
+    selected = selected or []
+    source_names = list(source_names)
+    direct_targets = list_selected_transform_targets(selected)
+    if len(source_names) == 1 and len(direct_targets) > 1:
+        return [(source_names[0], target) for target in direct_targets]
+
+    # Selecting several rig roots should paste the complete clip to every
+    # selected hierarchy. The older global lookup saw duplicate control names
+    # across those rigs as ambiguous and pasted to neither of them. Resolve
+    # each hierarchy independently, as Transify does for multiple namespaces,
+    # while also supporting rigs that intentionally have no namespace.
+    if len(source_names) > 1 and len(direct_targets) > 1:
+        complete_hierarchies = []
+        for root in direct_targets:
+            candidates = list_candidate_controls([root])
+            if len(candidates) <= 1:
+                continue
+            lookup = build_control_identity_lookup(candidates)
+            used_targets = set()
+            hierarchy_map = []
+            for source_name in source_names:
+                target = _resolve_from_identity_lookup(
+                    source_name,
+                    lookup,
+                    namespaces=[None],
+                    used_targets=used_targets,
+                )
+                if target is None:
+                    hierarchy_map = []
+                    break
+                used_targets.add(target)
+                hierarchy_map.append((source_name, target))
+            if len(hierarchy_map) == len(source_names):
+                complete_hierarchies.append(hierarchy_map)
+        if len(complete_hierarchies) > 1:
+            return [
+                assignment
+                for hierarchy_map in complete_hierarchies
+                for assignment in hierarchy_map
+            ]
+    return list(resolve_target_controls(source_names, selected).items())
+
+
 def collect_curve_snapshot(attr_path, time_range=None, layer_name=None):
     """Serialize the requested layer curve without using Maya's clipboard."""
     fast_snapshot = curve_transfer.capture_curve(
@@ -443,6 +547,9 @@ def collect_curve_snapshot(attr_path, time_range=None, layer_name=None):
         "breakdown": cmds.keyframe(attr_path, breakdown=True, **key_query) or [],
     }
 
+    if time_range:
+        curve_data["clip_range"] = [float(time_range[0]), float(time_range[1])]
+
     try:
         curve_data["pre_infinity"] = cmds.setInfinity(attr_path, q=True, pri=True)[0]
         curve_data["post_infinity"] = cmds.setInfinity(attr_path, q=True, poi=True)[0]
@@ -451,6 +558,168 @@ def collect_curve_snapshot(attr_path, time_range=None, layer_name=None):
         curve_data["post_infinity"] = None
 
     return curve_data
+
+
+def _curves_on_layer(candidate_curves, layer_name):
+    """Filter candidate curves to one concrete animation layer in bulk."""
+    candidate_curves = list(dict.fromkeys(candidate_curves or []))
+    if not candidate_curves:
+        return []
+
+    layer_name = curve_transfer.active_animation_layer() if layer_name is None else layer_name
+    try:
+        layers = cmds.ls(type="animLayer") or []
+    except Exception:
+        layers = []
+    non_base_curves = set()
+    requested_curves = set()
+    for name in layers:
+        if curve_transfer.is_base_layer(name):
+            continue
+        try:
+            owned = cmds.animLayer(name, query=True, animCurves=True) or []
+        except Exception:
+            owned = []
+        owned = set(owned)
+        non_base_curves.update(owned)
+        if name == layer_name:
+            requested_curves.update(owned)
+
+    if curve_transfer.is_base_layer(layer_name):
+        return [curve for curve in candidate_curves if curve not in non_base_curves]
+    return [curve for curve in candidate_curves if curve in requested_curves]
+
+
+def collect_animation_for_controls(controls, time_range=None, layer_name=None):
+    """Capture selected controls with one curve query instead of per-attribute scans."""
+    controls = list_selected_transform_targets(controls)
+    if not controls:
+        return {}, {}
+    layer_name = curve_transfer.active_animation_layer() if layer_name is None else layer_name
+    try:
+        candidate_curves = cmds.keyframe(controls, query=True, name=True) or []
+    except Exception:
+        candidate_curves = []
+    curves = _curves_on_layer(candidate_curves, layer_name)
+    if not curves:
+        return {}, {}
+
+    selected_set = set(controls)
+    animation_data = {}
+    source_controls = {}
+    for curve in curves:
+        try:
+            driven_plugs = curve_transfer.driven_plugs_for_curve(curve)
+        except Exception:
+            driven_plugs = []
+        for plug in driven_plugs:
+            if not plug or "." not in plug:
+                continue
+            driven_node, driven_attr = plug.rsplit(".", 1)
+            control = _long_transform_name(driven_node)
+            if not control or control not in selected_set:
+                continue
+            channel = _long_attribute_name(control, driven_attr.split("[", 1)[0])
+            attr_path = "{}.{}".format(control, channel)
+            if not cmds.objExists(attr_path):
+                continue
+            snapshot = curve_transfer.capture_curve(
+                curve,
+                time_range=time_range,
+                layer_name=layer_name,
+            )
+            if not snapshot:
+                continue
+            ctrl_key = get_control_storage_key(control)
+            animation_data.setdefault(ctrl_key, {})
+            if channel not in animation_data[ctrl_key]:
+                animation_data[ctrl_key][channel] = snapshot
+                source_controls[ctrl_key] = control
+            break
+    return animation_data, source_controls
+
+
+def _long_transform_name(node):
+    """Return a stable long transform path for a driven plug node."""
+    try:
+        matches = cmds.ls(node, long=True, type="transform") or []
+    except Exception:
+        matches = []
+    if matches:
+        return matches[0]
+    # Shape animation is not a control channel. Mapping a shape's visibility
+    # curve onto its parent transform creates a different animation result.
+    return None
+
+
+def _long_attribute_name(node, attr):
+    try:
+        return cmds.attributeQuery(attr, node=node, longName=True) or attr
+    except Exception:
+        return attr
+
+
+def _collect_selected_graph_animation(selected):
+    """Capture exactly the selected Graph Editor keys and concrete curves.
+
+    This deliberately bypasses the currently preferred animation layer: a
+    selected Graph Editor curve already identifies the exact layer the user
+    intends to copy. The destination still goes to its active layer at paste
+    time.
+    """
+    selected_curve_times = curve_transfer.selected_curve_key_times()
+    if not selected_curve_times:
+        return {}, {}
+
+    selected_transforms = set(list_selected_transform_targets(selected))
+    animation_data = {}
+    source_controls = {}
+
+    for curve, key_times in selected_curve_times.items():
+        driven_plugs = curve_transfer.driven_plugs_for_curve(curve)
+        candidates = []
+        for plug in driven_plugs:
+            if not plug or "." not in plug:
+                continue
+            driven_node, driven_attr = plug.rsplit(".", 1)
+            control = _long_transform_name(driven_node)
+            if not control:
+                continue
+            channel = _long_attribute_name(control, driven_attr.split("[", 1)[0])
+            candidates.append((control, channel))
+
+        if selected_transforms:
+            selected_candidates = [
+                item for item in candidates if item[0] in selected_transforms
+            ]
+            if selected_candidates:
+                candidates = selected_candidates
+        if not candidates:
+            continue
+
+        control, channel = candidates[0]
+        source_layer = curve_transfer.animation_layer_for_curve(
+            "{}.{}".format(control, channel),
+            curve,
+        )
+        snapshot = curve_transfer.capture_curve(
+            curve,
+            layer_name=source_layer,
+            key_times=key_times,
+        )
+        if not snapshot:
+            continue
+
+        ctrl_key = get_control_storage_key(control)
+        animation_data.setdefault(ctrl_key, {})
+        # One channel cannot represent two source layers simultaneously. Keep
+        # the first concrete curve instead of replacing it by enumeration order.
+        if channel in animation_data[ctrl_key]:
+            continue
+        animation_data[ctrl_key][channel] = snapshot
+        source_controls[ctrl_key] = control
+
+    return animation_data, source_controls
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -519,11 +788,18 @@ _anim_buffer = {}
 _anim_sources = {}
 _anim_source_snapshots = {}
 _last_disk_mtime = 0
+_buffer_is_current = False
+_pose_buffer = None
+_pose_buffer_mtime = 0
+_pose_buffer_is_current = False
+_json_write_lock = threading.Lock()
+_json_write_generation = {}
 
 
 def _cleanup_buffer():
     """Clear the clip and remove buffer nodes left by AnimKey versions before v3."""
     global _anim_buffer, _anim_sources, _anim_source_snapshots
+    global _last_disk_mtime, _buffer_is_current
     nodes = cmds.ls(f"{_BUFFER_PREFIX}*", type='transform')
     if nodes:
         try:
@@ -533,6 +809,8 @@ def _cleanup_buffer():
     _anim_buffer = {}
     _anim_sources = {}
     _anim_source_snapshots = {}
+    _last_disk_mtime = 0
+    _buffer_is_current = True
 
 
 def _safe_name(ctrl_short):
@@ -895,7 +1173,11 @@ def get_animation_frame_range(animation_data):
     all_frames = []
     for channels in animation_data.values():
         for curve_data in channels.values():
-            all_frames.extend(curve_data.get("keyframes", []))
+            clip_range = curve_data.get("clip_range")
+            if isinstance(clip_range, (list, tuple)) and len(clip_range) == 2:
+                all_frames.extend(clip_range)
+            else:
+                all_frames.extend(curve_data.get("keyframes", []))
     if not all_frames:
         return None
     return min(all_frames), max(all_frames)
@@ -946,14 +1228,18 @@ def apply_animation_data_to_scene(
     selected_objects = cmds.ls(selection=True, long=True) if selected_objects is None else selected_objects
     selected_objects = selected_objects or []
     if preferred_namespace is None:
-        target_map = resolve_target_controls(animation_data.keys(), selected_objects)
+        target_assignments = resolve_animation_target_assignments(
+            animation_data.keys(),
+            selected_objects,
+        )
     else:
         target_map = resolve_target_controls_for_namespace(
             animation_data.keys(),
             namespace=preferred_namespace,
             selected=selected_objects
         )
-    if not target_map:
+        target_assignments = list(target_map.items())
+    if not target_assignments:
         cmds.warning("AnimKey: No matching target controls found.")
         return 0, 0
 
@@ -969,28 +1255,21 @@ def apply_animation_data_to_scene(
         except Exception:
             pass
 
-        for ctrl_name, control in target_map.items():
+        transfers = []
+        for ctrl_name, control in target_assignments:
             for ch, curve_data in animation_data.get(ctrl_name, {}).items():
-                try:
-                    if not cmds.attributeQuery(ch, node=control, exists=True):
-                        skipped += 1
-                        continue
-
-                    attr_path = f"{control}.{ch}"
-                    clear_existing = paste_mode != "insert"
-                    pasted, _ = curve_transfer.paste_curve(
-                        attr_path,
-                        curve_data,
-                        layer_name=target_layer,
-                        time_offset=float(time_offset or 0.0),
-                        clear_existing=clear_existing,
-                    )
-                    if pasted:
-                        applied += 1
-                    else:
-                        skipped += 1
-                except Exception:
+                if not cmds.attributeQuery(ch, node=control, exists=True):
                     skipped += 1
+                    continue
+                transfers.append((f"{control}.{ch}", curve_data))
+        results = curve_transfer.paste_curves_batch(
+            transfers,
+            layer_name=target_layer,
+            time_offset=float(time_offset or 0.0),
+            clear_existing=paste_mode != "insert",
+        )
+        applied += sum(1 for result in results if result)
+        skipped += sum(1 for result in results if not result)
     finally:
         if refresh_suspended:
             try:
@@ -1117,9 +1396,43 @@ def list_animation_library_entries():
     return entries
 
 
+def _schedule_json_write(file_path, data, indent=None, on_written=None):
+    """Persist pure Python data off Maya's UI thread, keeping newest-write wins."""
+    global _json_write_generation
+    generation = _json_write_generation.get(file_path, 0) + 1
+    _json_write_generation[file_path] = generation
+
+    def _writer():
+        with _json_write_lock:
+            if generation < _json_write_generation.get(file_path, 0):
+                return
+            try:
+                atomic_write_json(file_path, data, indent=indent)
+                mtime = os.path.getmtime(file_path)
+                if on_written:
+                    on_written(mtime)
+            except Exception:
+                pass
+
+    worker = threading.Thread(
+        target=_writer,
+        name="AnimKeyJsonWriter",
+    )
+    worker.daemon = True
+    worker.start()
+    return worker
+
+
 def _export_buffer_to_disk(save_to_library=False):
-    global _anim_buffer, _last_disk_mtime
+    global _anim_buffer, _last_disk_mtime, _buffer_is_current
     if not _anim_buffer:
+        _buffer_is_current = True
+        json_path = get_copy_paste_animation_file()
+        try:
+            if os.path.exists(json_path):
+                os.remove(json_path)
+        except Exception:
+            pass
         return
 
     source_controls_meta = {
@@ -1141,41 +1454,50 @@ def _export_buffer_to_disk(save_to_library=False):
     json_path = get_copy_paste_animation_file()
     os.makedirs(os.path.dirname(json_path), exist_ok=True)
     try:
-        temp_path = f"{json_path}.{os.getpid()}.tmp"
-        with open(temp_path, "w") as f:
-            json.dump(animation_data, f, separators=(",", ":"))
-        os.replace(temp_path, json_path)
-        _last_disk_mtime = os.path.getmtime(json_path)
-
         if save_to_library:
+            atomic_write_json(json_path, animation_data, indent=None)
+            _last_disk_mtime = os.path.getmtime(json_path)
             # Also save to library/backup folder
             backup_folder = get_animation_backup_folder()
             latest_backup = get_latest_animation_backup_file()
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             snapshot_backup = os.path.join(backup_folder, f"anim_backup_{timestamp}.animkey_anim")
 
-            with open(latest_backup, "w") as f:
-                json.dump(animation_data, f, indent=2)
-            with open(snapshot_backup, "w") as f:
-                json.dump(animation_data, f, indent=2)
+            atomic_write_json(latest_backup, animation_data, indent=2)
+            atomic_write_json(snapshot_backup, animation_data, indent=2)
             
             # If library window is open, refresh it
             global _library_window
             if _library_window and _library_window.isVisible():
                 _library_window.refresh_library()
+        else:
+            def _mark_written(mtime):
+                global _last_disk_mtime
+                _last_disk_mtime = mtime
+
+            _schedule_json_write(
+                json_path,
+                animation_data,
+                indent=None,
+                on_written=_mark_written,
+            )
+        _buffer_is_current = True
     except Exception:
         pass
 
 
 def _sync_buffer_from_disk():
-    global _anim_buffer, _anim_sources, _anim_source_snapshots, _last_disk_mtime
+    global _anim_buffer, _anim_sources, _anim_source_snapshots
+    global _last_disk_mtime, _buffer_is_current
     json_path = get_copy_paste_animation_file()
     if not os.path.exists(json_path):
         return
         
     try:
         mtime = os.path.getmtime(json_path)
-        if _last_disk_mtime and mtime <= _last_disk_mtime:
+        if _buffer_is_current and not _last_disk_mtime:
+            return
+        if _anim_buffer and _last_disk_mtime and mtime <= _last_disk_mtime:
             return
             
         with open(json_path, "r") as f:
@@ -1204,6 +1526,7 @@ def _sync_buffer_from_disk():
         }
 
         _last_disk_mtime = mtime
+        _buffer_is_current = True
     except Exception:
         pass
 
@@ -1358,12 +1681,11 @@ class SaveAnimationWindow(QtWidgets.QWidget):
 
     # ── Paint: rounded rect + speech-bubble tail ──────────────────────────
     def paintEvent(self, event):
-        from PySide2.QtGui import QPainter, QPainterPath, QColor, QPen
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
 
-        bg = QColor(30, 30, 30)
-        border_color = QColor(51, 51, 51)
+        bg = QtGui.QColor(30, 30, 30)
+        border_color = QtGui.QColor(51, 51, 51)
 
         if self._tail_on_top:
             body_rect = QtCore.QRectF(0.5, self._tail_height + 0.5,
@@ -1374,7 +1696,7 @@ class SaveAnimationWindow(QtWidgets.QWidget):
                                        self.width() - 1,
                                        self.height() - self._tail_height - 1)
 
-        path = QPainterPath()
+        path = QtGui.QPainterPath()
         path.addRoundedRect(body_rect, 10, 10)
 
         tail_cx = max(20, min(self._tail_x, self.width() - 20))
@@ -1394,7 +1716,7 @@ class SaveAnimationWindow(QtWidgets.QWidget):
 
         self.setMask(path.toFillPolygon().toPolygon())
 
-        painter.setPen(QPen(border_color, 1))
+        painter.setPen(QtGui.QPen(border_color, 1))
         painter.setBrush(bg)
         painter.drawPath(path)
         painter.end()
@@ -1598,12 +1920,7 @@ class SaveAnimationWindow(QtWidgets.QWidget):
         btn_top_y = btn_top_left.y()
         btn_bottom_y = btn_top_y + btn_rect.height()
 
-        screen = QtWidgets.QApplication.screenAt(btn_top_left) if hasattr(QtWidgets.QApplication, 'screenAt') else None
-        if screen:
-            screen_rect = screen.availableGeometry()
-        else:
-            desktop = QtWidgets.QApplication.desktop()
-            screen_rect = desktop.availableGeometry(self.anchor_button)
+        screen_rect = screen_available_geometry(self.anchor_button, btn_top_left)
 
         popup_w = self.width()
         popup_h = self.height()
@@ -1705,23 +2022,11 @@ def _do_save_to_library(file_name, start_frame, end_frame, capture_gif=False, an
 
     # Collect animation data from the scene (no buffer nodes needed)
     time_range = (start_frame, end_frame)
-    animation_payload = {}
-
-    for control in selected:
-        ctrl_key = get_control_storage_key(control)
-        channels = get_animated_channels(control)
-        if not channels:
-            continue
-
-        ctrl_data = {}
-        for ch in channels:
-            attr_path = f"{control}.{ch}"
-            snapshot = collect_curve_snapshot(attr_path, time_range)
-            if snapshot:
-                ctrl_data[ch] = snapshot
-
-        if ctrl_data:
-            animation_payload[ctrl_key] = ctrl_data
+    animation_payload, _ = collect_animation_for_controls(
+        selected,
+        time_range=time_range,
+        layer_name=curve_transfer.active_animation_layer(),
+    )
 
     if not animation_payload:
         cmds.warning("AnimKey: No animation found on selected controls in the given range.")
@@ -1758,8 +2063,7 @@ def _do_save_to_library(file_name, start_frame, end_frame, capture_gif=False, an
         timestamp = datetime.now().strftime("%H%M%S")
         file_path = os.path.join(backup_folder, f"{file_name}_{timestamp}.animkey_anim")
 
-    with open(file_path, "w") as f:
-        json.dump(save_data, f, indent=2)
+    atomic_write_json(file_path, save_data, indent=2)
 
     # Optionally capture GIF preview
     gif_path = None
@@ -1769,8 +2073,7 @@ def _do_save_to_library(file_name, start_frame, end_frame, capture_gif=False, an
         if gif_path:
             # Update meta with gif path
             save_data["meta"]["preview_gif"] = gif_path
-            with open(file_path, "w") as f:
-                json.dump(save_data, f, indent=2)
+            atomic_write_json(file_path, save_data, indent=2)
 
     # Refresh library window if open
     global _library_window
@@ -1950,12 +2253,11 @@ class SmartAnimationLibraryWindow(ContextPopupWindow):
     def paintEvent(self, event):
         """Draw solid rounded rect + speech bubble tail."""
         return super(SmartAnimationLibraryWindow, self).paintEvent(event)
-        from PySide2.QtGui import QPainter, QPainterPath, QColor, QPen
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
 
-        bg = QColor(30, 30, 30)
-        border_color = QColor(51, 51, 51)
+        bg = QtGui.QColor(30, 30, 30)
+        border_color = QtGui.QColor(51, 51, 51)
 
         if self._tail_on_top:
             body_rect = QtCore.QRectF(0.5, self._tail_height + 0.5,
@@ -1966,7 +2268,7 @@ class SmartAnimationLibraryWindow(ContextPopupWindow):
                                        self.width() - 1,
                                        self.height() - self._tail_height - 1)
 
-        path = QPainterPath()
+        path = QtGui.QPainterPath()
         path.addRoundedRect(body_rect, 10, 10)
 
         tail_cx = max(20, min(self._tail_x, self.width() - 20))
@@ -1988,7 +2290,7 @@ class SmartAnimationLibraryWindow(ContextPopupWindow):
         # This removes the rectangular transparent frame behind the rounded corners
         self.setMask(path.toFillPolygon().toPolygon())
 
-        painter.setPen(QPen(border_color, 1))
+        painter.setPen(QtGui.QPen(border_color, 1))
         painter.setBrush(bg)
         painter.drawPath(path)
         painter.end()
@@ -2217,12 +2519,7 @@ class SmartAnimationLibraryWindow(ContextPopupWindow):
         btn_bottom_y = btn_top_y + btn_rect.height()
 
         # Get available screen geometry
-        screen = QtWidgets.QApplication.screenAt(btn_top_left) if hasattr(QtWidgets.QApplication, 'screenAt') else None
-        if screen:
-            screen_rect = screen.availableGeometry()
-        else:
-            desktop = QtWidgets.QApplication.desktop()
-            screen_rect = desktop.availableGeometry(self.anchor_button)
+        screen_rect = screen_available_geometry(self.anchor_button, btn_top_left)
 
         popup_w = self.width()
         popup_h = self.height()
@@ -2453,31 +2750,26 @@ def copy_animation(*args):
         return
 
     _cleanup_buffer()
-    time_range = get_selected_time_range()
-    source_layer = curve_transfer.active_animation_layer()
     copied_channels = 0
 
-    for control in selected:
-        ctrl_key = get_control_storage_key(control)
-        stored_channels = {}
-        for ch in get_animated_channels(control):
-            try:
-                snapshot = collect_curve_snapshot(
-                    f"{control}.{ch}",
-                    time_range=time_range,
-                    layer_name=source_layer,
-                )
-                if not snapshot:
-                    continue
-                stored_channels[ch] = snapshot
-                copied_channels += 1
-            except Exception:
-                pass
-
-        if stored_channels:
-            _anim_buffer[ctrl_key] = stored_channels
-            _anim_sources[ctrl_key] = control
-            _anim_source_snapshots[ctrl_key] = stored_channels
+    graph_animation, graph_sources = _collect_selected_graph_animation(selected)
+    if graph_animation:
+        _anim_buffer.update(graph_animation)
+        _anim_sources.update(graph_sources)
+        _anim_source_snapshots.update(graph_animation)
+        copied_channels = sum(len(channels) for channels in graph_animation.values())
+    else:
+        time_range = get_selected_time_range()
+        source_layer = curve_transfer.active_animation_layer()
+        captured, sources = collect_animation_for_controls(
+            selected,
+            time_range=time_range,
+            layer_name=source_layer,
+        )
+        _anim_buffer.update(captured)
+        _anim_sources.update(sources)
+        _anim_source_snapshots.update(captured)
+        copied_channels = sum(len(channels) for channels in captured.values())
 
     # Sync buffer to disk for cross-instance copy/paste
     _export_buffer_to_disk(save_to_library=False)
@@ -2549,22 +2841,22 @@ def _paste_clip_to_targets(target_map, time_offset=0.0, clear_existing=True):
     target_layer = curve_transfer.active_animation_layer()
     pasted_count = 0
     skipped_count = 0
-    for ctrl_key, control in target_map.items():
+    assignments = target_map.items() if hasattr(target_map, "items") else target_map
+    transfers = []
+    for ctrl_key, control in assignments:
         for channel, curve_data in _anim_buffer.get(ctrl_key, {}).items():
             if not cmds.attributeQuery(channel, node=control, exists=True):
                 skipped_count += 1
                 continue
-            pasted, _ = curve_transfer.paste_curve(
-                f"{control}.{channel}",
-                curve_data,
-                layer_name=target_layer,
-                time_offset=float(time_offset or 0.0),
-                clear_existing=clear_existing,
-            )
-            if pasted:
-                pasted_count += 1
-            else:
-                skipped_count += 1
+            transfers.append((f"{control}.{channel}", curve_data))
+    results = curve_transfer.paste_curves_batch(
+        transfers,
+        layer_name=target_layer,
+        time_offset=float(time_offset or 0.0),
+        clear_existing=clear_existing,
+    )
+    pasted_count += sum(1 for result in results if result)
+    skipped_count += sum(1 for result in results if not result)
     return pasted_count, skipped_count
 
 
@@ -2579,8 +2871,8 @@ def paste_animation(*args):
         return
 
     selected = cmds.ls(selection=True, long=True) or []
-    target_map = resolve_target_controls(_anim_buffer.keys(), selected)
-    if not target_map:
+    target_assignments = resolve_animation_target_assignments(_anim_buffer.keys(), selected)
+    if not target_assignments:
         cmds.warning("AnimKey: No matching target controls found in the selection or scene.")
         return
 
@@ -2596,7 +2888,7 @@ def paste_animation(*args):
             pass
 
         pasted_count, skipped_count = _paste_clip_to_targets(
-            target_map,
+            target_assignments,
             time_offset=0.0,
             clear_existing=True,
         )
@@ -2633,8 +2925,8 @@ def paste_insert_animation(*args):
 
     selected = cmds.ls(selection=True, long=True) or []
     current_time = cmds.currentTime(query=True)
-    target_map = resolve_target_controls(_anim_buffer.keys(), selected)
-    if not target_map:
+    target_assignments = resolve_animation_target_assignments(_anim_buffer.keys(), selected)
+    if not target_assignments:
         cmds.warning("AnimKey: No matching target controls found in the selection or scene.")
         return
 
@@ -2654,7 +2946,7 @@ def paste_insert_animation(*args):
             pass
 
         inserted_count, skipped_count = _paste_clip_to_targets(
-            target_map,
+            target_assignments,
             time_offset=time_offset,
             clear_existing=False,
         )
@@ -2730,7 +3022,13 @@ def paste_opposite_animation(*args):
 
             source_data = mirror_module._snap_ctrl_data(source_side, snapshot) or {}
             target_data = mirror_module._snap_ctrl_data(opposite, snapshot) or {}
-            attr_map = source_data.get("attr_map") or {}
+            attr_map = mirror_module._effective_attr_map(
+                source_side,
+                opposite,
+                snapshot,
+                sym_plane,
+                source_data=source_data,
+            )
             for channel, curve_data in _anim_buffer.get(ctrl_key, {}).items():
                 spec = attr_map.get(channel, {})
                 target_channel = spec.get("target", channel)
@@ -2807,11 +3105,20 @@ def copy_pose(*args):
 
     current_frame = cmds.currentTime(query=True)
     animation_payload = {}
+    global _pose_buffer, _pose_buffer_mtime, _pose_buffer_is_current
 
     try:
         for control in selected_objects:
             control_name = get_control_storage_key(control)
-            attributes = cmds.listAttr(control, keyable=True)
+            try:
+                attributes = cmds.listAttr(
+                    control,
+                    keyable=True,
+                    unlocked=True,
+                    settable=True,
+                )
+            except Exception:
+                attributes = cmds.listAttr(control, keyable=True)
 
             if not attributes:
                 continue
@@ -2820,10 +3127,6 @@ def copy_pose(*args):
             for attr in attributes:
                 try:
                     attr_path = f"{control}.{attr}"
-                    if cmds.getAttr(attr_path, lock=True):
-                        continue
-                    if not cmds.getAttr(attr_path, settable=True):
-                        continue
                     value = cmds.getAttr(attr_path)
                     if not _is_numeric_pose_value(value):
                         continue
@@ -2853,9 +3156,20 @@ def copy_pose(*args):
 
         json_file_path = get_copy_paste_pose_file()
         os.makedirs(os.path.dirname(json_file_path), exist_ok=True)
+        _pose_buffer = pose_data
+        _pose_buffer_mtime = 0
+        _pose_buffer_is_current = True
 
-        with open(json_file_path, "w") as json_file:
-            json.dump(pose_data, json_file, indent=2)
+        def _mark_pose_written(mtime):
+            global _pose_buffer_mtime
+            _pose_buffer_mtime = mtime
+
+        _schedule_json_write(
+            json_file_path,
+            pose_data,
+            indent=None,
+            on_written=_mark_pose_written,
+        )
 
         cmds.warning("AnimKey: Pose copied.")
 
@@ -2873,10 +3187,11 @@ def paste_pose(*args):
     if not require_animkey_context("AnimKey.buttons.copyAnimation.paste_pose"):
         return None
     selected_objects = cmds.ls(selection=True, long=True) or []
+    global _pose_buffer, _pose_buffer_mtime, _pose_buffer_is_current
 
     json_file_path = get_copy_paste_pose_file()
 
-    if not os.path.exists(json_file_path):
+    if not os.path.exists(json_file_path) and not _pose_buffer:
         legacy_json_file_path = get_legacy_copy_paste_pose_file()
         if os.path.exists(legacy_json_file_path):
             json_file_path = legacy_json_file_path
@@ -2885,8 +3200,19 @@ def paste_pose(*args):
             return
 
     try:
-        with open(json_file_path, "r") as json_file:
-            pose_data = json.load(json_file)
+        pose_data = _pose_buffer if _pose_buffer_is_current else None
+        disk_mtime = 0
+        if os.path.exists(json_file_path):
+            disk_mtime = os.path.getmtime(json_file_path)
+        should_read_disk = pose_data is None or (
+            _pose_buffer_mtime and disk_mtime > _pose_buffer_mtime
+        )
+        if should_read_disk:
+            with open(json_file_path, "r") as json_file:
+                pose_data = json.load(json_file)
+            _pose_buffer = pose_data
+            _pose_buffer_mtime = disk_mtime
+            _pose_buffer_is_current = True
 
         if isinstance(pose_data, dict) and "animation" in pose_data:
             animation_payload = pose_data.get("animation") or {}
@@ -2901,31 +3227,36 @@ def paste_pose(*args):
             target_layer = curve_transfer.active_animation_layer()
             cmds.undoInfo(openChunk=True)
             try:
+                key_values = []
                 for control_name, control in target_map.items():
+                    try:
+                        editable_attrs = set(cmds.listAttr(
+                            control,
+                            keyable=True,
+                            unlocked=True,
+                            settable=True,
+                        ) or [])
+                    except Exception:
+                        editable_attrs = set(cmds.listAttr(control, keyable=True) or [])
                     for attr, curve_data in animation_payload.get(control_name, {}).items():
                         try:
-                            if not cmds.attributeQuery(attr, node=control, exists=True):
-                                skipped += 1
-                                continue
-                            attr_path = f"{control}.{attr}"
-                            if cmds.getAttr(attr_path, lock=True):
+                            if attr not in editable_attrs:
                                 skipped += 1
                                 continue
                             value = _extract_pose_value(curve_data)
                             if value is None:
                                 skipped += 1
                                 continue
-                            if curve_transfer.set_key_on_layer(
-                                attr_path,
-                                current_frame,
-                                value,
-                                layer_name=target_layer,
-                            ):
-                                applied += 1
-                            else:
-                                skipped += 1
+                            key_values.append((f"{control}.{attr}", value))
                         except Exception:
                             skipped += 1
+                results = curve_transfer.set_keys_on_layer(
+                    key_values,
+                    current_frame,
+                    layer_name=target_layer,
+                )
+                applied += sum(1 for result in results if result)
+                skipped += sum(1 for result in results if not result)
             finally:
                 cmds.undoInfo(closeChunk=True)
 

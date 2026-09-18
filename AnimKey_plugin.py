@@ -23,7 +23,7 @@ def maya_useNewAPI():
 
 # Plugin information
 PLUGIN_NAME = "AnimKey"
-PLUGIN_VERSION = "1.0"
+from AnimKey.version import __version__ as PLUGIN_VERSION
 PLUGIN_AUTHOR = "AnimKey"
 VENDOR = "AnimKey"
 
@@ -42,6 +42,12 @@ def uninitializePlugin(plugin):
     """Called when the plugin is unloaded"""
     pluginFn = om.MFnPlugin(plugin)
     
+    try:
+        from AnimKey.mods import uiMod
+        uiMod.cleanup_animkey_runtime(full=True)
+    except Exception:
+        pass
+
     # Try to close AnimKey toolbar
     try:
         if cmds.workspaceControl("AnimKey_Toolbar", query=True, exists=True):

@@ -1,0 +1,56 @@
+name: Publish stable AnimKey release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Stable version (MAJOR.MINOR.PATCH, matching AnimKey/version.py)"
+        required: true
+        type: string
+      release_notes:
+        description: "Optional release notes (leave empty to generate them from commits)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-stable-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_NOTES: ${{ inputs.release_notes }}
+    steps:
+      - name: Check out selected commit
+        uses: actions/checkout@v7
+
+      - name: Build updater package and checksum
+        run: python3 tools/build_release.py --version "$RELEASE_VERSION" --output dist
+
+      - name: Publish stable GitHub Release
+        shell: bash
+        run: |
+          if [[ -n "$RELEASE_NOTES" ]]; then
+            printf '%s\n' "$RELEASE_NOTES" > release-notes.md
+            gh release create "v${RELEASE_VERSION}" \
+              "dist/AnimKey-${RELEASE_VERSION}.zip" \
+              "dist/AnimKey-${RELEASE_VERSION}.zip.sha256" \
+              --target "$GITHUB_SHA" \
+              --title "AnimKey ${RELEASE_VERSION}" \
+              --notes-file release-notes.md \
+              --latest
+          else
+            gh release create "v${RELEASE_VERSION}" \
+              "dist/AnimKey-${RELEASE_VERSION}.zip" \
+              "dist/AnimKey-${RELEASE_VERSION}.zip.sha256" \
+              --target "$GITHUB_SHA" \
+              --title "AnimKey ${RELEASE_VERSION}" \
+              --generate-notes \
+              --latest
+          fi

@@ -25,6 +25,7 @@ from AnimKey.sliders.slider_utils import (
     get_processing_context,
     get_value_at_time,
     should_process_attribute,
+    slider_attribute_is_editable,
     slider_amount
 )
 
@@ -43,7 +44,7 @@ def prepare_blend_data(objs=None, attrs=None):
     global _blend_buffer_data_cache, _processing_context
     _blend_buffer_data_cache = {}
     
-    _processing_context = get_processing_context()
+    _processing_context = get_processing_context(explicit_attributes=attrs is not None)
     current_time = _processing_context.get('current_time')
     selected_channels = _processing_context.get('selected_channels')
     
@@ -168,7 +169,7 @@ def execute(percentage):
         try:
             if not cmds.objExists(attr_full):
                 continue
-            if cmds.getAttr(attr_full, lock=True) or not cmds.getAttr(attr_full, settable=True):
+            if not slider_attribute_is_editable(attr_full):
                 continue
             
             current_value = cache.get("currentValue")

@@ -10,6 +10,7 @@ Sophisticated PySide2 window matching AnimKey's design language.
 import maya.cmds as cmds
 from AnimKey.mods.uiMod import ContextPopupWindow
 import maya.api.OpenMaya as om2
+import maya.api.OpenMayaAnim as oma2
 import maya.OpenMayaUI as mui
 import json
 import os
@@ -19,12 +20,26 @@ import threading
 from datetime import datetime, timedelta
 from collections import defaultdict
 
-try:
-    from PySide2 import QtWidgets, QtCore, QtGui
-    from shiboken2 import wrapInstance
-except ImportError:
-    from PySide6 import QtWidgets, QtCore, QtGui
-    from shiboken6 import wrapInstance
+from AnimKey.mods.maya_compat import (
+    QtCore, QtGui, QtWidgets, wrap_instance as wrapInstance,
+)
+from AnimKey.mods.storage import atomic_write_json
+from AnimKey.core.animation_curve_transfer import paste_curve
+
+
+QT_NO_BUTTON = getattr(QtCore.Qt, "NoButton", None)
+if QT_NO_BUTTON is None:
+    QT_NO_BUTTON = QtCore.Qt.MouseButton.NoButton
+QT_USER_ROLE = getattr(QtCore.Qt, "UserRole", None)
+if QT_USER_ROLE is None:
+    QT_USER_ROLE = QtCore.Qt.ItemDataRole.UserRole
+QT_SINGLE_SELECTION = getattr(
+    QtWidgets.QAbstractItemView, "SingleSelection", None
+)
+if QT_SINGLE_SELECTION is None:
+    QT_SINGLE_SELECTION = (
+        QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+    )
 
 
 # ==============================================================================
@@ -41,13 +56,19 @@ class Config:
             os.makedirs(folder)
         return folder
     
-    SAVE_INTERVAL = 25
+    # A checkpoint of a production shot can contain hundreds of thousands of
+    # keys.  Wait for a real pause in the animator's work and keep enough time
+    # between full snapshots that recovery never becomes a background loop.
+    SAVE_INTERVAL = 120
+    IDLE_DELAY = 8.0
+    TIMER_INTERVAL_MS = 2000
     MAX_DAYS = 7
     MAX_CHECKPOINTS = 80
 
 
 _async_checkpoint_capture = None
 _async_checkpoint_pending = None
+_async_checkpoint_write_in_progress = False
 
 
 # ==============================================================================
@@ -60,28 +81,98 @@ class RecoverySystem:
     _jobs = []
     _timer = None
     _dirty = False
-    
+    _last_change_time = 0.0
+    _last_checkpoint_time = 0.0
+    _last_checkpoint_path = None
+    _change_serial = 0
+
+    @classmethod
+    def preferred_enabled(cls):
+        try:
+            from AnimKey.mods import configMod
+            return bool(configMod.get_config().get("crash_recovery_enabled", True))
+        except Exception:
+            return True
+
+    @classmethod
+    def set_preferred_enabled(cls, enabled):
+        try:
+            from AnimKey.mods import configMod
+            configMod.get_config().set("crash_recovery_enabled", bool(enabled))
+        except Exception:
+            pass
+
+    @classmethod
+    def ensure_preferred_state(cls):
+        if cls.preferred_enabled():
+            cls.start()
+        else:
+            cls.stop()
+        return cls._active
+
     @classmethod
     def start(cls):
         if cls._active:
             return
         Config.get_save_folder()
+        cls._active = True
+        invalidate_animated_objects_cache()
+        cls._dirty = True
+        cls._last_change_time = time.monotonic()
+        cls._change_serial += 1
         
         try:
-            cb = om2.MSceneMessage.addCallback(om2.MSceneMessage.kBeforeSave, cls._on_save)
+            cb = om2.MSceneMessage.addCallback(
+                om2.MSceneMessage.kBeforeOpen, cls._on_before_scene_change
+            )
+            cls._callbacks.append(cb)
+            cb = om2.MSceneMessage.addCallback(
+                om2.MSceneMessage.kBeforeNew, cls._on_before_scene_change
+            )
+            cls._callbacks.append(cb)
+            cb = om2.MSceneMessage.addCallback(
+                om2.MSceneMessage.kAfterOpen, cls._on_after_scene_change
+            )
+            cls._callbacks.append(cb)
+            cb = om2.MSceneMessage.addCallback(
+                om2.MSceneMessage.kAfterNew, cls._on_after_scene_change
+            )
+            cls._callbacks.append(cb)
+            cb = om2.MSceneMessage.addCallback(
+                om2.MSceneMessage.kBeforeSave, cls._on_before_save
+            )
+            cls._callbacks.append(cb)
+            cb = om2.MSceneMessage.addCallback(
+                om2.MSceneMessage.kAfterSave, cls._on_after_save
+            )
             cls._callbacks.append(cb)
             cb = om2.MSceneMessage.addCallback(om2.MSceneMessage.kMayaExiting, cls._on_exit)
             cls._callbacks.append(cb)
         except: pass
-        
+
         try:
-            cls._jobs.append(cmds.scriptJob(event=['timeChanged', cls._on_change]))
+            # This callback only flips a Boolean and invalidates a small name
+            # cache.  It does not scan the scene or restart a capture for each
+            # key edit, which was the expensive behavior in the newer system.
+            cb = oma2.MAnimMessage.addAnimKeyframeEditedCallback(
+                cls._on_animation_edited
+            )
+            cls._callbacks.append(cb)
+        except Exception:
+            pass
+
+        try:
             cls._jobs.append(cmds.scriptJob(event=['Undo', cls._on_change]))
             cls._jobs.append(cmds.scriptJob(event=['Redo', cls._on_change]))
         except: pass
         
         cls._start_timer()
-        cls._active = True
+        # Produce a real first backup without waiting 25 seconds.  This is a
+        # single deferred request, not a permanent edit callback.
+        try:
+            cmds.evalDeferred(cls._tick)
+        except Exception:
+            pass
         print("AnimKey: Recovery system STARTED")
     
     @classmethod
@@ -98,7 +189,11 @@ class RecoverySystem:
             except: pass
         cls._jobs = []
         if cls._timer:
-            cls._timer.cancel()
+            try:
+                cls._timer.stop()
+                cls._timer.deleteLater()
+            except Exception:
+                pass
             cls._timer = None
         cancel_async_checkpoints()
         cls._active = False
@@ -110,37 +205,145 @@ class RecoverySystem:
     
     @classmethod
     def toggle(cls):
-        if cls._active: cls.stop()
-        else: cls.start()
+        if cls._active:
+            cls.stop()
+        else:
+            cls.start()
+        cls.set_preferred_enabled(cls._active)
         return cls._active
     
     @classmethod
     def _start_timer(cls):
-        def tick():
-            if not cls._active: return
-            if cls._dirty:
-                try:
-                    cmds.evalDeferred(lambda: request_checkpoint(auto=True))
-                    cls._dirty = False
-                except: pass
-            cls._timer = threading.Timer(Config.SAVE_INTERVAL, tick)
-            cls._timer.daemon = True
-            cls._timer.start()
-        cls._timer = threading.Timer(Config.SAVE_INTERVAL, tick)
-        cls._timer.daemon = True
-        cls._timer.start()
+        cls._timer = QtCore.QTimer(QtWidgets.QApplication.instance())
+        cls._timer.setSingleShot(True)
+        cls._timer.timeout.connect(cls._tick)
+        cls._schedule_tick(Config.IDLE_DELAY)
+
+    @classmethod
+    def _schedule_tick(cls, delay_seconds=None):
+        """Arm one recovery check; remain completely idle otherwise."""
+        if not cls._active or cls._timer is None:
+            return
+        if delay_seconds is None:
+            delay_seconds = Config.IDLE_DELAY
+        delay_ms = max(1, int(float(delay_seconds) * 1000.0))
+        cls._timer.start(delay_ms)
+
+    @classmethod
+    def _tick(cls):
+        if not cls._active:
+            return
+        if (
+            _async_checkpoint_capture is not None
+            or _async_checkpoint_write_in_progress
+        ):
+            cls._schedule_tick(Config.TIMER_INTERVAL_MS / 1000.0)
+            return
+        try:
+            if cmds.play(query=True, state=True):
+                cls._schedule_tick(Config.TIMER_INTERVAL_MS / 1000.0)
+                return
+        except Exception:
+            pass
+        try:
+            if QtWidgets.QApplication.mouseButtons() != QT_NO_BUTTON:
+                cls._schedule_tick(Config.TIMER_INTERVAL_MS / 1000.0)
+                return
+        except Exception:
+            pass
+        if not cls._dirty:
+            return
+        now = time.monotonic()
+        idle_remaining = (
+            float(Config.IDLE_DELAY) - (now - cls._last_change_time)
+        )
+        if idle_remaining > 0.0:
+            cls._schedule_tick(idle_remaining)
+            return
+        if cls._last_checkpoint_time:
+            interval_remaining = (
+                float(Config.SAVE_INTERVAL) -
+                (now - cls._last_checkpoint_time)
+            )
+            if interval_remaining > 0.0:
+                cls._schedule_tick(interval_remaining)
+                return
+        request_checkpoint(auto=True)
     
     @classmethod
-    def _on_change(cls): cls._dirty = True
-    
+    def _on_change(cls, *args):
+        cls._dirty = True
+        cls._last_change_time = time.monotonic()
+        cls._change_serial += 1
+        invalidate_animated_objects_cache()
+        # A dense slider gesture can emit hundreds of key-edit callbacks in a
+        # few milliseconds.  Arm the single-shot timer once; when it fires it
+        # uses the latest timestamp and reschedules only the remaining idle
+        # delay.  Re-starting QTimer for every key made recovery compete with
+        # Tweener even though no checkpoint was being captured yet.
+        if cls._timer is None or not cls._timer.isActive():
+            cls._schedule_tick(Config.IDLE_DELAY)
+
     @classmethod
-    def _on_save(cls, *args):
-        request_checkpoint(auto=True, desc="Pre-save")
+    def _on_animation_edited(cls, *args):
+        cls._on_change()
+
+    @classmethod
+    def _on_before_scene_change(cls, *args):
+        # Never inspect a dependency graph while Maya is replacing it.
+        cancel_async_checkpoints(auto_only=True)
+        invalidate_animated_objects_cache()
         cls._dirty = False
+        if cls._timer:
+            cls._timer.stop()
+
+    @classmethod
+    def _on_after_scene_change(cls, *args):
+        # Recovery commonly starts before the animator opens a shot.  Reset
+        # the throttle so every newly opened scene gets its own initial
+        # animation checkpoint, even when the file itself is unmodified.
+        cancel_async_checkpoints(auto_only=True)
+        invalidate_animated_objects_cache()
+        cls._last_checkpoint_time = 0.0
+        cls._last_checkpoint_path = None
+        cls._dirty = True
+        cls._last_change_time = time.monotonic()
+        cls._change_serial += 1
+        cls._schedule_tick(Config.IDLE_DELAY)
+
+    @classmethod
+    def _on_before_save(cls, *args):
+        # Never compete with Maya's own scene serialization.  A canceled auto
+        # capture remains dirty and is retried only after the animator is idle.
+        cancel_async_checkpoints(auto_only=True)
+
+    @classmethod
+    def _on_after_save(cls, *args):
+        # The scene file is safe, but keep an independent animation-only
+        # recovery point as animBot does.  It is delayed and chunked, so it
+        # never competes with Maya's save operation itself.
+        cls._dirty = True
+        cls._last_change_time = time.monotonic()
+        cls._change_serial += 1
+        cls._schedule_tick(Config.IDLE_DELAY)
+
+    @classmethod
+    def _checkpoint_completed(cls, filepath, change_serial):
+        if not filepath:
+            return
+        cls._last_checkpoint_time = time.monotonic()
+        cls._last_checkpoint_path = filepath
+        if int(change_serial) == int(cls._change_serial):
+            cls._dirty = False
+            if cls._timer:
+                cls._timer.stop()
+        elif cls._dirty:
+            cls._schedule_tick(Config.IDLE_DELAY)
     
     @classmethod
     def _on_exit(cls, *args):
-        if cls._dirty: save_checkpoint(auto=True, desc="Exit")
+        # Maya is tearing down here.  Avoid DG reads during shutdown.
+        cls._dirty = False
         cls.stop()
 
 
@@ -228,12 +431,33 @@ def get_animated_objects(force=False):
         return list(_animated_objects_cache["objects"])
 
     animated = set()
-    for ctype in ['animCurveTL', 'animCurveTA', 'animCurveTU', 'animCurveTT']:
-        for curve in (cmds.ls(type=ctype) or []):
-            for conn in (cmds.listConnections(curve, d=True, s=False, p=True) or []):
-                obj = conn.split('.')[0]
-                if cmds.objExists(obj):
-                    animated.add(obj)
+    curve_types = ['animCurveTL', 'animCurveTA', 'animCurveTU', 'animCurveTT']
+    curves = []
+    for curve_type in curve_types:
+        curves.extend(cmds.ls(type=curve_type) or [])
+
+    # One batched graph query is considerably cheaper than one Maya command
+    # per curve (10k+ calls in a production shot).  Keep the old path only as
+    # a compatibility fallback for Maya builds that reject list arguments.
+    try:
+        if curves:
+            destinations = cmds.listConnections(
+                curves, destination=True, source=False, plugs=True
+            ) or []
+        else:
+            destinations = []
+    except Exception:
+        destinations = []
+        for curve in curves:
+            destinations.extend(
+                cmds.listConnections(
+                    curve, destination=True, source=False, plugs=True
+                ) or []
+            )
+    for destination in destinations:
+        obj = destination.split('.', 1)[0]
+        if obj:
+            animated.add(obj)
 
     result = list(animated)
     _animated_objects_cache["objects"] = result
@@ -330,8 +554,13 @@ def save_checkpoint(auto=False, desc=""):
     filepath = os.path.join(folder, filename)
     
     try:
-        with open(filepath, 'w') as f:
-            json.dump(data, f)
+        atomic_write_json(filepath, data, indent=None, ensure_ascii=False)
+        atomic_write_json(
+            filepath + ".meta",
+            data.get("meta", {}),
+            indent=None,
+            ensure_ascii=False,
+        )
         cleanup_old(folder)
         return filepath
     except Exception as e:
@@ -358,15 +587,29 @@ def _write_checkpoint_payload_async(data, folder, filename, on_done=None):
             if not os.path.exists(folder):
                 os.makedirs(folder)
             filepath = os.path.join(folder, filename)
-            with open(filepath, 'w') as f:
-                json.dump(data, f)
+            atomic_write_json(
+                filepath, data, indent=None, ensure_ascii=False
+            )
+            atomic_write_json(
+                filepath + ".meta",
+                data.get("meta", {}),
+                indent=None,
+                ensure_ascii=False,
+            )
             cleanup_old(folder)
         except Exception as e:
             filepath = None
             print(f"AnimKey Recovery Error: {e}")
 
         if on_done:
-            _defer_to_main_thread(on_done, filepath)
+            # This completion hook only updates thread-safe Python state.  It
+            # is responsible for deferring any Maya/UI work itself.  Keeping
+            # the writer state independent from Maya's idle queue prevents a
+            # missed executeDeferred from leaving recovery permanently busy.
+            try:
+                on_done(filepath)
+            except Exception as e:
+                print(f"AnimKey Recovery completion error: {e}")
 
     thread = threading.Thread(target=worker)
     thread.daemon = True
@@ -374,32 +617,76 @@ def _write_checkpoint_payload_async(data, folder, filename, on_done=None):
 
 def _async_checkpoint_finished(capture, data, folder, filename, on_done):
     global _async_checkpoint_capture, _async_checkpoint_pending
+    global _async_checkpoint_write_in_progress
 
     if _async_checkpoint_capture is capture:
         _async_checkpoint_capture = None
 
-    if data:
-        _write_checkpoint_payload_async(data, folder, filename, on_done=on_done)
-    elif on_done:
-        _defer_to_main_thread(on_done, None)
+    def finished(filepath):
+        global _async_checkpoint_write_in_progress, _async_checkpoint_pending
+        if filepath:
+            RecoverySystem._checkpoint_completed(
+                filepath, capture.change_serial
+            )
+        pending_request = _async_checkpoint_pending
+        _async_checkpoint_pending = None
+        _async_checkpoint_write_in_progress = False
+        if not filepath and capture.auto and RecoverySystem._dirty:
+            RecoverySystem._schedule_tick(
+                Config.TIMER_INTERVAL_MS / 1000.0
+            )
 
-    pending = _async_checkpoint_pending
-    _async_checkpoint_pending = None
-    if pending:
-        request_checkpoint(**pending)
+        if filepath or on_done or pending_request:
+            def notify_and_continue():
+                if filepath and RecoverySystem.is_active():
+                    update_toolbar_checkpoint_status(filepath)
+                if on_done:
+                    on_done(filepath)
+                if pending_request:
+                    request_checkpoint(**pending_request)
+            _defer_to_main_thread(notify_and_continue)
+
+    if data:
+        _async_checkpoint_write_in_progress = True
+        _write_checkpoint_payload_async(
+            data, folder, filename, on_done=finished
+        )
+    else:
+        if capture.auto:
+            RecoverySystem._last_checkpoint_time = time.monotonic()
+            if capture.change_serial == RecoverySystem._change_serial:
+                RecoverySystem._dirty = False
+        if on_done:
+            _defer_to_main_thread(on_done, None)
+
+    if not data:
+        pending = _async_checkpoint_pending
+        _async_checkpoint_pending = None
+        if pending:
+            request_checkpoint(**pending)
 
 class _AsyncCheckpointCapture(object):
-    CHUNK_TIME_BUDGET = 0.012
+    """V088's lightweight object-based checkpoint capture.
+
+    Capturing one animated object at a time avoids the newer implementation's
+    expensive per-layer/per-curve graph traversal.  The timer yields to Maya
+    after a small slice so even large rigs stay interactive.
+    """
+
+    AUTO_CHUNK_TIME_BUDGET = 0.003
+    MANUAL_CHUNK_TIME_BUDGET = 0.012
+    AUTO_TIMER_INTERVAL_MS = 20
 
     def __init__(self, auto=True, desc="", on_done=None):
         self.auto = auto
         self.desc = desc or ("Auto" if auto else "Manual")
         self.on_done = on_done
+        self.change_serial = RecoverySystem._change_serial
         self.objects = get_animated_objects()
         self.index = 0
         self.total_keys = 0
         self.folder = get_scene_folder()
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self.filename = timestamp + "_" + ("auto" if auto else "manual") + ".json"
 
         ns_counts = count_objects_by_namespace(self.objects)
@@ -412,18 +699,22 @@ class _AsyncCheckpointCapture(object):
                 'keys': 0,
                 'namespaces': ns_counts,
                 'description': self.desc,
-                'is_auto': auto
+                'is_auto': auto,
             },
             'animation': {}
         }
 
         self.timer = QtCore.QTimer()
-        self.timer.setInterval(0)
+        self.timer.setInterval(
+            self.AUTO_TIMER_INTERVAL_MS if self.auto else 0
+        )
         self.timer.timeout.connect(self._process_chunk)
 
     def start(self):
         if not self.objects:
-            _async_checkpoint_finished(self, None, self.folder, self.filename, self.on_done)
+            _async_checkpoint_finished(
+                self, None, self.folder, self.filename, self.on_done
+            )
             return
         self.timer.start()
 
@@ -433,9 +724,47 @@ class _AsyncCheckpointCapture(object):
         except Exception:
             pass
 
+    def _finish(self):
+        self.timer.stop()
+        self.data['meta']['objects'] = len(self.data['animation'])
+        self.data['meta']['keys'] = self.total_keys
+        data = self.data if self.data['animation'] else None
+        _async_checkpoint_finished(
+            self, data, self.folder, self.filename, self.on_done
+        )
+
     def _process_chunk(self):
-        started = time.time()
+        global _async_checkpoint_capture
+
+        if self.auto:
+            # If the shot changed after this snapshot began, discard the stale
+            # partial capture.  The service will start one fresh checkpoint
+            # only after the animator has been idle for IDLE_DELAY seconds.
+            if self.change_serial != RecoverySystem._change_serial:
+                self.timer.stop()
+                if _async_checkpoint_capture is self:
+                    _async_checkpoint_capture = None
+                return
+            try:
+                if cmds.play(query=True, state=True):
+                    self.timer.setInterval(100)
+                    return
+            except Exception:
+                pass
+            try:
+                if QtWidgets.QApplication.mouseButtons() != QT_NO_BUTTON:
+                    self.timer.setInterval(100)
+                    return
+            except Exception:
+                pass
+            self.timer.setInterval(self.AUTO_TIMER_INTERVAL_MS)
+
+        started = time.perf_counter()
         processed = 0
+        time_budget = (
+            self.AUTO_CHUNK_TIME_BUDGET
+            if self.auto else self.MANUAL_CHUNK_TIME_BUDGET
+        )
 
         while self.index < len(self.objects):
             obj = self.objects[self.index]
@@ -446,14 +775,13 @@ class _AsyncCheckpointCapture(object):
                 self.total_keys += key_count
             processed += 1
 
-            if processed >= 1 and (time.time() - started) >= self.CHUNK_TIME_BUDGET:
+            if (
+                processed >= 1
+                and (time.perf_counter() - started) >= time_budget
+            ):
                 return
 
-        self.timer.stop()
-        self.data['meta']['objects'] = len(self.data['animation'])
-        self.data['meta']['keys'] = self.total_keys
-        data = self.data if self.data['animation'] else None
-        _async_checkpoint_finished(self, data, self.folder, self.filename, self.on_done)
+        self._finish()
 
 def request_checkpoint(auto=True, desc="", on_done=None):
     """
@@ -462,6 +790,7 @@ def request_checkpoint(auto=True, desc="", on_done=None):
     are done on a worker thread.
     """
     global _async_checkpoint_capture, _async_checkpoint_pending
+    global _async_checkpoint_write_in_progress
 
     request = {
         "auto": auto,
@@ -469,15 +798,30 @@ def request_checkpoint(auto=True, desc="", on_done=None):
         "on_done": on_done,
     }
 
-    if _async_checkpoint_capture is not None:
+    if _async_checkpoint_write_in_progress:
         if (
-            _async_checkpoint_pending is not None and
-            _async_checkpoint_pending.get("on_done") is not None and
-            on_done is None
+            _async_checkpoint_pending is not None
+            and _async_checkpoint_pending.get("on_done") is not None
+            and on_done is None
         ):
             return None
         _async_checkpoint_pending = request
         return None
+
+    if _async_checkpoint_capture is not None:
+        if not auto and _async_checkpoint_capture.auto:
+            _async_checkpoint_capture.cancel()
+            _async_checkpoint_capture = None
+            _async_checkpoint_pending = None
+        else:
+            if (
+                _async_checkpoint_pending is not None and
+                _async_checkpoint_pending.get("on_done") is not None and
+                on_done is None
+            ):
+                return None
+            _async_checkpoint_pending = request
+            return None
 
     try:
         _async_checkpoint_capture = _AsyncCheckpointCapture(auto=auto, desc=desc, on_done=on_done)
@@ -489,15 +833,21 @@ def request_checkpoint(auto=True, desc="", on_done=None):
             _defer_to_main_thread(on_done, None)
     return None
 
-def cancel_async_checkpoints():
+def cancel_async_checkpoints(auto_only=False):
     global _async_checkpoint_capture, _async_checkpoint_pending
     if _async_checkpoint_capture is not None:
+        if auto_only and not _async_checkpoint_capture.auto:
+            return False
         try:
             _async_checkpoint_capture.cancel()
         except Exception:
             pass
     _async_checkpoint_capture = None
-    _async_checkpoint_pending = None
+    if not auto_only or (
+        _async_checkpoint_pending and _async_checkpoint_pending.get("auto")
+    ):
+        _async_checkpoint_pending = None
+    return True
 
 def load_checkpoint(filepath):
     try:
@@ -506,11 +856,145 @@ def load_checkpoint(filepath):
     except:
         return None
 
+
+def _load_checkpoint_meta(filepath):
+    """Read checkpoint metadata without parsing the animation payload."""
+    sidecar = filepath + ".meta"
+    try:
+        with open(sidecar, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    # Backwards-compatible fast path for older files without a sidecar.  Meta
+    # is the first field written by every AnimCrash format, so raw_decode can
+    # stop as soon as that small object is complete.
+    decoder = json.JSONDecoder()
+    buffer = ""
+    try:
+        with open(filepath, "r", encoding="utf-8") as stream:
+            while len(buffer) < 1024 * 1024:
+                chunk = stream.read(16384)
+                if not chunk:
+                    break
+                buffer += chunk
+                marker = buffer.find('"meta"')
+                if marker < 0:
+                    continue
+                value_start = buffer.find("{", marker + 6)
+                if value_start < 0:
+                    continue
+                try:
+                    meta, _end = decoder.raw_decode(buffer[value_start:])
+                except ValueError:
+                    continue
+                if isinstance(meta, dict):
+                    return meta
+    except Exception:
+        pass
+    return {}
+
 def apply_animation(data, namespace_filter="TODOS", target_namespace=None):
     if not data or 'animation' not in data:
         return 0, 0, 0
     
     success, failed, skipped = 0, 0, 0
+
+    layer_metadata = {
+        item.get("name"): item
+        for item in data.get("meta", {}).get("animation_layers", [])
+        if isinstance(item, dict) and item.get("name")
+    }
+
+    def ensure_layer(layer_name):
+        if not layer_name or layer_name == "BaseAnimation":
+            return "BaseAnimation"
+        if not cmds.objExists(layer_name):
+            metadata = layer_metadata.get(layer_name, {})
+            try:
+                cmds.animLayer(
+                    layer_name,
+                    override=bool(metadata.get("override", False)),
+                    passthrough=bool(metadata.get("passthrough", True)),
+                )
+            except Exception:
+                return None
+        return layer_name
+
+    # Rebuild only the layers used by the requested source rig.  Importing one
+    # namespace must not recreate animation layers that belong exclusively to
+    # other characters in the checkpoint.
+    required_layers = set()
+    for source_obj, source_anim in data.get("animation", {}).items():
+        source_ns = get_namespace(source_obj) or "(sin namespace)"
+        if namespace_filter != "TODOS" and source_ns != namespace_filter:
+            continue
+        for saved_attr in source_anim.values():
+            if not isinstance(saved_attr, dict):
+                continue
+            for entry in saved_attr.get("curves", []):
+                if isinstance(entry, dict):
+                    layer_name = entry.get("layer")
+                    if layer_name and layer_name != "BaseAnimation":
+                        required_layers.add(layer_name)
+
+    pending_parents = list(required_layers)
+    while pending_parents:
+        layer_name = pending_parents.pop()
+        parent_name = layer_metadata.get(layer_name, {}).get("parent")
+        if (
+            parent_name and parent_name != "BaseAnimation"
+            and parent_name not in required_layers
+        ):
+            required_layers.add(parent_name)
+            pending_parents.append(parent_name)
+
+    # Adding a layer to an already-restored direct attribute can otherwise
+    # rewire (or replace) the base curve while recovery is still in progress.
+    for saved_layer in required_layers:
+        ensure_layer(saved_layer)
+    for saved_layer in required_layers:
+        metadata = layer_metadata.get(saved_layer, {})
+        if saved_layer == "BaseAnimation" or not cmds.objExists(saved_layer):
+            continue
+        parent_layer = metadata.get("parent")
+        if parent_layer and cmds.objExists(parent_layer):
+            try:
+                cmds.animLayer(saved_layer, edit=True, parent=parent_layer)
+            except Exception:
+                pass
+        try:
+            cmds.setAttr(saved_layer + ".lock", False)
+        except Exception:
+            pass
+    for source_obj, source_anim in data.get("animation", {}).items():
+        source_ns = get_namespace(source_obj) or "(sin namespace)"
+        if namespace_filter != "TODOS" and source_ns != namespace_filter:
+            continue
+        preflight_obj = (
+            remap_namespace(source_obj, source_ns, target_namespace)
+            if target_namespace and target_namespace != "(mismo)"
+            else source_obj
+        )
+        if not cmds.objExists(preflight_obj):
+            continue
+        for attr, saved_attr in source_anim.items():
+            if not isinstance(saved_attr, dict):
+                continue
+            plug = preflight_obj + "." + attr
+            if not cmds.objExists(plug):
+                continue
+            for entry in saved_attr.get("curves", []):
+                layer_name = entry.get("layer") if isinstance(entry, dict) else None
+                if not layer_name or layer_name == "BaseAnimation":
+                    continue
+                if ensure_layer(layer_name):
+                    try:
+                        cmds.animLayer(layer_name, edit=True, attribute=plug)
+                    except Exception:
+                        pass
     
     for obj, obj_anim in data['animation'].items():
         obj_ns = get_namespace(obj) or "(sin namespace)"
@@ -529,23 +1013,77 @@ def apply_animation(data, namespace_filter="TODOS", target_namespace=None):
             continue
         
         try:
+            recovered_any = False
             for attr, keys in obj_anim.items():
                 full_attr = target_obj + "." + attr
                 if not cmds.attributeQuery(attr, node=target_obj, exists=True):
                     continue
-                
-                cmds.cutKey(full_attr, cl=True)
+
+                curve_entries = (
+                    keys.get("curves", []) if isinstance(keys, dict) else []
+                )
+                if curve_entries:
+                    for entry in curve_entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        layer_name = ensure_layer(
+                            entry.get("layer") or "BaseAnimation"
+                        )
+                        curve_data = entry.get("curve")
+                        if not layer_name or not isinstance(curve_data, dict):
+                            continue
+                        pasted, _count = paste_curve(
+                            full_attr,
+                            curve_data,
+                            layer_name=layer_name,
+                            clear_existing=True,
+                        )
+                        recovered_any = recovered_any or bool(pasted)
+                    continue
+
+                # Legacy v1 checkpoints stored a single direct curve as a
+                # list of {t, v, tangent...} dictionaries.
+                if not isinstance(keys, list):
+                    continue
+                cmds.cutKey(full_attr, clear=True)
                 for key in keys:
-                    cmds.setKeyframe(full_attr, t=key['t'], v=key['v'])
+                    cmds.setKeyframe(full_attr, time=key['t'], value=key['v'])
                     if 'itt' in key:
                         try:
-                            cmds.keyTangent(full_attr, t=(key['t'], key['t']),
-                                          itt=key.get('itt', 'auto'),
-                                          ott=key.get('ott', 'auto'))
-                        except: pass
-            success += 1
-        except:
+                            cmds.keyTangent(
+                                full_attr, time=(key['t'], key['t']),
+                                inTangentType=key.get('itt', 'auto'),
+                                outTangentType=key.get('ott', 'auto'),
+                            )
+                        except Exception:
+                            pass
+                recovered_any = recovered_any or bool(keys)
+            if recovered_any:
+                success += 1
+            else:
+                failed += 1
+        except Exception:
             failed += 1
+
+    for layer_name, metadata in layer_metadata.items():
+        if (
+            layer_name == "BaseAnimation"
+            or layer_name not in required_layers
+            or not cmds.objExists(layer_name)
+        ):
+            continue
+        for attr, value in (
+            ("mute", metadata.get("mute")),
+            ("solo", metadata.get("solo")),
+            ("weight", metadata.get("weight")),
+            ("lock", metadata.get("lock")),
+        ):
+            if value is None:
+                continue
+            try:
+                cmds.setAttr("{}.{}".format(layer_name, attr), value)
+            except Exception:
+                pass
     
     return success, failed, skipped
 
@@ -565,8 +1103,7 @@ def get_checkpoints(folder=None):
             parts = filename.replace('.json', '').split('_')
             dt = datetime.strptime(parts[0] + "_" + parts[1], "%Y%m%d_%H%M%S")
             is_auto = 'auto' in filename
-            data = load_checkpoint(filepath)
-            meta = data.get('meta', {}) if data else {}
+            meta = _load_checkpoint_meta(filepath)
             
             ns_raw = meta.get('namespaces', {})
             ns_names = safe_get_ns_names(ns_raw)
@@ -584,6 +1121,7 @@ def get_checkpoints(folder=None):
                 'objects': meta.get('objects', 0),
                 'keys': meta.get('keys', 0),
                 'ns_names': ns_names,
+                'ns_counts': ns_raw if isinstance(ns_raw, dict) else {},
                 'scene_name': meta.get('scene_name', ''),
                 'size': os.path.getsize(filepath) / 1024
             })
@@ -621,19 +1159,25 @@ def cleanup_old(folder=None):
     keep = []
     for dt, path in items:
         if dt < cutoff:
-            try: os.remove(path)
-            except: pass
+            for candidate in (path, path + ".meta"):
+                try: os.remove(candidate)
+                except: pass
         else:
             keep.append((dt, path))
 
     if len(keep) > Config.MAX_CHECKPOINTS:
         for dt, path in keep[Config.MAX_CHECKPOINTS:]:
-            try: os.remove(path)
-            except: pass
+            for candidate in (path, path + ".meta"):
+                try: os.remove(candidate)
+                except: pass
 
 def delete_checkpoint(filepath):
     if os.path.exists(filepath):
         os.remove(filepath)
+        try:
+            os.remove(filepath + ".meta")
+        except Exception:
+            pass
         return True
     return False
 
@@ -662,6 +1206,17 @@ def update_toolbar_crash_button(is_active):
             toolbar.update_recovery_indicator(is_active)
     except Exception as e:
         # Silently fail if toolbar is not found
+        pass
+
+
+def update_toolbar_checkpoint_status(filepath):
+    """Show that the active recovery service has completed a real write."""
+    try:
+        from AnimKey.core.toolbar import AnimKeyToolbar
+        toolbar = AnimKeyToolbar._instance
+        if toolbar and hasattr(toolbar, "update_recovery_checkpoint"):
+            toolbar.update_recovery_checkpoint(filepath)
+    except Exception:
         pass
 
 
@@ -986,12 +1541,15 @@ class RecoveryWindow(ContextPopupWindow):
         ns_layout.setContentsMargins(12, 10, 12, 10)
         ns_layout.setSpacing(6)
         
-        ns_title = QtWidgets.QLabel("🎭 Namespaces in Checkpoint")
+        ns_title = QtWidgets.QLabel("🎭 Source Rig / Namespace")
         ns_title.setStyleSheet("color: #f5f5f7; font-size: 11px; font-weight: 700;")
         ns_layout.addWidget(ns_title)
         
         self.ns_list = QtWidgets.QListWidget()
         self.ns_list.setMaximumHeight(80)
+        self.ns_list.setSelectionMode(
+            QT_SINGLE_SELECTION
+        )
         self.ns_list.setStyleSheet("""
             QListWidget {
                 background-color: #3A3A3A;
@@ -1003,6 +1561,9 @@ class RecoveryWindow(ContextPopupWindow):
             QListWidget::item { padding: 4px; }
             QListWidget::item:selected { background-color: #3498DB; color: #FFF; }
         """)
+        self.ns_list.currentItemChanged.connect(
+            self._on_namespace_selection_changed
+        )
         ns_layout.addWidget(self.ns_list)
         
         # Source/Target remap
@@ -1017,6 +1578,7 @@ class RecoveryWindow(ContextPopupWindow):
         for ns in get_scene_namespaces():
             self.target_combo.addItem(ns)
         self.target_combo.addItem("(no namespace)")
+        self.target_combo.setEnabled(False)
         self.target_combo.setStyleSheet("""
             QComboBox {
                 background-color: #454545;
@@ -1180,7 +1742,9 @@ class RecoveryWindow(ContextPopupWindow):
         idx = self.checkpoint_list.row(item)
         if idx >= 0 and idx < len(self.filtered):
             self.selected = self.filtered[idx]
-            self.selected_data = load_checkpoint(self.selected['path'])
+            # Keep selection instant even for very large layered scenes.  The
+            # full payload is loaded only when Recover is actually requested.
+            self.selected_data = None
             self._update_details()
     
     def _update_details(self):
@@ -1196,18 +1760,47 @@ class RecoveryWindow(ContextPopupWindow):
         
         # Update namespace list
         self.ns_list.clear()
-        if self.selected_data:
-            anim_objs = list(self.selected_data.get('animation', {}).keys())
-            ns_counts = count_objects_by_namespace(anim_objs)
-            for ns, count in sorted(ns_counts.items()):
-                self.ns_list.addItem(f"{ns}  ({count} objs)")
+        ns_counts = cp.get("ns_counts", {})
+        all_item = QtWidgets.QListWidgetItem(
+            "TODOS / All rigs  ({} objs)".format(cp.get("objects", 0))
+        )
+        all_item.setData(QT_USER_ROLE, "TODOS")
+        self.ns_list.addItem(all_item)
+        for ns, count in sorted(ns_counts.items()):
+            item = QtWidgets.QListWidgetItem(f"{ns}  ({count} objs)")
+            item.setData(QT_USER_ROLE, ns)
+            self.ns_list.addItem(item)
+        self.ns_list.setCurrentRow(0)
+
+    def _selected_source_namespace(self):
+        item = self.ns_list.currentItem()
+        if item is None:
+            return "TODOS"
+        namespace = item.data(QT_USER_ROLE)
+        return namespace or "TODOS"
+
+    def _on_namespace_selection_changed(self, *args):
+        # Remapping several source rigs into one namespace would overwrite
+        # them on top of each other, so target remapping is available only
+        # when one concrete source rig is selected.
+        source_namespace = self._selected_source_namespace()
+        can_remap = source_namespace != "TODOS"
+        if not can_remap:
+            self.target_combo.setCurrentIndex(0)
+        self.target_combo.setEnabled(can_remap)
     
     def _on_recover(self, *args):
-        if not self.selected or not self.selected_data:
+        if not self.selected:
             cmds.warning("AnimKey: Please select a checkpoint first.")
+            return
+        if not self.selected_data:
+            self.selected_data = load_checkpoint(self.selected['path'])
+        if not self.selected_data:
+            cmds.warning("AnimKey: Could not read the selected checkpoint.")
             return
         
         target_label = self.target_combo.currentText()
+        source_ns = self._selected_source_namespace()
         target_ns = None if target_label == "(same)" else target_label
         if target_ns == "(no namespace)":
             target_ns = "(sin namespace)"
@@ -1216,12 +1809,15 @@ class RecoveryWindow(ContextPopupWindow):
         try:
             success, failed, skipped = apply_animation(
                 self.selected_data,
-                namespace_filter="TODOS",
+                namespace_filter=source_ns,
                 target_namespace=target_ns
             )
             
             cmds.inViewMessage(
-                amg=f"<span style='color:#a3be8c'>Recovered {success} objects</span>",
+                amg=(
+                    "<span style='color:#a3be8c'>Recovered {} objects"
+                    " from {}</span>"
+                ).format(success, source_ns),
                 pos='topCenter',
                 fade=True,
                 fadeStayTime=2000

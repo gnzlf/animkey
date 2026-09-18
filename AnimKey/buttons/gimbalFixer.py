@@ -11,12 +11,9 @@ import maya.cmds as cmds
 from AnimKey.mods.uiMod import ContextPopupWindow
 import maya.OpenMayaUI as mui
 
-try:
-    from PySide2 import QtWidgets, QtCore, QtGui
-    from shiboken2 import wrapInstance
-except ImportError:
-    from PySide6 import QtWidgets, QtCore, QtGui
-    from shiboken6 import wrapInstance
+from AnimKey.mods.maya_compat import (
+    QtCore, QtGui, QtWidgets, wrap_instance as wrapInstance,
+)
 
 
 ROTATE_ORDERS = ['xyz', 'yzx', 'zxy', 'xzy', 'yxz', 'zyx']

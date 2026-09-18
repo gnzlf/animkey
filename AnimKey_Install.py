@@ -19,6 +19,24 @@ import sys
 import shutil
 import stat
 
+STARTUP_BEGIN = "# >>> AnimKey startup >>>"
+STARTUP_END = "# <<< AnimKey startup <<<"
+REQUIRED_PACKAGE_FILES = (
+    "__init__.py",
+    os.path.join("core", "toolbar.py"),
+    os.path.join("mods", "maya_compat.py"),
+    os.path.join("buttons", "animCrash.py"),
+)
+
+
+def _missing_required_package_files(package_root):
+    """Return critical runtime files absent from a source or staged copy."""
+    return [
+        relative_path
+        for relative_path in REQUIRED_PACKAGE_FILES
+        if not os.path.isfile(os.path.join(package_root, relative_path))
+    ]
+
 def _on_rm_error(func, path, exc_info):
     try:
         os.chmod(path, stat.S_IWRITE)
@@ -42,6 +60,44 @@ def _copy_ignore(src, names):
             ignored.add(name)
     return ignored
 
+
+def _is_within(path, parent):
+    try:
+        return os.path.commonpath((os.path.realpath(path), os.path.realpath(parent))) == os.path.realpath(parent)
+    except Exception:
+        return False
+
+
+def _safe_remove_tree(path, allowed_parent):
+    if not path or not _is_within(path, allowed_parent):
+        raise RuntimeError("Refusing to remove path outside Maya app directory: {}".format(path))
+    if os.path.exists(path):
+        shutil.rmtree(path, onerror=_on_rm_error)
+
+
+def _atomic_write_text(path, content):
+    temporary = "{}.{}.tmp".format(path, os.getpid())
+    try:
+        with open(temporary, "w") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            try:
+                os.remove(temporary)
+            except Exception:
+                pass
+
+
+def _remove_marked_startup(content):
+    while STARTUP_BEGIN in content and STARTUP_END in content:
+        start = content.index(STARTUP_BEGIN)
+        end = content.index(STARTUP_END, start) + len(STARTUP_END)
+        content = (content[:start].rstrip() + "\n" + content[end:].lstrip("\r\n"))
+    return content
+
 def onMayaDroppedPythonFile(*args):
     """
     This function is automatically called when the file is dropped into Maya.
@@ -61,6 +117,12 @@ def clean_previous_installation():
             cmds.deleteUI("AnimKey_Toolbar", control=True)
             print("    - Closed existing toolbar")
     except:
+        pass
+
+    try:
+        from AnimKey.mods import uiMod
+        uiMod.cleanup_animkey_runtime(full=True)
+    except Exception:
         pass
     
     # 2. Remove modules from memory
@@ -87,7 +149,7 @@ def clean_previous_installation():
                 pass
 
 
-def install_animkey():
+def install_animkey(launch=True):
     """
     Install AnimKey to Maya's user directory.
     """
@@ -111,34 +173,63 @@ def install_animkey():
     if not os.path.exists(animkey_source):
         cmds.error("AnimKey source folder not found. Please ensure the AnimKey folder is in the same directory as this installer.")
         return
+
+    missing_source = _missing_required_package_files(animkey_source)
+    if missing_source:
+        cmds.error(
+            "AnimKey source is incomplete. Missing required files: {}".format(
+                ", ".join(missing_source)
+            )
+        )
+        return
     
-    # CLEAN PREVIOUS INSTALLATION FIRST
-    clean_previous_installation()
-    
-    # Remove existing installation from disk
-    if os.path.exists(animkey_dest):
-        print("\n  Removing previous installation from disk...")
-        try:
-            shutil.rmtree(animkey_dest, onerror=_on_rm_error)
-            print("    - Removed old AnimKey folder")
-        except Exception as e:
-            cmds.warning(f"Could not remove existing installation: {e}")
-            cmds.warning("Please close Maya, delete the AnimKey folder manually, and try again.")
-            return
-    
-    # Copy AnimKey to scripts directory
+    if not _is_within(animkey_dest, maya_app_dir) or os.path.basename(animkey_dest) != "AnimKey":
+        cmds.error("AnimKey destination did not resolve inside Maya's application directory.")
+        return
+
+    staging_path = animkey_dest + ".installing_{}".format(os.getpid())
+    backup_path = animkey_dest + ".backup_{}".format(os.getpid())
+
+    # Stage and fully copy the new package before touching the working install.
     print("\n  Copying new AnimKey files...")
     try:
-        shutil.copytree(animkey_source, animkey_dest, ignore=_copy_ignore)
-        print("    - Files copied successfully")
+        _safe_remove_tree(staging_path, maya_app_dir)
+        _safe_remove_tree(backup_path, maya_app_dir)
+        shutil.copytree(animkey_source, staging_path, ignore=_copy_ignore)
+        missing_staged = _missing_required_package_files(staging_path)
+        if missing_staged:
+            raise RuntimeError(
+                "Staged package is incomplete. Missing: {}".format(
+                    ", ".join(missing_staged)
+                )
+            )
     except Exception as e:
-        if os.path.exists(animkey_dest):
-            try:
-                shutil.rmtree(animkey_dest, onerror=_on_rm_error)
-            except Exception:
-                pass
+        try:
+            _safe_remove_tree(staging_path, maya_app_dir)
+        except Exception:
+            pass
         cmds.error(f"Could not copy AnimKey: {e}")
         return
+
+    clean_previous_installation()
+    try:
+        if os.path.exists(animkey_dest):
+            os.replace(animkey_dest, backup_path)
+        os.replace(staging_path, animkey_dest)
+        print("    - Files copied successfully")
+    except Exception as e:
+        try:
+            if not os.path.exists(animkey_dest) and os.path.exists(backup_path):
+                os.replace(backup_path, animkey_dest)
+        except Exception:
+            pass
+        cmds.error(f"Could not activate the new AnimKey installation: {e}")
+        return
+
+    try:
+        _safe_remove_tree(backup_path, maya_app_dir)
+    except Exception as e:
+        cmds.warning("AnimKey updated, but the old backup could not be removed: {}".format(e))
     
     # Add maya_app_dir to Python path (where AnimKey is now installed)
     if maya_app_dir not in sys.path:
@@ -146,7 +237,7 @@ def install_animkey():
     
     # Create userSetup.py entry if it doesn't exist
     user_setup_path = os.path.join(maya_scripts_dir, "userSetup.py")
-    animkey_startup_code = '''
+    animkey_startup_code = STARTUP_BEGIN + '''
 # AnimKey Auto-start
 def _animkey_deferred_startup():
     """Deferred startup to ensure Maya is fully loaded"""
@@ -169,24 +260,22 @@ try:
     maya.utils.executeDeferred(_animkey_deferred_startup)
 except:
     pass
-'''
+''' + STARTUP_END + '\n'
     
     # Check if userSetup.py exists and if AnimKey is already in it
     if os.path.exists(user_setup_path):
         with open(user_setup_path, 'r') as f:
             content = f.read()
         
-        if 'AnimKey' not in content:
-            # Append to existing userSetup.py
-            with open(user_setup_path, 'a') as f:
-                f.write('\n' + animkey_startup_code)
+        content = _remove_marked_startup(content)
+        if '_animkey_deferred_startup' not in content:
+            _atomic_write_text(user_setup_path, content.rstrip() + '\n\n' + animkey_startup_code)
             print("    - Added AnimKey to userSetup.py")
         else:
             print("    - AnimKey already in userSetup.py")
     else:
         # Create new userSetup.py
-        with open(user_setup_path, 'w') as f:
-            f.write(animkey_startup_code)
+        _atomic_write_text(user_setup_path, animkey_startup_code)
         print("    - Created userSetup.py with AnimKey startup")
     
     # Install plugin to Maya's plug-ins folder
@@ -202,7 +291,9 @@ except:
         
         # Copy plugin file
         try:
-            shutil.copy2(plugin_source, plugin_dest)
+            plugin_temp = plugin_dest + ".{}.tmp".format(os.getpid())
+            shutil.copy2(plugin_source, plugin_temp)
+            os.replace(plugin_temp, plugin_dest)
             print("    - Installed AnimKey plugin to plug-ins folder")
             print("      (You can enable 'Auto load' in Plugin Manager)")
         except Exception as e:
@@ -210,6 +301,10 @@ except:
     
     print("\n  Installation complete!")
     print("=" * 60)
+
+    if not launch:
+        print("\n  Files installed successfully. Maya launch was skipped.")
+        return animkey_dest
     
     # Launch AnimKey
     print("\n  Launching AnimKey...")
@@ -251,8 +346,10 @@ except:
         import traceback
         traceback.print_exc()
         cmds.warning(f"AnimKey installed but could not start automatically: {e}")
-        print("\n  Please restart Maya or run:")
+        print("\n  Run this command to start AnimKey:")
         print("    import AnimKey; AnimKey.show()")
+
+    return animkey_dest
 
 
 def uninstall_animkey():
@@ -281,6 +378,13 @@ def uninstall_animkey():
     print("=" * 60)
     print("  AnimKey Uninstallation")
     print("=" * 60)
+
+    try:
+        from AnimKey.mods import uiMod
+        uiMod.cleanup_animkey_runtime(full=True)
+        uiMod.unload_animkey_entry_plugin()
+    except Exception:
+        pass
     
     # Clean from memory first
     clean_previous_installation()
@@ -308,40 +412,13 @@ def uninstall_animkey():
     user_setup_path = os.path.join(maya_scripts_dir, "userSetup.py")
     if os.path.exists(user_setup_path):
         with open(user_setup_path, 'r') as f:
-            lines = f.readlines()
-        
-        # Filter out AnimKey related lines (including the deferred function)
-        new_lines = []
-        skip_block = False
-        for line in lines:
-            # Start skipping at AnimKey Auto-start comment
-            if '# AnimKey Auto-start' in line:
-                skip_block = True
-                continue
-            # Also skip the deferred function definition
-            if 'def _animkey_deferred_startup' in line:
-                skip_block = True
-                continue
-            # Stop skipping after we see a line that ends the block
-            if skip_block:
-                # End of block: empty line followed by non-indented code, or next comment block
-                if line.strip() == '' and not line.startswith(' ') and not line.startswith('\t'):
-                    skip_block = False
-                    continue
-                # Still in the AnimKey block
-                if 'AnimKey' in line or 'animkey' in line.lower() or line.startswith(' ') or line.startswith('\t'):
-                    continue
-                # Line doesn't belong to AnimKey block anymore
-                if not line.startswith(' ') and not line.startswith('\t') and line.strip() != '':
-                    skip_block = False
-            if 'AnimKey' in line or '_animkey_deferred_startup' in line:
-                continue
-            new_lines.append(line)
-        
-        with open(user_setup_path, 'w') as f:
-            f.writelines(new_lines)
-        
-        print("  ✓ Removed AnimKey from userSetup.py")
+            content = f.read()
+        cleaned = _remove_marked_startup(content)
+        if cleaned != content:
+            _atomic_write_text(user_setup_path, cleaned)
+            print("  ✓ Removed AnimKey from userSetup.py")
+        else:
+            print("  AnimKey startup block is legacy/unmarked; left userSetup.py unchanged for safety")
     
     # Remove plugin from plug-ins folder
     plugins_dir = os.path.join(maya_app_dir, "plug-ins")
@@ -364,7 +441,7 @@ def uninstall_animkey():
         print("  User data preserved")
     
     print("\n  Uninstallation complete!")
-    print("  Please restart Maya to complete the process.")
+    print("  AnimKey has been removed from the current Maya session.")
     print("=" * 60)
 
 

@@ -29,6 +29,9 @@ _SIDE_SWAP = {
     "der": ("izq",),
 }
 
+_LEFT_SIDE_TOKENS = frozenset(("l", "left", "lf", "lt", "lft", "lhs", "izq"))
+_RIGHT_SIDE_TOKENS = frozenset(("r", "right", "rf", "rt", "rgt", "rg", "rhs", "der"))
+
 _ALIAS_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])("
     + "|".join(sorted((re.escape(k) for k in _SIDE_SWAP), key=len, reverse=True))
@@ -49,6 +52,84 @@ def _match_case(template, replacement):
 
 def _swap_replacements(token):
     return _SIDE_SWAP.get(token.lower(), ())
+
+
+def _token_side(token):
+    token = str(token or "").lower()
+    if token in _LEFT_SIDE_TOKENS:
+        return "left"
+    if token in _RIGHT_SIDE_TOKENS:
+        return "right"
+    return None
+
+
+def _side_occurrences(short_name):
+    """Return boundary-aware side tokens found in a Maya short name."""
+    occurrences = []
+    seen = set()
+
+    def append(index, token):
+        side = _token_side(token)
+        key = (int(index), str(token).lower(), side)
+        if side and key not in seen:
+            seen.add(key)
+            occurrences.append(key)
+
+    for match in _ALIAS_PATTERN.finditer(short_name):
+        append(match.start(1), match.group(1))
+
+    for source in sorted((key for key in _SIDE_SWAP if len(key) > 1), key=len, reverse=True):
+        pattern = re.compile(re.escape(source), re.IGNORECASE)
+        for match in pattern.finditer(short_name):
+            before = short_name[match.start() - 1] if match.start() else ""
+            after = short_name[match.end()] if match.end() < len(short_name) else ""
+            starts_token = not before or not before.isalpha() or before.islower()
+            ends_token = not after or not after.islower()
+            if starts_token and ends_token:
+                append(match.start(), match.group(0))
+
+    for key in sorted(_SIDE_SWAP, key=len, reverse=True):
+        length = len(key)
+        if len(short_name) <= length:
+            continue
+        prefix = short_name[:length]
+        if prefix.lower() == key:
+            next_char = short_name[length]
+            if next_char.isupper() or next_char.isdigit():
+                append(0, prefix)
+        suffix = short_name[-length:]
+        if suffix.lower() == key:
+            prev_char = short_name[-length - 1]
+            if suffix.isupper() and (prev_char.islower() or prev_char.isdigit()):
+                append(len(short_name) - length, suffix)
+
+    for index, char in enumerate(short_name):
+        if char.lower() not in ("l", "r"):
+            continue
+        before = short_name[index - 1] if index else ""
+        after = short_name[index + 1] if index + 1 < len(short_name) else ""
+        left_boundary = not before or not before.isalnum()
+        right_boundary = not after or not after.islower()
+        compact_suffix = char.isupper() and before.islower() and right_boundary
+        if (left_boundary and right_boundary) or compact_suffix:
+            append(index, char)
+
+    return occurrences
+
+
+def detect_side(name):
+    """Return ``left``/``right`` for a boundary-safe side token, else None."""
+    _, leaf_name = _split_dag_path(str(name or ""))
+    _, short_name = _split_namespace(leaf_name)
+    sides = {entry[2] for entry in _side_occurrences(short_name)}
+    return next(iter(sides)) if len(sides) == 1 else None
+
+
+def side_swap_candidates(name):
+    """Return every namespace-preserving side-swapped name candidate."""
+    dag_prefix, leaf_name = _split_dag_path(str(name or ""))
+    namespace, short_name = _split_namespace(leaf_name)
+    return [dag_prefix + namespace + item for item in _candidate_short_names(short_name)]
 
 
 def _split_dag_path(node_name):
@@ -153,9 +234,7 @@ def _compact_side_candidates(short_name):
 
 def _camel_word_candidates(short_name):
     candidates = []
-    word_pairs = (("left", "right"), ("right", "left"))
-
-    for source, replacement in word_pairs:
+    for source in sorted((key for key in _SIDE_SWAP if len(key) > 1), key=len, reverse=True):
         pattern = re.compile(re.escape(source), re.IGNORECASE)
         for match in pattern.finditer(short_name):
             before = short_name[match.start() - 1] if match.start() else ""
@@ -164,10 +243,11 @@ def _camel_word_candidates(short_name):
             ends_token = not after or not after.islower()
             if not (starts_token and ends_token):
                 continue
-            swapped = short_name[:match.start()]
-            swapped += _match_case(match.group(0), replacement)
-            swapped += short_name[match.end():]
-            _append_unique(candidates, swapped)
+            for replacement in _swap_replacements(source):
+                swapped = short_name[:match.start()]
+                swapped += _match_case(match.group(0), replacement)
+                swapped += short_name[match.end():]
+                _append_unique(candidates, swapped)
 
     return candidates
 
@@ -288,6 +368,20 @@ def find_opposite_name(name):
                 return resolved
 
     return None
+
+
+def swap_side_name(name):
+    """Return the first side-swapped name without requiring it in the scene.
+
+    Selection Sets use this for their display names while ``find_opposite_name``
+    remains responsible for resolving real Maya controls.
+    """
+    dag_prefix, leaf_name = _split_dag_path(str(name or ""))
+    namespace, short_name = _split_namespace(leaf_name)
+    candidates = _candidate_short_names(short_name)
+    if not candidates:
+        return str(name or "")
+    return dag_prefix + namespace + candidates[0]
 
 
 def _as_selectable_transform(node):

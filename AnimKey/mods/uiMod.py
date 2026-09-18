@@ -9,19 +9,31 @@ import maya.cmds as cmds
 import maya.OpenMayaUI as mui
 import math
 
-# Try importing PySide2 or PySide6
-try:
-    from PySide2 import QtWidgets, QtCore, QtGui
-    from PySide2.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea
-    from PySide2.QtCore import Qt, QPropertyAnimation, QEasingCurve, Property, QPoint, QRect
-    from PySide2.QtGui import QColor, QPainter, QPen, QBrush, QLinearGradient, QRadialGradient, QFont, QPainterPath
-    from shiboken2 import wrapInstance
-except ImportError:
-    from PySide6 import QtWidgets, QtCore, QtGui
-    from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea
-    from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, Property, QPoint, QRect
-    from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QLinearGradient, QRadialGradient, QFont, QPainterPath
-    from shiboken6 import wrapInstance
+from AnimKey.mods.maya_compat import (
+    QtCore, QtGui, QtWidgets, screen_available_geometry,
+    wrap_instance as wrapInstance,
+)
+
+QApplication = QtWidgets.QApplication
+QWidget = QtWidgets.QWidget
+QVBoxLayout = QtWidgets.QVBoxLayout
+QHBoxLayout = QtWidgets.QHBoxLayout
+QLabel = QtWidgets.QLabel
+QScrollArea = QtWidgets.QScrollArea
+Qt = QtCore.Qt
+QPropertyAnimation = QtCore.QPropertyAnimation
+QEasingCurve = QtCore.QEasingCurve
+Property = QtCore.Property
+QPoint = QtCore.QPoint
+QRect = QtCore.QRect
+QColor = QtGui.QColor
+QPainter = QtGui.QPainter
+QPen = QtGui.QPen
+QBrush = QtGui.QBrush
+QLinearGradient = QtGui.QLinearGradient
+QRadialGradient = QtGui.QRadialGradient
+QFont = QtGui.QFont
+QPainterPath = QtGui.QPainterPath
 
 from AnimKey.mods.themes import ThemeManager
 from AnimKey.mods import styleMod as style
@@ -85,7 +97,7 @@ ANIMKEY_SINGLE_POPUP_OBJECTS = {
     "setManagerV7",
     "AnimKey_Retimer",
     "AnimKey_BakeFactory",
-    "AnimKey_CollisionTool",
+    "AnimKey_Switcher",
     "AnimKey_GimbalFixer",
     "AnimKey_TempControl",
     "AnimKey_TempPivotPro",
@@ -94,21 +106,60 @@ ANIMKEY_SINGLE_POPUP_OBJECTS = {
 }
 
 
-def close_animkey_tool_windows(except_widget=None, include_hidden=False):
-    """Hide attached AnimKey tool windows so detached panels can stay open."""
+def _is_animkey_tool_window(widget):
+    """Return whether a top-level Qt widget belongs to an AnimKey script."""
+    try:
+        object_name = str(widget.objectName() or "")
+    except Exception:
+        object_name = ""
+    if object_name in ANIMKEY_SINGLE_POPUP_OBJECTS or object_name.startswith("AnimKey"):
+        return True
+
+    try:
+        class_module = str(type(widget).__module__ or "")
+    except Exception:
+        class_module = ""
+    if class_module == "AnimKey" or class_module.startswith("AnimKey."):
+        return True
+
+    try:
+        return "animkey" in str(widget.windowTitle() or "").lower()
+    except Exception:
+        return False
+
+
+def close_animkey_tool_windows(
+    except_widget=None,
+    include_hidden=False,
+    force_close=False,
+):
+    """Close every top-level window owned by an AnimKey script.
+
+    Normal toolbar hiding preserves attached popups. A full runtime cleanup
+    uses ``force_close`` so uninstall/update cannot leave hidden script windows
+    or old Qt objects alive.
+    """
     app = QtWidgets.QApplication.instance()
     if app is None:
         return
 
-    for widget in app.topLevelWidgets():
+    try:
+        widgets = app.topLevelWidgets()
+    except AttributeError:
+        try:
+            widgets = QtWidgets.QApplication.topLevelWidgets()
+        except Exception:
+            widgets = []
+
+    for widget in widgets:
         if widget is except_widget:
             continue
         try:
-            if widget.objectName() not in ANIMKEY_SINGLE_POPUP_OBJECTS:
+            if not _is_animkey_tool_window(widget):
                 continue
             if not widget.isVisible() and not include_hidden:
                 continue
-            if hasattr(widget, "animkey_auto_hide"):
+            if hasattr(widget, "animkey_auto_hide") and not force_close:
                 widget.animkey_auto_hide()
             else:
                 widget.close()
@@ -118,8 +169,14 @@ def close_animkey_tool_windows(except_widget=None, include_hidden=False):
         except Exception:
             pass
 
+    if force_close:
+        try:
+            QtWidgets.QApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+        except Exception:
+            pass
 
-def cleanup_animkey_runtime(except_widget=None):
+
+def cleanup_animkey_runtime(except_widget=None, full=False):
     """Close AnimKey-owned floating tools and stop live helpers when AnimKey exits."""
     def _safe_call(func, *args, **kwargs):
         try:
@@ -142,11 +199,27 @@ def cleanup_animkey_runtime(except_widget=None):
     except Exception:
         pass
 
-    try:
-        from AnimKey.buttons import animCrash
-        _safe_call(animCrash.RecoverySystem.stop)
-    except Exception:
-        pass
+    # Hiding the toolbar or closing a tool must not turn crash protection off.
+    # A full unload stops the runtime callbacks temporarily; the next AnimKey
+    # startup restores them according to the animator's persisted preference.
+    if full:
+        try:
+            from AnimKey.buttons import animCrash
+            _safe_call(animCrash.RecoverySystem.stop)
+        except Exception:
+            pass
+
+    for module_name, function_name in (
+        ("AnimKey.buttons.mirror", "disable_auto_mirror"),
+        ("AnimKey.buttons.copyWorldspace", "disable_auto_worldspace"),
+        ("AnimKey.buttons.linkObjects", "disable_auto_link"),
+        ("AnimKey.buttons.trail", "shutdown_runtime"),
+    ):
+        try:
+            module = __import__(module_name, fromlist=[function_name])
+            _safe_call(getattr(module, function_name))
+        except Exception:
+            pass
 
     try:
         from AnimKey.buttons import brush
@@ -178,7 +251,42 @@ def cleanup_animkey_runtime(except_widget=None):
     except Exception:
         pass
 
-    close_animkey_tool_windows(except_widget=except_widget, include_hidden=True)
+    if full:
+        try:
+            from AnimKey.mods import hotkeysMod
+            _safe_call(hotkeysMod.uninstall_event_filter)
+        except Exception:
+            pass
+        try:
+            from AnimKey.core.toolbar import AnimKeyToolbar
+            instance = AnimKeyToolbar.get_instance()
+            if instance is not None:
+                _safe_call(instance._remove_scene_callbacks)
+        except Exception:
+            pass
+
+    close_animkey_tool_windows(
+        except_widget=except_widget,
+        include_hidden=True,
+        force_close=full,
+    )
+
+
+def unload_animkey_entry_plugin():
+    """Unload AnimKey's lightweight Plugin Manager entry without restarting Maya."""
+    for plugin_name in ("AnimKey_plugin.py", "AnimKey_plugin"):
+        try:
+            if not cmds.pluginInfo(plugin_name, query=True, loaded=True):
+                continue
+            try:
+                cmds.pluginInfo(plugin_name, edit=True, autoload=False)
+            except Exception:
+                pass
+            cmds.unloadPlugin(plugin_name)
+            return True
+        except Exception:
+            continue
+    return False
 
 
 def is_valid_qt_widget(widget):
@@ -223,10 +331,10 @@ def get_screen_resolution():
         app = QApplication([])
     
     try:
-        from PySide2.QtWidgets import QDesktopWidget
-        desktop = QDesktopWidget()
+        desktop_class = getattr(QtWidgets, "QDesktopWidget")
+        desktop = desktop_class()
         screen_rect = desktop.screenGeometry()
-    except ImportError:
+    except (AttributeError, TypeError):
         screen = app.primaryScreen()
         screen_rect = screen.geometry()
     
@@ -250,7 +358,7 @@ def get_dpi_scale():
 #                           CUSTOM WIDGETS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class AnimKeySlider(QtWidgets.QSlider):
+class LegacyAnimKeyQSlider(QtWidgets.QSlider):
     """
     Custom slider with enhanced styling and functionality
     """
@@ -261,7 +369,7 @@ class AnimKeySlider(QtWidgets.QSlider):
     dragEnded = QtCore.Signal()
     
     def __init__(self, orientation=QtCore.Qt.Horizontal, parent=None, slider_type="tween"):
-        super(AnimKeySlider, self).__init__(orientation, parent)
+        super(LegacyAnimKeyQSlider, self).__init__(orientation, parent)
         
         self.slider_type = slider_type
         self._is_dragging = False
@@ -1246,8 +1354,10 @@ class AnimKeySlider(QWidget):
         actual_value = self.min_val + (percentage / 100.0) * (self.max_val - self.min_val)
         # Trigger full cycle: prepare → execute → reset
         self.sliderPressed.emit()
+        # setValue already emits valueChanged when the value changes. Emitting
+        # it a second time made every Tweener dot run the full curve update
+        # twice, which is especially noticeable on full-character selections.
         self.setValue(int(actual_value))
-        self.valueChanged.emit(int(actual_value))
         self.sliderReleased.emit(int(actual_value))
         # Return to origin after clicking a dot
         self._animate_return_to_origin()
@@ -2366,12 +2476,7 @@ class ContextPopupWindow(QtWidgets.QWidget):
         btn_top_y = btn_top_left.y()
         btn_bottom_y = btn_top_y + btn_rect.height()
 
-        screen = QtWidgets.QApplication.screenAt(btn_top_left) if hasattr(QtWidgets.QApplication, 'screenAt') else None
-        if screen:
-            screen_rect = screen.availableGeometry()
-        else:
-            desktop = QtWidgets.QApplication.desktop()
-            screen_rect = desktop.availableGeometry(self.anchor_button)
+        screen_rect = screen_available_geometry(self.anchor_button, btn_top_left)
 
         popup_w = self.width()
         popup_h = self.height()
@@ -2548,4 +2653,3 @@ class ContextPopupWindow(QtWidgets.QWidget):
                 return True
 
         return super(ContextPopupWindow, self).eventFilter(obj, event)
-

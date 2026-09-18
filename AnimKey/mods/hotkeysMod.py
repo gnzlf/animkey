@@ -9,16 +9,10 @@ import maya.cmds as cmds
 import maya.mel as mel
 from AnimKey.core.settings import load_shortcuts, save_shortcuts
 
-try:
-    from PySide2 import QtWidgets, QtCore, QtGui
-    from PySide2.QtCore import Qt
-    from PySide2.QtGui import QKeySequence
-    import shiboken2 as shiboken
-except ImportError:
-    from PySide6 import QtWidgets, QtCore, QtGui
-    from PySide6.QtCore import Qt
-    from PySide6.QtGui import QKeySequence
-    import shiboken6 as shiboken
+from AnimKey.mods.maya_compat import QtCore, QtGui, QtWidgets, shiboken
+
+Qt = QtCore.Qt
+QKeySequence = QtGui.QKeySequence
 
 import maya.OpenMayaUI as omui
 from AnimKey.core.executionGuard import animkey_execution
@@ -238,7 +232,7 @@ def get_action_function(action_name):
         # ─────────────────────────────────────────────────────────────────────
         "RBK": "import AnimKey.buttons.reblock as mod; mod.execute()",
         "GMB": "import AnimKey.buttons.gimbalFixer as mod; mod.execute()",
-        "COL": "import AnimKey.buttons.collisionTool as mod; mod.execute()",
+        "SWT": "import AnimKey.buttons.switcher as mod; mod.execute()",
         "BAK": "import AnimKey.buttons.bakeAnim as mod; mod.execute()",
         "SETS": "import AnimKey.buttons.selectionSets as mod; mod.execute()",
         "ACR": "import AnimKey.buttons.animCrash as mod; mod.execute()",
@@ -267,9 +261,10 @@ def get_action_function(action_name):
         # MIRROR SUBMENU
         # ─────────────────────────────────────────────────────────────────────
         "All Mirror": "from AnimKey.buttons.mirror import all_mirror; all_mirror()",
+        "Mirror to Left": "from AnimKey.buttons.mirror import mirror_to_left; mirror_to_left()",
+        "Mirror to Right": "from AnimKey.buttons.mirror import mirror_to_right; mirror_to_right()",
         "Toggle Auto Mirror": "from AnimKey.buttons.mirror import toggle_auto_mirror; toggle_auto_mirror()",
         "Snapshot Mirror Settings": "from AnimKey.buttons.mirror import snapshot_mirror_settings; snapshot_mirror_settings()",
-        "Show Snapshot Info": "from AnimKey.buttons.mirror import show_mirror_snapshot_info; show_mirror_snapshot_info()",
         "Delete Snapshot": "from AnimKey.buttons.mirror import delete_mirror_snapshot; delete_mirror_snapshot()",
         "Add Mirror Invert Exception": "from AnimKey.buttons.mirror import add_mirror_invert_exception; add_mirror_invert_exception()",
         "Add Mirror Keep Exception": "from AnimKey.buttons.mirror import add_mirror_keep_exception; add_mirror_keep_exception()",
@@ -497,4 +492,3 @@ def register_all_commands_in_hotkey_editor():
     With the Qt event filter system, this just ensures hotkeys are loaded.
     """
     load_and_register_all_hotkeys()
-

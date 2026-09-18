@@ -24,39 +24,54 @@ FFMPEG_DOWNLOAD_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essenti
 # ======================================================================
 #  COMPATIBILIDAD MULTI-VERSIÓN DE PYSIDE (Maya 2022 a Maya 2025)
 # ======================================================================
-try:
-    from PySide6 import QtWidgets, QtCore, QtGui
-    from PySide6.QtCore import (Qt, QPoint, QPointF, QRectF, QTimer,
-                             QPropertyAnimation, QEasingCurve)
-    from PySide6.QtGui import (QPainter, QPen, QColor, QPixmap, QImage,
-                            QRadialGradient, QLinearGradient, QPainterPath,
-                            QBrush, QTransform, QCursor, QTabletEvent,
-                            QConicalGradient, QAction)
-    from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
-                                QPushButton, QSlider, QLabel, QColorDialog,
-                                QSizePolicy, QFrame, QCheckBox, QComboBox,
-                                QSpinBox, QDockWidget, QMainWindow,
-                                QToolBar, QSplitter, QScrollArea, QGroupBox)
-    from shiboken6 import wrapInstance
-    PYSIDE_VER = 6
-except ImportError:
-    from PySide2 import QtWidgets, QtCore, QtGui
-    from PySide2.QtCore import (Qt, QPoint, QPointF, QRectF, QTimer,
-                             QPropertyAnimation, QEasingCurve)
-    from PySide2.QtGui import (QPainter, QPen, QColor, QPixmap, QImage,
-                            QRadialGradient, QLinearGradient, QPainterPath,
-                            QBrush, QTransform, QCursor, QTabletEvent,
-                            QConicalGradient)
-    from PySide2.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
-                                QPushButton, QSlider, QLabel, QColorDialog,
-                                QSizePolicy, QFrame, QCheckBox, QComboBox,
-                                QSpinBox, QDockWidget, QMainWindow, QAction,
-                                QToolBar, QSplitter, QScrollArea, QGroupBox)
-    PYSIDE_VER = 2
-    try:
-        from shiboken2 import wrapInstance
-    except ImportError:
-        from shiboken import wrapInstance
+from AnimKey.mods.maya_compat import (
+    PYSIDE_MAJOR as PYSIDE_VER,
+    QtCore,
+    QtGui,
+    QtWidgets,
+    execute_qt,
+    wrap_instance as wrapInstance,
+)
+from AnimKey.mods.storage import atomic_write_json
+
+Qt = QtCore.Qt
+QPoint = QtCore.QPoint
+QPointF = QtCore.QPointF
+QRectF = QtCore.QRectF
+QTimer = QtCore.QTimer
+QPropertyAnimation = QtCore.QPropertyAnimation
+QEasingCurve = QtCore.QEasingCurve
+QPainter = QtGui.QPainter
+QPen = QtGui.QPen
+QColor = QtGui.QColor
+QPixmap = QtGui.QPixmap
+QImage = QtGui.QImage
+QLinearGradient = QtGui.QLinearGradient
+QPainterPath = QtGui.QPainterPath
+QBrush = QtGui.QBrush
+QTransform = QtGui.QTransform
+QCursor = QtGui.QCursor
+QTabletEvent = QtGui.QTabletEvent
+QConicalGradient = QtGui.QConicalGradient
+QAction = QtGui.QAction if hasattr(QtGui, "QAction") else QtWidgets.QAction
+QWidget = QtWidgets.QWidget
+QVBoxLayout = QtWidgets.QVBoxLayout
+QHBoxLayout = QtWidgets.QHBoxLayout
+QPushButton = QtWidgets.QPushButton
+QSlider = QtWidgets.QSlider
+QLabel = QtWidgets.QLabel
+QColorDialog = QtWidgets.QColorDialog
+QSizePolicy = QtWidgets.QSizePolicy
+QFrame = QtWidgets.QFrame
+QCheckBox = QtWidgets.QCheckBox
+QComboBox = QtWidgets.QComboBox
+QSpinBox = QtWidgets.QSpinBox
+QDockWidget = QtWidgets.QDockWidget
+QMainWindow = QtWidgets.QMainWindow
+QToolBar = QtWidgets.QToolBar
+QSplitter = QtWidgets.QSplitter
+QScrollArea = QtWidgets.QScrollArea
+QGroupBox = QtWidgets.QGroupBox
 
 # Helpers para compatibilidad de eventos
 def get_event_pos(event) -> QPointF:
@@ -65,11 +80,46 @@ def get_event_pos(event) -> QPointF:
     p = event.pos()
     return QPointF(p.x(), p.y())
 
+
+def get_event_global_pos(event) -> Optional[QPointF]:
+    """Return an event's global position across the Qt versions used by Maya."""
+    for method_name in ("globalPosition", "globalPosF", "globalPos"):
+        method = getattr(event, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            point = method()
+            return QPointF(point.x(), point.y())
+        except Exception:
+            continue
+    return None
+
+
 def get_tablet_tilt_x(event):
     return event.tiltX() if hasattr(event, 'tiltX') else event.xTilt()
 
 def get_tablet_tilt_y(event):
     return event.tiltY() if hasattr(event, 'tiltY') else event.yTilt()
+
+
+def get_tablet_pressure(event, default: float = 1.0) -> float:
+    """Return a stable normalized pressure for Qt 5/6 tablet drivers."""
+    try:
+        pressure = float(event.pressure())
+    except Exception:
+        pressure = float(default)
+    if not math.isfinite(pressure):
+        pressure = float(default)
+    # Some Windows tablet drivers briefly report zero on TabletPress. Preserve
+    # a light stroke instead of dropping the first sample completely.
+    return max(0.02, min(1.0, pressure))
+
+
+def get_tablet_rotation(event) -> float:
+    try:
+        return float(event.rotation())
+    except Exception:
+        return 0.0
 
 
 def _animkey_package_dir():
@@ -200,7 +250,7 @@ def _download_ffmpeg_to_animkey_data(status_callback=None):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def resolve_ffmpeg_path(status_callback=None, allow_download=True):
+def resolve_ffmpeg_path(status_callback=None, allow_download=False):
     for candidate in _ffmpeg_candidate_paths():
         if _is_valid_ffmpeg(candidate):
             return candidate
@@ -385,8 +435,12 @@ class CatmullRomSpline:
             pr1 = points[i1][2] if len(points[i1]) > 2 else 1.0
             pr2 = points[i2][2] if len(points[i2]) > 2 else 1.0
 
-            seg = self.interpolate_segment(p0, p1, p2, p3, num_points=num_interp)
+            distance = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+            samples = max(2, min(num_interp, int(distance / 2.0) + 2))
+            seg = self.interpolate_segment(p0, p1, p2, p3, num_points=samples)
             for j, (x, y) in enumerate(seg):
+                if result and j == 0:
+                    continue
                 t = j / max(len(seg) - 1, 1)
                 result.append((x, y, pr1 + (pr2 - pr1) * t))
         return result
@@ -417,7 +471,9 @@ class BrushPhysics:
 
 def compute_stroke_width(base_size: float, pressure: float, speed: float,
                           tilt: float = 0.0, velocity_sensitivity: float = 0.08) -> float:
-    pressure_factor = max(0.05, pressure) ** 0.6
+    # Stored stroke pressure is already a calibrated 0..1 brush response.
+    # Applying a second exponent here made tablet input feel overly thin.
+    pressure_factor = max(0.08, min(1.0, float(pressure)))
     velocity_factor = 1.0 / (1.0 + speed * velocity_sensitivity)
     tilt_factor = max(0.3, math.cos(math.radians(tilt * 0.5)))
     return max(0.5, base_size * pressure_factor * velocity_factor * tilt_factor)
@@ -464,7 +520,7 @@ class Stroke:
         else:
             raw = [(p.x * w, p.y * h, p.pressure) for p in self.points]
             
-        self.smoothed_path = spline.smooth_path(raw, num_interp=14)
+        self.smoothed_path = spline.smooth_path(raw, num_interp=6)
         self._cache_size = cache_key
 
 @dataclass
@@ -637,14 +693,16 @@ class DrawingCanvas(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WA_AcceptTouchEvents, True)
+        if hasattr(Qt, "WA_TabletTracking"):
+            self.setAttribute(Qt.WA_TabletTracking, True)
         self.setMouseTracking(True)
 
         self.tool = "brush"
         self.brush_color = QColor(255, 255, 255, 220)
         self.brush_size = 10.0
         self.brush_opacity = 0.85
-        self.brush_hardness = 0.7
-        self.velocity_sensitivity = 0.06
+        self.brush_hardness = 0.72
+        self.velocity_sensitivity = 0.0
 
         self.spline = CatmullRomSpline(alpha=0.5)
         self.kalman = KalmanFilter1D(process_noise=5e-4, measurement_noise=0.02)
@@ -656,6 +714,14 @@ class DrawingCanvas(QWidget):
         self.last_cursor_pos: Optional[QPointF] = None
         self.last_pressure: float = 1.0
         self.has_tablet = False
+        self._tablet_stroke_active = False
+        self._last_tablet_pressure = 1.0
+        self._last_tablet_event_time = 0.0
+        self._last_input_pos: Optional[QPointF] = None
+        self._drawing_view_transform = (1.0, 1.0, 0.0, 0.0)
+        self._drawing_uniform_transform = None
+        self._drawing_pixel_scale = 1.0
+        self._stroke_base_pixmap = None
 
         self.transform_active = False
         self.selected_strokes = []
@@ -693,10 +759,14 @@ class DrawingCanvas(QWidget):
 
         self._onion_cache: Dict[int, QPixmap] = {}
         self._cache_dirty = True
+        self._frame_render_cache = {}
+        self._frame_render_cache_order = deque()
+        self._frame_render_cache_limit = 12
         self._last_size = (0, 0)
         self._last_view_token = None
         self.model_panel = None
         self._drawing_view_zoom = 1.0
+        self._playback_mode = False
 
         self.setMinimumSize(50, 50)
 
@@ -707,6 +777,7 @@ class DrawingCanvas(QWidget):
         if (w, h) == self._last_size:
             return
         self._last_size = (w, h)
+        self._invalidate_frame_render_cache()
         self.canvas_pixmap = QPixmap(w, h)
         self.canvas_pixmap.fill(Qt.transparent)
         self.overlay_pixmap = QPixmap(w, h)
@@ -715,11 +786,42 @@ class DrawingCanvas(QWidget):
 
     def _rebuild_current_frame(self):
         """Re-renderiza todos los trazos del frame actual desde coordenadas normalizadas."""
+        cache_key = (
+            int(self.current_frame), int(self.width()), int(self.height()),
+            self._last_view_token,
+        )
+        if self._playback_mode:
+            cached = self._frame_render_cache.get(cache_key)
+            if cached is not None:
+                self.canvas_pixmap = QPixmap(cached)
+                self._cache_dirty = True
+                return
         self.canvas_pixmap.fill(Qt.transparent)
         fd = self.data.frames.get(self.current_frame)
         if fd and fd.strokes:
             self._render_frame_to_pixmap(fd, self.canvas_pixmap, 1.0)
+        if self._playback_mode:
+            self._frame_render_cache[cache_key] = QPixmap(self.canvas_pixmap)
+            self._frame_render_cache_order.append(cache_key)
+            while len(self._frame_render_cache_order) > self._frame_render_cache_limit:
+                stale = self._frame_render_cache_order.popleft()
+                self._frame_render_cache.pop(stale, None)
         self._cache_dirty = True
+
+    def _invalidate_frame_render_cache(self, frame=None):
+        if frame is None:
+            self._frame_render_cache.clear()
+            self._frame_render_cache_order.clear()
+            return
+        frame = int(frame)
+        stale_keys = [key for key in self._frame_render_cache if key[0] == frame]
+        for key in stale_keys:
+            self._frame_render_cache.pop(key, None)
+        if stale_keys:
+            stale_set = set(stale_keys)
+            self._frame_render_cache_order = deque(
+                key for key in self._frame_render_cache_order if key not in stale_set
+            )
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -736,10 +838,34 @@ class DrawingCanvas(QWidget):
         return self.tool == "free_transform"
 
     def tabletEvent(self, event: QTabletEvent):
+        if self._handle_tablet_event(event, get_event_pos(event)):
+            event.accept()
+        else:
+            event.ignore()
+
+    def handle_external_tablet_event(self, event, global_pos: QPointF) -> bool:
+        """Handle a tablet event received by Maya instead of the overlay canvas.
+
+        In Maya's viewport overlay mode, a number of Windows tablet drivers
+        target the modelPanel widget even though the canvas is visually above
+        it.  Converting the global tablet location here keeps pressure samples
+        on the same path as native canvas events.
+        """
+        if global_pos is None:
+            return False
+        local_pos = self.mapFromGlobal(QPoint(
+            int(round(global_pos.x())), int(round(global_pos.y()))
+        ))
+        if not self.rect().contains(local_pos):
+            return False
+        return self._handle_tablet_event(event, QPointF(local_pos))
+
+    def _handle_tablet_event(self, event, epos: QPointF) -> bool:
         self.has_tablet = True
-        epos = get_event_pos(event)
-        raw_pressure = event.pressure()
-        tilt_x, tilt_y, rotation = get_tablet_tilt_x(event), get_tablet_tilt_y(event), event.rotation()
+        raw_pressure = get_tablet_pressure(event)
+        self._last_tablet_pressure = raw_pressure
+        self._last_tablet_event_time = time.monotonic()
+        tilt_x, tilt_y, rotation = get_tablet_tilt_x(event), get_tablet_tilt_y(event), get_tablet_rotation(event)
 
         is_pan_modifier = (event.modifiers() & Qt.AltModifier) != 0
 
@@ -747,16 +873,15 @@ class DrawingCanvas(QWidget):
         if ev_type == int(QtCore.QEvent.TabletPress):
             if self.tool == "lasso":
                 self._lasso_mouse_press(epos, event.button(), event.modifiers())
-                event.accept()
-                return
+                return True
             if self._is_transform_tool():
                 self._transform_mouse_press(epos, event.button(), event.modifiers())
-                event.accept()
-                return
+                return True
             if not is_pan_modifier and event.button() != Qt.MiddleButton:
-                pressure = self.kalman.update(raw_pressure)
-                self._begin_stroke(epos, pressure, tilt_x, tilt_y, rotation)
-                event.accept()
+                self._tablet_stroke_active = True
+                self._begin_stroke(epos, raw_pressure, tilt_x, tilt_y, rotation)
+                return True
+            return False
         elif ev_type == int(QtCore.QEvent.TabletMove):
             self.last_cursor_pos = epos
             if self.tool == "lasso":
@@ -764,33 +889,53 @@ class DrawingCanvas(QWidget):
                     self._transform_mouse_move(epos, event.modifiers())
                 else:
                     self._lasso_mouse_move(epos)
-                event.accept()
-                return
+                return True
             if self._is_transform_tool():
                 self._transform_mouse_move(epos, event.modifiers())
-                event.accept()
-                return
+                return True
             if self.drawing:
-                pressure = self.kalman.update(raw_pressure)
-                self._add_point(epos, pressure, tilt_x, tilt_y, rotation)
+                self._add_point(epos, raw_pressure, tilt_x, tilt_y, rotation)
             else:
                 self.last_draw_pos = epos
                 self.update()
-            event.accept()
+            return True
         elif ev_type == int(QtCore.QEvent.TabletRelease):
             if self.tool == "lasso":
                 if self._transform_drag_mode:
                     self._transform_mouse_release()
                 else:
                     self._lasso_mouse_release()
-                event.accept()
-                return
+                self._tablet_stroke_active = False
+                return True
             if self._is_transform_tool():
                 self._transform_mouse_release()
-                event.accept()
-                return
+                self._tablet_stroke_active = False
+                return True
+            if self.drawing and self.current_points:
+                # Qt reports the final lift pressure on TabletRelease.  Keep
+                # it instead of ending on the last full-pressure move sample.
+                # This is what gives the clean outline its natural thin tail.
+                release_pressure = self._persistent_pressure(raw_pressure)
+                nx, ny = self._to_normalized(
+                    epos.x(), epos.y(), self._drawing_view_transform,
+                    self._drawing_uniform_transform,
+                )
+                last = self.current_points[-1]
+                last_px, last_py = self._point_to_pixel(
+                    last, self._drawing_view_transform,
+                    self._drawing_uniform_transform,
+                )
+                if math.hypot(epos.x() - last_px, epos.y() - last_py) > 0.35:
+                    self.current_points.append(StrokePoint(
+                        x=nx, y=ny, pressure=release_pressure,
+                        tilt_x=tilt_x, tilt_y=tilt_y, rotation=rotation,
+                    ))
+                else:
+                    last.pressure = min(last.pressure, release_pressure)
             self._end_stroke()
-            event.accept()
+            self._tablet_stroke_active = False
+            return True
+        return False
 
     def mousePressEvent(self, event):
         epos = get_event_pos(event)
@@ -802,7 +947,7 @@ class DrawingCanvas(QWidget):
             self._transform_mouse_press(epos, event.button(), event.modifiers())
             event.accept()
             return
-        if not self.has_tablet and event.button() == Qt.LeftButton:
+        if not self._tablet_stroke_active and event.button() == Qt.LeftButton:
             self._begin_stroke(epos, 1.0)
             event.accept()
 
@@ -820,9 +965,19 @@ class DrawingCanvas(QWidget):
             self._transform_mouse_move(epos, event.modifiers())
             event.accept()
             return
-        if not self.has_tablet and self.drawing:
+        if not self._tablet_stroke_active and self.drawing:
             self._add_point(epos, 1.0)
             event.accept()
+        elif self._tablet_stroke_active and self.drawing:
+            # Some Windows drivers send tablet pressure to the viewport but
+            # report movement to the overlay as mouse events.  Keep those
+            # positions while reusing the most recent real tablet pressure.
+            if time.monotonic() - self._last_tablet_event_time > 0.02:
+                self._add_point(epos, self._last_tablet_pressure)
+                event.accept()
+                return
+            self.last_draw_pos = epos
+            self.update()
         else:
             self.last_draw_pos = epos
             self.update()
@@ -839,7 +994,7 @@ class DrawingCanvas(QWidget):
             self._transform_mouse_release()
             event.accept()
             return
-        if not self.has_tablet and event.button() == Qt.LeftButton:
+        if not self._tablet_stroke_active and event.button() == Qt.LeftButton:
             self._end_stroke()
             event.accept()
 
@@ -852,6 +1007,22 @@ class DrawingCanvas(QWidget):
         ox = (cw - rw * s) / 2.0
         oy = (ch - rh * s) / 2.0
         return s, ox, oy, rw, rh
+
+    def _viewport_brush_scale(self, target_width=None, target_height=None):
+        """Return an isotropic scale while points follow both viewport axes.
+
+        Stroke points are normalized to the complete viewport, not to a
+        letterboxed reference rectangle.  Brush width still needs one value,
+        so the geometric mean provides a stable proportional response when
+        only one viewport dimension changes.
+        """
+        rw = float(self.data.canvas_width or self.width() or 1.0)
+        rh = float(self.data.canvas_height or self.height() or 1.0)
+        cw = float(target_width if target_width is not None else self.width())
+        ch = float(target_height if target_height is not None else self.height())
+        sx = cw / max(1.0, rw)
+        sy = ch / max(1.0, rh)
+        return max(0.001, math.sqrt(abs(sx * sy)))
 
     def _camera_shape_from_panel(self):
         panel = getattr(self, "model_panel", None) or get_active_model_panel()
@@ -1092,8 +1263,10 @@ class DrawingCanvas(QWidget):
         cy = height * 0.5
         return zoom, zoom, cx * (1.0 - zoom) + pan_x, cy * (1.0 - zoom) + pan_y
 
-    def _apply_view_panzoom(self, px, py):
-        zoom_x, zoom_y, offset_x, offset_y = self._view_panzoom_transform()
+    def _apply_view_panzoom(self, px, py, view_transform=None):
+        zoom_x, zoom_y, offset_x, offset_y = (
+            view_transform or self._view_panzoom_transform()
+        )
         if (
             abs(zoom_x - 1.0) <= 1e-8 and
             abs(zoom_y - 1.0) <= 1e-8 and
@@ -1103,8 +1276,10 @@ class DrawingCanvas(QWidget):
             return px, py
         return px * zoom_x + offset_x, py * zoom_y + offset_y
 
-    def _remove_view_panzoom(self, px, py):
-        zoom_x, zoom_y, offset_x, offset_y = self._view_panzoom_transform()
+    def _remove_view_panzoom(self, px, py, view_transform=None):
+        zoom_x, zoom_y, offset_x, offset_y = (
+            view_transform or self._view_panzoom_transform()
+        )
         if (
             abs(zoom_x - 1.0) <= 1e-8 and
             abs(zoom_y - 1.0) <= 1e-8 and
@@ -1126,14 +1301,22 @@ class DrawingCanvas(QWidget):
         if origin_zoom is None and stroke is not None:
             origin_zoom = getattr(stroke, "draw_zoom", 1.0)
         origin_zoom = max(0.001, float(origin_zoom or 1.0))
-        scale = self._uniform_transform()[0] if base_scale is None else float(base_scale)
+        scale = (
+            self._viewport_brush_scale(target_width, target_height)
+            if base_scale is None else float(base_scale)
+        )
         return scale * (self._current_panzoom_zoom(target_width, target_height) / origin_zoom)
 
     def _ensure_view_render_current(self):
+        # Camera/pan-zoom state is frozen for the duration of a stroke. Querying
+        # Maya here for every tablet sample was the largest source of input lag.
+        if self.drawing:
+            return
         token = self._current_view_token()
         if token == self._last_view_token:
             return
         self._last_view_token = token
+        self._invalidate_frame_render_cache()
         fd = self.data.frames.get(self.current_frame)
         if fd:
             for stroke in fd.strokes:
@@ -1141,22 +1324,22 @@ class DrawingCanvas(QWidget):
         self._onion_cache.clear()
         self._rebuild_current_frame()
 
-    def _to_normalized(self, px, py):
-        """Pixel del widget → coordenadas normalizadas en espacio de referencia."""
-        px, py = self._remove_view_panzoom(px, py)
-        s, ox, oy, rw, rh = self._uniform_transform()
-        denom_w = rw * s
-        denom_h = rh * s
-        nx = (px - ox) / denom_w if denom_w > 0 else 0.0
-        ny = (py - oy) / denom_h if denom_h > 0 else 0.0
+    def _to_normalized(self, px, py, view_transform=None,
+                       uniform_transform=None):
+        """Pixel del viewport → coordenadas normalizadas de pantalla."""
+        px, py = self._remove_view_panzoom(px, py, view_transform)
+        width = max(1.0, float(self.width()))
+        height = max(1.0, float(self.height()))
+        nx = px / width
+        ny = py / height
         return nx, ny
 
-    def _to_pixel(self, nx, ny):
-        """Coordenadas normalizadas → pixel del widget."""
-        s, ox, oy, rw, rh = self._uniform_transform()
-        px = nx * rw * s + ox
-        py = ny * rh * s + oy
-        return self._apply_view_panzoom(px, py)
+    def _to_pixel(self, nx, ny, view_transform=None,
+                  uniform_transform=None):
+        """Coordenadas normalizadas de pantalla → pixel del viewport."""
+        px = nx * max(1.0, float(self.width()))
+        py = ny * max(1.0, float(self.height()))
+        return self._apply_view_panzoom(px, py, view_transform)
 
     def _point_has_world(self, point):
         return (
@@ -1166,8 +1349,11 @@ class DrawingCanvas(QWidget):
             point.wz is not None
         )
 
-    def _point_to_pixel(self, point):
-        return self._to_pixel(point.x, point.y)
+    def _point_to_pixel(self, point, view_transform=None,
+                        uniform_transform=None):
+        return self._to_pixel(
+            point.x, point.y, view_transform, uniform_transform
+        )
 
     def _set_point_from_screen(self, point, px, py):
         point.x, point.y = self._to_normalized(px, py)
@@ -1182,23 +1368,115 @@ class DrawingCanvas(QWidget):
         if not stroke:
             return []
         _s, _ox, _oy, rw, rh = self._uniform_transform()
-        cache_key = (self.width(), self.height(), rw, rh, self._current_view_token())
+        view_token = self._last_view_token
+        if view_token is None:
+            view_token = self._current_view_token()
+        cache_key = (self.width(), self.height(), rw, rh, view_token)
         if stroke.smoothed_path and stroke._cache_size == cache_key:
             return stroke.smoothed_path
         raw = []
         for point in stroke.points:
             px, py = self._point_to_pixel(point)
             raw.append((px, py, point.pressure))
-        stroke.smoothed_path = self.spline.smooth_path(raw, num_interp=14)
+        # Six samples per input span are enough after tablet-point filtering.
+        # The old value (14) multiplied the amount of geometry rendered during
+        # drawing and playback without producing a visible improvement.
+        stroke.smoothed_path = self.spline.smooth_path(raw, num_interp=6)
         stroke._cache_size = cache_key
         return stroke.smoothed_path
 
     def _persistent_pressure(self, pressure, speed=0.0, tilt=0.0):
-        pressure = max(0.05, float(pressure))
-        velocity_factor = 1.0 / (1.0 + max(0.0, speed) * self.velocity_sensitivity)
-        tilt_factor = max(0.3, math.cos(math.radians(tilt * 0.5)))
-        width_factor = (pressure ** 0.6) * velocity_factor * tilt_factor
-        return max(0.05, min(4.0, width_factor ** (1.0 / 0.6)))
+        pressure = max(0.0, min(1.0, float(pressure)))
+        # Preserve the tablet's useful low-pressure range.  The previous
+        # 0.16 floor plus a strong exponent made almost every sample look the
+        # same and prevented a natural thin start/end.
+        return max(0.025, pressure ** 0.82)
+
+    def _clean_stroke_outline(self, points, base_size):
+        """Build one solid variable-width outline for a clean vector stroke.
+
+        Every stored sample contributes its pressure to the final width.  A
+        single filled outline keeps that variable line clean without the
+        opacity buildup produced by repeated brush stamps.
+        """
+        if not points:
+            return QPainterPath()
+
+        filtered = []
+        for point in points:
+            item = (float(point[0]), float(point[1]), float(point[2]))
+            if not filtered or math.hypot(
+                item[0] - filtered[-1][0], item[1] - filtered[-1][1]
+            ) >= 0.20:
+                filtered.append(item)
+            else:
+                filtered[-1] = item
+
+        if len(filtered) == 1:
+            radius = max(
+                0.25,
+                float(base_size) * max(0.05, min(1.0, filtered[0][2])) * 0.5,
+            )
+            path = QPainterPath()
+            path.setFillRule(Qt.WindingFill)
+            path.addEllipse(QPointF(filtered[0][0], filtered[0][1]), radius, radius)
+            return path
+
+        left = []
+        right = []
+        for index, (x, y, pressure) in enumerate(filtered):
+            previous = filtered[max(0, index - 1)]
+            following = filtered[min(len(filtered) - 1, index + 1)]
+            tangent_x = following[0] - previous[0]
+            tangent_y = following[1] - previous[1]
+            tangent_length = math.hypot(tangent_x, tangent_y)
+            if tangent_length <= 1e-8:
+                normal_x, normal_y = 0.0, 1.0
+            else:
+                normal_x = -tangent_y / tangent_length
+                normal_y = tangent_x / tangent_length
+
+            pressure_factor = max(0.04, min(1.0, pressure))
+            half_width = max(
+                0.25, float(base_size) * pressure_factor * 0.5
+            )
+            left.append(QPointF(x + normal_x * half_width, y + normal_y * half_width))
+            right.append(QPointF(x - normal_x * half_width, y - normal_y * half_width))
+
+        path = QPainterPath(left[0])
+        # A pressure outline can cross itself on loops, quick direction
+        # changes and ordinary line intersections.  QPainterPath defaults to
+        # OddEvenFill, which turns the overlap into a transparent hole.  The
+        # winding rule treats the outline as one solid stroke, so opacity is
+        # applied once and remains uniform through every intersection.
+        path.setFillRule(Qt.WindingFill)
+        for point in left[1:]:
+            path.lineTo(point)
+        for point in reversed(right):
+            path.lineTo(point)
+        path.closeSubpath()
+        return path
+
+    def _paint_stroke_path(self, painter, points, base_size, color, opacity,
+                           hardness, is_eraser=False):
+        if not points:
+            return
+        painter.save()
+        painter.setCompositionMode(
+            QPainter.CompositionMode_DestinationOut
+            if is_eraser else QPainter.CompositionMode_SourceOver
+        )
+        alpha = max(0, min(255, int(round(float(opacity) * color.alpha()))))
+        # DestinationOut multiplies the removed alpha by the source alpha.
+        # The eraser must therefore be fully opaque; pressure controls only
+        # its width, never how completely it removes the stroke.
+        paint_color = QColor(0, 0, 0, 255) if is_eraser else QColor(
+            color.red(), color.green(), color.blue(), alpha
+        )
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(paint_color))
+        painter.drawPath(self._clean_stroke_outline(points, base_size))
+        painter.restore()
 
     def _invalidate_stroke(self, stroke):
         stroke.smoothed_path = []
@@ -1470,6 +1748,7 @@ class DrawingCanvas(QWidget):
             return
 
         self._transform_drag_mode = mode
+        self._invalidate_frame_render_cache(self.current_frame)
         self._transform_drag_start = QPointF(pos)
         self._transform_start_rect = QRectF(rect)
         self._store_transform_undo_snapshot()
@@ -1578,6 +1857,7 @@ class DrawingCanvas(QWidget):
         self._transform_start_stroke_sizes = {}
         self._transform_current_quad = None
         self._last_transform_undo = None
+        self._invalidate_frame_render_cache(self.current_frame)
         self._rebuild_current_frame()
         self.update()
         return True
@@ -1888,40 +2168,67 @@ class DrawingCanvas(QWidget):
         painter.restore()
 
     def _begin_stroke(self, pos: QPointF, pressure: float, tilt_x: float = 0, tilt_y: float = 0, rotation: float = 0):
+        self._ensure_view_render_current()
         self.drawing = True
         self.kalman.reset(pressure)
-        self.physics.reset(pos)
         self.current_points = []
-        self._drawing_view_zoom = self._current_panzoom_zoom()
+        # Freeze all camera conversions once. Previously each accepted point
+        # recalculated this about six times through maya.cmds/OpenMaya.
+        self._drawing_view_transform = self._view_panzoom_transform()
+        zoom_x, zoom_y, _offset_x, _offset_y = self._drawing_view_transform
+        self._drawing_view_zoom = max(
+            0.001, math.sqrt(abs(float(zoom_x) * float(zoom_y)))
+        )
         # Fijar las dimensiones de referencia la primera vez que se dibuja
         if not self.data.get_frame_numbers():
             self.data.canvas_width = self.width()
             self.data.canvas_height = self.height()
-        nx, ny = self._to_normalized(pos.x(), pos.y())
+        self._drawing_uniform_transform = self._uniform_transform()
+        self._drawing_pixel_scale = self._viewport_brush_scale()
+        nx, ny = self._to_normalized(
+            pos.x(), pos.y(), self._drawing_view_transform,
+            self._drawing_uniform_transform,
+        )
         persistent_pressure = self._persistent_pressure(pressure, 0.0, tilt_x)
         pt = StrokePoint(x=nx, y=ny, pressure=persistent_pressure, tilt_x=tilt_x, tilt_y=tilt_y, rotation=rotation)
         self.current_points.append(pt)
         self.last_draw_pos = pos
+        self._last_input_pos = QPointF(pos)
         self.last_pressure = persistent_pressure
-        self.physics_timer.start()
 
         self.overlay_pixmap.fill(Qt.transparent)
+        self._stroke_base_pixmap = (
+            self.canvas_pixmap.copy() if self.tool == "eraser" else None
+        )
 
     def _add_point(self, pos: QPointF, pressure: float, tilt_x: float = 0, tilt_y: float = 0, rotation: float = 0):
         if not self.drawing: return
         smooth_pressure = self.kalman.update(pressure)
-        physics_pos = self.physics.update(pos)
-        speed = self.physics.speed()
+        if self.last_draw_pos:
+            distance = math.hypot(
+                pos.x() - self.last_draw_pos.x(), pos.y() - self.last_draw_pos.y()
+            )
+            min_spacing = max(
+                0.85,
+                self.brush_size * self._drawing_pixel_scale * 0.075,
+            )
+            if distance < min_spacing and abs(smooth_pressure - self.last_pressure) < 0.026:
+                self.last_cursor_pos = pos
+                return
 
-        nx, ny = self._to_normalized(physics_pos.x(), physics_pos.y())
-        persistent_pressure = self._persistent_pressure(smooth_pressure, speed, tilt_x)
+        nx, ny = self._to_normalized(
+            pos.x(), pos.y(), self._drawing_view_transform,
+            self._drawing_uniform_transform,
+        )
+        persistent_pressure = self._persistent_pressure(smooth_pressure, 0.0, tilt_x)
         pt = StrokePoint(x=nx, y=ny, pressure=persistent_pressure, tilt_x=tilt_x, tilt_y=tilt_y, rotation=rotation)
         self.current_points.append(pt)
 
         if self.last_draw_pos and len(self.current_points) >= 2:
             self._render_incremental(0.0, persistent_pressure, tilt_x)
 
-        self.last_draw_pos = physics_pos
+        self.last_draw_pos = QPointF(pos)
+        self._last_input_pos = QPointF(pos)
         self.last_pressure = persistent_pressure
         self.update()
 
@@ -1930,8 +2237,9 @@ class DrawingCanvas(QWidget):
         self.drawing = False
         self.physics_timer.stop()
 
-        if len(self.current_points) < 2:
+        if not self.current_points:
             self.overlay_pixmap.fill(Qt.transparent)
+            self._stroke_base_pixmap = None
             return
 
         color_tuple = (self.brush_color.red(), self.brush_color.green(), self.brush_color.blue(), self.brush_color.alpha())
@@ -1942,63 +2250,102 @@ class DrawingCanvas(QWidget):
         )
         frame_data = self.data.get_or_create_frame(self.current_frame)
         frame_data.strokes.append(stroke)
+        self._invalidate_frame_render_cache(self.current_frame)
         self._last_transform_undo = None
 
-        self._commit_overlay()
+        # Replace the lightweight live preview with a high-quality render of
+        # only the new stroke. Rebuilding every previous stroke on every mouse
+        # release made a drawing progressively slower as it grew.
+        if self.tool == "eraser" and self._stroke_base_pixmap is not None:
+            self.canvas_pixmap = QPixmap(self._stroke_base_pixmap)
+        self.overlay_pixmap.fill(Qt.transparent)
+        self._render_single_stroke(stroke, self.canvas_pixmap)
+        self._stroke_base_pixmap = None
         self.current_points = []
         self._cache_dirty = True
         self.stroke_added.emit(self.current_frame)
         self.update()
 
     def _physics_tick(self):
-        if self.drawing and self.last_draw_pos:
-            self.physics.update(self.last_draw_pos)
         self.update()
 
     def _render_incremental(self, speed: float, pressure: float, tilt: float):
+        """Paint a cheap live preview; final stroke quality is rendered on release."""
         is_eraser = (self.tool == "eraser")
         target = self.canvas_pixmap if is_eraser else self.overlay_pixmap
         painter = QPainter(target)
         painter.setRenderHint(QPainter.Antialiasing, True)
         n = len(self.current_points)
 
-        # Convertir puntos normalizados a píxeles con transformación uniforme
-        if n >= 4:
-            pts = self.current_points[-4:]
-            raw = []
-            for p in pts:
-                px, py = self._point_to_pixel(p)
-                raw.append((px, py, p.pressure))
-            seg = self.spline.smooth_path(raw, num_interp=10)
-        elif n >= 2:
-            p1, p2 = self.current_points[-2], self.current_points[-1]
-            px1, py1 = self._point_to_pixel(p1)
-            px2, py2 = self._point_to_pixel(p2)
-            seg = [(px1, py1, p1.pressure), (px2, py2, p2.pressure)]
-        else:
+        if n < 2:
             painter.end()
             return
 
-        s_uniform = self._effective_pixel_scale(draw_zoom=self._drawing_view_zoom)
-        for i in range(len(seg) - 1):
-            x1, y1, pr1 = seg[i]
-            x2, y2, pr2 = seg[i + 1]
-
-            sw = compute_stroke_width(self.brush_size * s_uniform, (pr1 + pr2)*0.5, speed, velocity_sensitivity=self.velocity_sensitivity)
-
-            if is_eraser:
-                painter.setCompositionMode(QPainter.CompositionMode_Clear)
-            else:
-                painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
-            local_alpha = int(self.brush_opacity * 255 * min(1.0, (pr1 + pr2)*0.5 + 0.1))
-            color = QColor(self.brush_color.red(), self.brush_color.green(), self.brush_color.blue(), local_alpha) if not is_eraser else QColor(0, 0, 0, 255)
-
-            pen = QPen(color)
-            pen.setWidthF(max(0.5, sw))
-            pen.setCapStyle(Qt.RoundCap)
-            pen.setJoinStyle(Qt.RoundJoin)
-            painter.setPen(pen)
+        first = self.current_points[-2]
+        second = self.current_points[-1]
+        x1, y1 = self._point_to_pixel(
+            first, self._drawing_view_transform,
+            self._drawing_uniform_transform,
+        )
+        x2, y2 = self._point_to_pixel(
+            second, self._drawing_view_transform,
+            self._drawing_uniform_transform,
+        )
+        average_pressure = (first.pressure + second.pressure) * 0.5
+        width = compute_stroke_width(
+            self.brush_size * self._drawing_pixel_scale,
+            average_pressure, speed,
+            velocity_sensitivity=self.velocity_sensitivity,
+        )
+        painter.setCompositionMode(
+            QPainter.CompositionMode_DestinationOut
+            if is_eraser else QPainter.CompositionMode_SourceOver
+        )
+        # Opacity belongs to the stroke, not to every tablet stamp.  Varying
+        # alpha per sample created dark beads where segments overlapped.
+        alpha = int(max(0.0, min(1.0,
+            self.brush_opacity * (self.brush_color.alpha() / 255.0)
+        )) * 255.0)
+        color = QColor(0, 0, 0, 255) if is_eraser else QColor(
+            self.brush_color.red(), self.brush_color.green(),
+            self.brush_color.blue(), alpha,
+        )
+        pen = QPen(color)
+        pen.setWidthF(max(0.5, width))
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        if n >= 3:
+            previous = self.current_points[-3]
+            x0, y0 = self._point_to_pixel(
+                previous, self._drawing_view_transform,
+                self._drawing_uniform_transform,
+            )
+            path = QPainterPath(QPointF((x0 + x1) * 0.5, (y0 + y1) * 0.5))
+            path.quadTo(QPointF(x1, y1), QPointF((x1 + x2) * 0.5, (y1 + y2) * 0.5))
+            painter.drawPath(path)
+        else:
             painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+        painter.end()
+
+    def _render_single_stroke(self, stroke, target):
+        """Render one completed vector stroke without rebuilding the frame."""
+        if not stroke or not stroke.points:
+            return
+        raw = []
+        for point in stroke.points:
+            px, py = self._point_to_pixel(
+                point, self._drawing_view_transform,
+                self._drawing_uniform_transform,
+            )
+            raw.append((px, py, point.pressure))
+        points = self.spline.smooth_path(raw, num_interp=6)
+        painter = QPainter(target)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        self._paint_saved_stroke(
+            painter, stroke, points, self._drawing_pixel_scale,
+            global_opacity=1.0,
+        )
         painter.end()
 
     def _commit_overlay(self):
@@ -2013,110 +2360,38 @@ class DrawingCanvas(QWidget):
         painter.end()
         self.overlay_pixmap.fill(Qt.transparent)
 
+    def _paint_saved_stroke(self, painter, stroke, points, scale,
+                            global_opacity=1.0):
+        color = QColor(*tuple(stroke.color[:4]))
+        self._paint_stroke_path(
+            painter,
+            points,
+            stroke.base_size * scale,
+            color,
+            max(0.0, min(1.0, float(stroke.opacity) * float(global_opacity))),
+            stroke.hardness,
+            is_eraser=(stroke.tool == "eraser"),
+        )
+
     def _render_frame_to_pixmap(self, frame_data: FrameData, target: QPixmap, opacity: float = 1.0):
         if not frame_data or not frame_data.strokes:
             return
 
         painter = QPainter(target)
         painter.setRenderHint(QPainter.Antialiasing, True)
+        base_scale = self._viewport_brush_scale()
+        current_zoom = self._current_panzoom_zoom()
 
         for stroke in frame_data.strokes:
-            s_uniform = self._effective_pixel_scale(stroke=stroke)
+            s_uniform = base_scale * (
+                current_zoom / max(0.001, float(stroke.draw_zoom or 1.0))
+            )
             seg = self._stroke_smoothed_path(stroke)
-            c = stroke.color
-            is_eraser = (stroke.tool == "eraser")
-
-            if is_eraser:
-                painter.setOpacity(1.0)
-                painter.setCompositionMode(QPainter.CompositionMode_Clear)
-            else:
-                painter.setOpacity(opacity)
-                painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
-
-            for i in range(len(seg) - 1):
-                x1, y1, pr1 = seg[i]
-                x2, y2, pr2 = seg[i + 1]
-                w = compute_stroke_width(stroke.base_size * s_uniform, (pr1 + pr2) * 0.5, 0)
-
-                if is_eraser:
-                    base_color = QColor(0, 0, 0, 255)
-                else:
-                    local_alpha = int(stroke.opacity * 255 * min(1.0, (pr1 + pr2)*0.5 + 0.1))
-                    base_color = QColor(c[0], c[1], c[2], local_alpha)
-
-                pen = QPen(base_color)
-                pen.setWidthF(max(0.5, w))
-                pen.setCapStyle(Qt.RoundCap)
-                pen.setJoinStyle(Qt.RoundJoin)
-                painter.setPen(pen)
-                painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
-
-        painter.end()
-
-    def render_frame_to_image(self, frame_num, target_w, target_h):
-        """Renderiza los trazos de un frame a un QImage RGBA a resolución arbitraria.
-        Pinta directo sobre QImage (NO QPixmap) para preservar canal alpha."""
-        img = QImage(target_w, target_h, QImage.Format_ARGB32)
-        img.fill(QColor(0, 0, 0, 0))
-
-        fd = self.data.frames.get(frame_num)
-        if not fd or not fd.strokes:
-            return img
-
-        rw = float(self.data.canvas_width or target_w)
-        rh = float(self.data.canvas_height or target_h)
-        s = min(target_w / max(1, rw), target_h / max(1, rh))
-        ox = (target_w - rw * s) / 2.0
-        oy = (target_h - rh * s) / 2.0
-
-        painter = QPainter(img)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        spline = CatmullRomSpline()
-        zoom_x, zoom_y, offset_x, offset_y = self._view_panzoom_transform(target_w, target_h)
-
-        for stroke in fd.strokes:
-            raw = []
-            for p in stroke.points:
-                px = p.x * rw * s + ox
-                py = p.y * rh * s + oy
-                raw.append((px * zoom_x + offset_x, py * zoom_y + offset_y, p.pressure))
-            seg = spline.smooth_path(raw, num_interp=14)
-            stroke_scale = self._effective_pixel_scale(
-                stroke=stroke,
-                base_scale=s,
-                target_width=target_w,
-                target_height=target_h,
+            self._paint_saved_stroke(
+                painter, stroke, seg, s_uniform, global_opacity=opacity
             )
 
-            is_eraser = (stroke.tool == "eraser")
-            if is_eraser:
-                painter.setOpacity(1.0)
-                painter.setCompositionMode(QPainter.CompositionMode_Clear)
-            else:
-                painter.setOpacity(1.0)
-                painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
-
-            c = stroke.color
-            for i in range(len(seg) - 1):
-                x1, y1, pr1 = seg[i]
-                x2, y2, pr2 = seg[i + 1]
-                w = compute_stroke_width(stroke.base_size * stroke_scale, (pr1 + pr2) * 0.5, 0)
-
-                if is_eraser:
-                    color = QColor(0, 0, 0, 255)
-                else:
-                    local_alpha = int(stroke.opacity * 255 * min(1.0, (pr1 + pr2) * 0.5 + 0.1))
-                    color = QColor(c[0], c[1], c[2], local_alpha)
-
-                pen = QPen(color)
-                pen.setWidthF(max(0.5, w))
-                pen.setCapStyle(Qt.RoundCap)
-                pen.setJoinStyle(Qt.RoundJoin)
-                painter.setPen(pen)
-                painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
-
         painter.end()
-        return img
 
     def _build_onion_skin(self, current_frame: int) -> QPixmap:
         w, h = self.canvas_pixmap.width(), self.canvas_pixmap.height()
@@ -2188,11 +2463,16 @@ class DrawingCanvas(QWidget):
         elif not pt:
             painter.fillRect(self.rect(), QColor(1, 1, 1, 1))
 
-        if self.onion_enabled and self._cache_dirty:
+        # Onion skins can require three extra full-frame rasterizations.  They
+        # are useful while posing, but must not compete with Maya playback.
+        if self.onion_enabled and not self._playback_mode and self._cache_dirty:
             self._onion_cache[self.current_frame] = self._build_onion_skin(self.current_frame)
             self._cache_dirty = False
 
-        if self.onion_enabled and self.current_frame in self._onion_cache:
+        if (
+            self.onion_enabled and not self._playback_mode
+            and self.current_frame in self._onion_cache
+        ):
             painter.drawPixmap(0, 0, self._onion_cache[self.current_frame])
 
         # Siempre dibujar el canvas actual
@@ -2228,17 +2508,24 @@ class DrawingCanvas(QWidget):
         self.transform_active = False
         self._last_transform_undo = None
         self._rebuild_current_frame()
-        if force_repaint:
-            # Durante cmds.play() Maya no siempre procesa el paintEvent diferido
-            # de Qt a tiempo, así que forzamos un repintado sincrónico inmediato.
-            self.repaint()
-        else:
-            self.update()
+        # Let Qt coalesce repaints when Maya advances more quickly than the UI.
+        # A synchronous repaint on every frame throttled scene playback.
+        self.update()
+
+    def set_playback_mode(self, enabled):
+        enabled = bool(enabled)
+        if enabled == self._playback_mode:
+            return
+        self._playback_mode = enabled
+        if not enabled:
+            self._cache_dirty = True
+        self.update()
 
     def undo_stroke(self):
         fd = self.data.frames.get(self.current_frame)
         if fd and fd.strokes:
             fd.strokes.pop()
+            self._invalidate_frame_render_cache(self.current_frame)
             self.selected_strokes = []
             self.transform_active = False
             self._last_transform_undo = None
@@ -2251,6 +2538,7 @@ class DrawingCanvas(QWidget):
         self.transform_active = False
         self._last_transform_undo = None
         self.data.clear_frame(self.current_frame)
+        self._invalidate_frame_render_cache(self.current_frame)
         self._rebuild_current_frame()
         self.stroke_added.emit(self.current_frame)
         self.update()
@@ -2260,6 +2548,7 @@ class DrawingCanvas(QWidget):
         self.transform_active = False
         self._last_transform_undo = None
         self.data.clear_all()
+        self._invalidate_frame_render_cache()
         self._rebuild_current_frame()
         self.stroke_added.emit(self.current_frame)
         self.update()
@@ -2274,57 +2563,24 @@ class DrawingCanvas(QWidget):
         if not fd or not fd.strokes:
             return img
 
-        rw = float(self.data.canvas_width or target_w)
-        rh = float(self.data.canvas_height or target_h)
-        s = min(target_w / max(1, rw), target_h / max(1, rh))
-        ox = (target_w - rw * s) / 2.0
-        oy = (target_h - rh * s) / 2.0
-
         painter = QPainter(img)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        spline = CatmullRomSpline()
         zoom_x, zoom_y, offset_x, offset_y = self._view_panzoom_transform(target_w, target_h)
+        current_zoom = max(
+            0.001, math.sqrt(abs(float(zoom_x) * float(zoom_y)))
+        )
 
         for stroke in fd.strokes:
             raw = []
             for p in stroke.points:
-                px = p.x * rw * s + ox
-                py = p.y * rh * s + oy
+                px = p.x * target_w
+                py = p.y * target_h
                 raw.append((px * zoom_x + offset_x, py * zoom_y + offset_y, p.pressure))
-            seg = spline.smooth_path(raw, num_interp=14)
-            stroke_scale = self._effective_pixel_scale(
-                stroke=stroke,
-                base_scale=s,
-                target_width=target_w,
-                target_height=target_h,
+            seg = self.spline.smooth_path(raw, num_interp=6)
+            stroke_scale = self._viewport_brush_scale(target_w, target_h) * (
+                current_zoom / max(0.001, float(stroke.draw_zoom or 1.0))
             )
-
-            is_eraser = (stroke.tool == "eraser")
-            if is_eraser:
-                painter.setOpacity(1.0)
-                painter.setCompositionMode(QPainter.CompositionMode_Clear)
-            else:
-                painter.setOpacity(1.0)
-                painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
-
-            c = stroke.color
-            for i in range(len(seg) - 1):
-                x1, y1, pr1 = seg[i]
-                x2, y2, pr2 = seg[i + 1]
-                w = compute_stroke_width(stroke.base_size * stroke_scale, (pr1 + pr2) * 0.5, 0)
-
-                if is_eraser:
-                    color = QColor(0, 0, 0, 255)
-                else:
-                    local_alpha = int(stroke.opacity * 255 * min(1.0, (pr1 + pr2) * 0.5 + 0.1))
-                    color = QColor(c[0], c[1], c[2], local_alpha)
-
-                pen = QPen(color)
-                pen.setWidthF(max(0.5, w))
-                pen.setCapStyle(Qt.RoundCap)
-                pen.setJoinStyle(Qt.RoundJoin)
-                painter.setPen(pen)
-                painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+            self._paint_saved_stroke(painter, stroke, seg, stroke_scale, global_opacity=1.0)
 
         painter.end()
         return img
@@ -2767,7 +3023,7 @@ class ToolPanel(QWidget):
             popup_y = self.mapToGlobal(pos).y() - dialog.sizeHint().height() - 8
 
         dialog.move(popup_x, popup_y)
-        dialog.exec_()
+        execute_qt(dialog)
 
 # ═══════════════════════════════════════════════════════════════════════
 #  MÓDULO 5b: ONION SKIN SETTINGS DIALOG
@@ -3089,19 +3345,102 @@ class SketchboardWindow(QWidget):
         self._sidebar_opacity_effect = None
         self._sidebar_full_height = 0
         self._hud_width_hint = 0
+        self._tablet_event_filter_installed = False
         self._last_polled_frame = None
+        self._timeline_keys_dirty = False
+        self._scene_commit_timer = QTimer(self)
+        self._scene_commit_timer.setSingleShot(True)
+        self._scene_commit_timer.setInterval(350)
+        self._scene_commit_timer.timeout.connect(self._flush_deferred_scene_commit)
 
         self._build_ui()
         self._connect_signals()
         self._load_scene_session()
         self._sync_timeline()
+
+        if self.is_overlay:
+            self._install_tablet_event_filter()
         
         if self.is_overlay and self.viewport_parent:
             self.sync_timer = QTimer(self)
             self.sync_timer.timeout.connect(self._sync_geometry)
             self.sync_timer.timeout.connect(self._poll_current_frame)
-            self.sync_timer.start(16)
+            # 30 Hz is enough for viewport/frame synchronization and leaves
+            # more main-thread time for high-frequency tablet events.
+            self.sync_timer.start(33)
             self._sync_geometry()
+
+    def _install_tablet_event_filter(self):
+        """Capture pen events that Windows routes to Maya's model panel."""
+        if self._tablet_event_filter_installed:
+            return
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+        app.installEventFilter(self)
+        self._tablet_event_filter_installed = True
+
+    def _remove_tablet_event_filter(self):
+        if not self._tablet_event_filter_installed:
+            return
+        try:
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self)
+        except (RuntimeError, AttributeError):
+            pass
+        self._tablet_event_filter_installed = False
+
+    def _is_canvas_widget(self, widget):
+        """Whether *widget* is the canvas or one of its children."""
+        while widget is not None:
+            if widget is self.canvas:
+                return True
+            if widget is self:
+                return False
+            try:
+                widget = widget.parentWidget()
+            except (AttributeError, RuntimeError):
+                return False
+        return False
+
+    def eventFilter(self, watched, event):
+        """Route off-target tablet events into the visible drawing canvas.
+
+        The event filter deliberately leaves the canvas' own events alone and
+        only redirects events landing in an unobstructed canvas area.  Toolbar
+        controls and Navigation mode retain their normal Maya/Qt behavior.
+        """
+        tablet_events = (
+            int(QtCore.QEvent.TabletPress),
+            int(QtCore.QEvent.TabletMove),
+            int(QtCore.QEvent.TabletRelease),
+        )
+        try:
+            is_tablet_event = int(event.type()) in tablet_events
+        except Exception:
+            is_tablet_event = False
+
+        if (
+            is_tablet_event
+            and self.is_overlay
+            and self.isVisible()
+            and getattr(self, "_brush_overlay_enabled", True)
+            and not self.canvas.testAttribute(Qt.WA_TransparentForMouseEvents)
+            and not self._is_canvas_widget(watched)
+        ):
+            global_pos = get_event_global_pos(event)
+            if global_pos is not None:
+                window_pos = self.mapFromGlobal(QPoint(
+                    int(round(global_pos.x())), int(round(global_pos.y()))
+                ))
+                target = self.childAt(window_pos)
+                if target is not None and self._is_canvas_widget(target):
+                    if self.canvas.handle_external_tablet_event(event, global_pos):
+                        event.accept()
+                        return True
+
+        return super(SketchboardWindow, self).eventFilter(watched, event)
 
     def _poll_current_frame(self):
         """
@@ -3113,23 +3452,27 @@ class SketchboardWindow(QWidget):
         """
         if not getattr(self, "_brush_overlay_enabled", True) or not self.isVisible():
             return
+        if hasattr(self, "canvas") and self.canvas.drawing:
+            return
         try:
             curr = int(round(cmds.currentTime(query=True)))
+            is_playing = bool(cmds.play(query=True, state=True))
         except Exception:
             return
+        self.canvas.set_playback_mode(is_playing)
         if curr == self._last_polled_frame:
             return
         self._last_polled_frame = curr
-        try:
-            is_playing = bool(cmds.play(query=True, state=True))
-        except Exception:
-            is_playing = False
         self.canvas.set_frame(curr, force_repaint=is_playing)
         fd = self.canvas.data.frames.get(curr)
         self.status_bar.setText(f"Frame: {curr} | Strokes: {len(fd.strokes) if fd else 0}")
 
     def _sync_geometry(self):
         if not getattr(self, "_brush_overlay_enabled", True):
+            return
+        # Do not run model-panel discovery or force an extra canvas repaint in
+        # the middle of a stroke. Mouse/tablet events already repaint it.
+        if hasattr(self, "canvas") and self.canvas.drawing:
             return
 
         # Actualización dinámica del target en caso de que Maya rearme sus docks
@@ -3599,25 +3942,26 @@ class SketchboardWindow(QWidget):
 
     def _on_undo_requested(self):
         if self.canvas.undo_last_transform():
-            self.timeline.update_keys()
-            self._save_scene_session()
+            self._schedule_scene_commit(update_timeline=False)
             self.status_bar.setText(f"Frame: {self.canvas.current_frame} | Transform undo")
             return
         self.canvas.undo_stroke()
-        self.timeline.update_keys()
-        self._save_scene_session()
+        self._schedule_scene_commit(update_timeline=True)
         self._on_frame_changed(self.canvas.current_frame)
 
     def _on_clear_requested(self):
         self.canvas.clear_current_frame()
-        self.timeline.update_keys()
-        self._save_scene_session()
+        self._schedule_scene_commit(update_timeline=True)
         self._on_frame_changed(self.canvas.current_frame)
 
     def _on_stroke_added(self, frame):
-        self.timeline.update_keys()
-        self._save_scene_session()
         fd = self.canvas.data.frames.get(frame)
+        # Timeline ticks only change when the first stroke is added to a frame.
+        # Scene serialization is debounced so several quick strokes do not
+        # repeatedly encode the entire board between mouse releases.
+        self._schedule_scene_commit(
+            update_timeline=bool(fd and len(fd.strokes) == 1)
+        )
         self.status_bar.setText(f"Frame: {frame} | Strokes: {len(fd.strokes) if fd else 0}")
 
     def _on_frame_changed(self, frame):
@@ -3626,6 +3970,13 @@ class SketchboardWindow(QWidget):
             is_playing = bool(cmds.play(query=True, state=True))
         except Exception:
             is_playing = False
+        self.canvas.set_playback_mode(is_playing)
+        frame = int(frame)
+        if frame == self.canvas.current_frame:
+            return
+        # Keep the polling fallback in sync with the scriptJob so the same
+        # playback frame is never rasterized twice.
+        self._last_polled_frame = frame
         self.canvas.set_frame(frame, force_repaint=is_playing)
         fd = self.canvas.data.frames.get(frame)
         self.status_bar.setText(f"Frame: {frame} | Strokes: {len(fd.strokes) if fd else 0}")
@@ -3641,11 +3992,28 @@ class SketchboardWindow(QWidget):
     def _save_scene_session(self):
         save_brush_data_to_scene(self.canvas.data)
 
+    def _schedule_scene_commit(self, update_timeline=False):
+        self._timeline_keys_dirty = (
+            self._timeline_keys_dirty or bool(update_timeline)
+        )
+        self._scene_commit_timer.start()
+
+    def _flush_deferred_scene_commit(self):
+        # Never serialize a growing board while tablet events are arriving.
+        if hasattr(self, "canvas") and self.canvas.drawing:
+            self._scene_commit_timer.start()
+            return
+        if self._timeline_keys_dirty:
+            self.timeline.update_keys()
+            self._timeline_keys_dirty = False
+        self._save_scene_session()
+
     def _load_scene_session(self):
         data = load_brush_data_from_scene(self.canvas.width(), self.canvas.height())
         if data is None:
             return False
         self.canvas.data = data
+        self.canvas._invalidate_frame_render_cache()
         self.timeline.data_ref = self.canvas.data
         self.canvas.set_frame(self.canvas.current_frame)
         self.timeline.update_keys()
@@ -3672,8 +4040,7 @@ class SketchboardWindow(QWidget):
     def _export_json(self, path):
         """Exporta como JSON legible."""
         data = self.canvas.data.to_dict()
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        atomic_write_json(path, data, indent=2, ensure_ascii=False)
         self._save_scene_session()
         self.status_bar.setText(f"💾 Saved: {os.path.basename(path)}")
 
@@ -3760,7 +4127,7 @@ class SketchboardWindow(QWidget):
         msg.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
         msg.setDefaultButton(QtWidgets.QMessageBox.Yes)
         
-        reply = msg.exec_()
+        reply = execute_qt(msg)
         if reply == QtWidgets.QMessageBox.Yes:
             try:
                 import maya.cmds as cmds
@@ -4109,6 +4476,13 @@ class SketchboardWindow(QWidget):
 
     def closeEvent(self, event):
         global _instance
+        self._remove_tablet_event_filter()
+        try:
+            if self._scene_commit_timer.isActive():
+                self._scene_commit_timer.stop()
+                self._flush_deferred_scene_commit()
+        except Exception:
+            pass
         try:
             if hasattr(self, "sync_timer") and self.sync_timer:
                 self.sync_timer.stop()
@@ -4222,7 +4596,7 @@ if __name__ == "__main__":
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
         win = SketchboardWindow(overlay=False)
         win.show()
-        sys.exit(app.exec_())
+        sys.exit(execute_qt(app))
 
 _instance = None
 def close_instance():

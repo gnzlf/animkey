@@ -6,7 +6,11 @@
 
 import os
 import json
+import copy
 import maya.cmds as cmds
+
+from AnimKey.mods.storage import atomic_write_json, backup_corrupt_file, deep_merge
+from AnimKey.version import __version__ as ANIMKEY_VERSION
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -66,6 +70,8 @@ DEFAULT_CONFIG = {
     },
     "viewport_roll_gimbal_enabled": False,
     "tumble_around_selection_enabled": False,
+    # Recovery is opt-out: it starts with AnimKey unless the animator turns it off.
+    "crash_recovery_enabled": True,
     
     # Window Settings
     "window_opacity": 1.0,
@@ -116,16 +122,14 @@ class ConfigManager:
         if os.path.exists(config_path):
             try:
                 with open(config_path, 'r') as f:
-                    self._config = json.load(f)
-                # Merge with defaults for any missing keys
-                for key, value in DEFAULT_CONFIG.items():
-                    if key not in self._config:
-                        self._config[key] = value
+                    loaded = json.load(f)
+                self._config = deep_merge(DEFAULT_CONFIG, loaded)
             except (json.JSONDecodeError, IOError):
-                self._config = DEFAULT_CONFIG.copy()
+                backup_corrupt_file(config_path)
+                self._config = copy.deepcopy(DEFAULT_CONFIG)
                 self._save_config()
         else:
-            self._config = DEFAULT_CONFIG.copy()
+            self._config = copy.deepcopy(DEFAULT_CONFIG)
             self._save_config()
     
     def _save_config(self):
@@ -136,8 +140,7 @@ class ConfigManager:
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
         
         try:
-            with open(config_path, 'w') as f:
-                json.dump(self._config, f, indent=4)
+            atomic_write_json(config_path, self._config)
         except IOError as e:
             cmds.warning(f"AnimKey: Could not save configuration: {e}")
     
@@ -154,14 +157,14 @@ class ConfigManager:
         """Reset configuration to defaults"""
         if key:
             if key in DEFAULT_CONFIG:
-                self._config[key] = DEFAULT_CONFIG[key]
+                self._config[key] = copy.deepcopy(DEFAULT_CONFIG[key])
         else:
-            self._config = DEFAULT_CONFIG.copy()
+            self._config = copy.deepcopy(DEFAULT_CONFIG)
         self._save_config()
     
     def get_all(self):
         """Get all configuration as dictionary"""
-        return self._config.copy()
+        return copy.deepcopy(self._config)
     
     def update(self, config_dict):
         """Update multiple configuration values at once"""
@@ -209,7 +212,7 @@ def get_animation_backup_folder(create=True):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 VERSION_INFO = {
-    "version": "0.1.0",
+    "version": ANIMKEY_VERSION,
     "build": "001",
     "name": "AnimKey",
     "author": "AnimKey Team",
@@ -243,7 +246,7 @@ DEFAULT_WORKSPACE = {
         "RST": True, "TMP": True, "OFF": True, "HIR": True, "MIR": True,
         "C": True, "LKN": True, "CAM": True, "WS": True, "PIV": True, "RUL": True,
         "PLT": True, "STP": True, "FLT": True, "LIN": True, "CLP": True, "SPL": True, "AUT": True,
-        "RBK": True, "GMB": True, "COL": True, "BAK": True, "RTM": True, "ACL": True, "BTNS": True, "SETS": True, "CRASH": True
+        "RBK": True, "GMB": True, "SWT": True, "BAK": True, "RTM": True, "ACL": True, "BTNS": True, "SETS": True, "CRASH": True
     },
 
     "sliders": {
@@ -284,7 +287,11 @@ def load_workspace():
                     "other": DEFAULT_WORKSPACE["other"].copy()
                 }
                 if "buttons" in saved_workspace:
-                    workspace["buttons"].update(saved_workspace["buttons"])
+                    saved_buttons = saved_workspace["buttons"].copy()
+                    if "SWT" not in saved_buttons and "COL" in saved_buttons:
+                        saved_buttons["SWT"] = saved_buttons["COL"]
+                    saved_buttons.pop("COL", None)
+                    workspace["buttons"].update(saved_buttons)
                     legacy_trail_key = "T" + "RC"
                     if legacy_trail_key in workspace["buttons"]:
                         workspace["buttons"]["TRL"] = workspace["buttons"].pop(legacy_trail_key)
@@ -296,13 +303,14 @@ def load_workspace():
                     workspace["order"] = saved_workspace["order"]
                     legacy_trail_key = "T" + "RC"
                     workspace["order"] = [
-                        "TRL" if item == legacy_trail_key else item
+                        "TRL" if item == legacy_trail_key else
+                        "SWT" if item == "COL" else item
                         for item in workspace["order"]
                     ]
                     
                 return workspace
         except (json.JSONDecodeError, IOError):
-            pass
+            backup_corrupt_file(workspace_file)
     
     return {
         "buttons": DEFAULT_WORKSPACE["buttons"].copy(),
@@ -319,8 +327,7 @@ def save_workspace(workspace):
     
     try:
         os.makedirs(os.path.dirname(workspace_file), exist_ok=True)
-        with open(workspace_file, 'w') as f:
-            json.dump(workspace, f, indent=4)
+        atomic_write_json(workspace_file, workspace)
         return True
     except IOError as e:
         cmds.warning(f"AnimKey: Could not save workspace: {e}")
@@ -334,8 +341,7 @@ def export_workspace_preset(filepath):
     workspace = load_workspace()
     
     try:
-        with open(filepath, 'w') as f:
-            json.dump(workspace, f, indent=4)
+        atomic_write_json(filepath, workspace)
         return True
     except IOError as e:
         cmds.warning(f"AnimKey: Could not export workspace preset: {e}")

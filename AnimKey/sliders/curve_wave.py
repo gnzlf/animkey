@@ -20,7 +20,8 @@ from AnimKey.sliders.slider_utils import (
     get_selection_guide_frames,
     get_processing_context,
     get_value_at_time,
-    should_process_attribute
+    should_process_attribute,
+    slider_attribute_is_editable,
 )
 
 
@@ -38,7 +39,7 @@ def prepare_curve_data(objs=None, attrs=None):
     global _curve_data_cache, _processing_context
     _curve_data_cache = {}
     
-    _processing_context = get_processing_context()
+    _processing_context = get_processing_context(explicit_attributes=attrs is not None)
     selected_channels = _processing_context.get('selected_channels')
     
     objects = objs if objs else cmds.ls(selection=True)
@@ -117,7 +118,7 @@ def execute(percentage):
         try:
             if not cmds.objExists(attr_full):
                 continue
-            if cmds.getAttr(attr_full, lock=True) or not cmds.getAttr(attr_full, settable=True):
+            if not slider_attribute_is_editable(attr_full):
                 continue
             
             original_value = cache.get("originalValue")

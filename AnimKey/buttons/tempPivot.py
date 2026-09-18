@@ -12,15 +12,16 @@ import maya.cmds as cmds
 import maya.api.OpenMaya as om
 import maya.OpenMayaUI as omui
 import json
+import math
 import os
 from AnimKey.mods.uiMod import ContextPopupWindow
+from AnimKey.mods.storage import atomic_write_json, backup_corrupt_file
 
-try:
-    from PySide2 import QtWidgets, QtCore, QtGui
-    from shiboken2 import wrapInstance
-except ImportError:
-    from PySide6 import QtWidgets, QtCore, QtGui
-    from shiboken6 import wrapInstance
+from AnimKey.mods.maya_compat import (
+    QtCore, QtGui, QtWidgets, screen_available_geometry,
+    wrap_instance as wrapInstance,
+)
+from AnimKey.core.animation_curve_transfer import resolve_anim_curve, selected_time_range
 
 TOOL_TAG = "TEMP_CTRL_MATRIX_V2"
 WINDOW_OBJECT = "AnimKey_TempControl"
@@ -30,14 +31,287 @@ TEMP_BAKE_ATTRS = [
     'translateX', 'translateY', 'translateZ',
     'rotateX', 'rotateY', 'rotateZ'
 ]
+TEMP_PIVOT_PREFS_FILE = "temp_pivot_offsets.json"
+TEMP_PIVOT_MATRIX_EPSILON = 1e-5
+TEMP_PIVOT_MAX_BAKE_SAMPLES = 10000
+TEMP_PIVOT_MONITOR_INTERVAL_MS = 50
 
 # Global window reference
 _temp_pivot_window = None
 _temp_pivot_restore_state = None
 _temp_pivot_monitor = None
+_temp_pivot_edit_filter = None
+
+
+class _TempPivotEditFilter(QtCore.QObject):
+    """Wake the low-frequency monitor immediately after an edit gesture."""
+
+    def eventFilter(self, watched, event):
+        event_type = event.type()
+        event_types = getattr(QtCore.QEvent, "Type", QtCore.QEvent)
+        if event_type in (
+            event_types.MouseButtonRelease,
+            event_types.KeyRelease,
+        ):
+            QtCore.QTimer.singleShot(0, _monitor_temp_pivot_edit_mode)
+        return False
 
 def get_maya_main_window():
     return wrapInstance(int(omui.MQtUtil.mainWindow()), QtWidgets.QWidget)
+
+
+def _temp_pivot_prefs_path():
+    """Prefs path for reusable TEMP pivot offsets."""
+    try:
+        from AnimKey.mods import configMod
+        folder = os.path.join(configMod.get_user_folder_path(), "tools", "temp_pivot")
+    except Exception:
+        folder = os.path.join(
+            cmds.internalVar(userAppDir=True),
+            "AnimKey_user_data",
+            "tools",
+            "temp_pivot",
+        )
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+    return os.path.join(folder, TEMP_PIVOT_PREFS_FILE)
+
+
+def _empty_temp_pivot_offsets():
+    return {"single_offsets": {}, "multi_offsets": []}
+
+
+def _load_temp_pivot_offsets():
+    path = _temp_pivot_prefs_path()
+    if not os.path.exists(path):
+        return _empty_temp_pivot_offsets()
+    try:
+        with open(path, "r") as stream:
+            data = json.load(stream) or {}
+    except Exception:
+        backup_corrupt_file(path)
+        return _empty_temp_pivot_offsets()
+
+    if not isinstance(data.get("single_offsets"), dict):
+        data["single_offsets"] = {}
+    if not isinstance(data.get("multi_offsets"), list):
+        data["multi_offsets"] = []
+    return data
+
+
+def _save_temp_pivot_offsets(data):
+    path = _temp_pivot_prefs_path()
+    atomic_write_json(path, data or _empty_temp_pivot_offsets())
+
+
+def _world_matrix(node):
+    return om.MMatrix(cmds.xform(node, query=True, worldSpace=True, matrix=True))
+
+
+def _matrix_translation(matrix_value):
+    values = list(matrix_value)
+    return [float(values[12]), float(values[13]), float(values[14])]
+
+
+def _pivot_matrix_from_position(position, orientation_source=None):
+    if orientation_source and cmds.objExists(orientation_source):
+        values = list(_world_matrix(orientation_source))
+    else:
+        values = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+    values[12] = float(position[0])
+    values[13] = float(position[1])
+    values[14] = float(position[2])
+    return om.MMatrix(values)
+
+
+def _offset_to_world_position(offset_values, obj):
+    try:
+        if not offset_values or len(offset_values) != 16 or not cmds.objExists(obj):
+            return None
+        if _is_identity_matrix_values(offset_values):
+            return list(cmds.xform(obj, query=True, worldSpace=True, rotatePivot=True))
+        pivot_matrix = om.MMatrix(offset_values) * _world_matrix(obj)
+        return _matrix_translation(pivot_matrix)
+    except Exception:
+        return None
+
+
+def _is_identity_matrix_values(values):
+    if not values or len(values) != 16:
+        return False
+    identity = [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    ]
+    try:
+        return all(abs(float(a) - float(b)) < 0.0001 for a, b in zip(values, identity))
+    except Exception:
+        return False
+
+
+def _find_multi_offset_group(data, objects):
+    sorted_objects = sorted(objects or [])
+    for group in data.get("multi_offsets", []):
+        if sorted(group.get("objects", [])) == sorted_objects:
+            return group
+    return None
+
+
+def _stored_temp_pivot_position(objects, pivot_mode="last"):
+    objects = _selected_temp_pivot_objects(objects)
+    if not objects:
+        return None
+
+    data = _load_temp_pivot_offsets()
+    if len(objects) == 1:
+        return _offset_to_world_position(
+            data.get("single_offsets", {}).get(objects[0]),
+            objects[0],
+        )
+
+    if pivot_mode != "last":
+        return None
+
+    group = _find_multi_offset_group(data, objects)
+    if not group:
+        return None
+
+    reference = group.get("reference")
+    reference_offset = group.get("offset_matrix")
+    if reference not in objects or not cmds.objExists(reference):
+        reference = objects[-1]
+    if reference_offset:
+        position = _offset_to_world_position(reference_offset, reference)
+        if position:
+            return position
+
+    # Backward compatibility with offsets saved by older AnimKey versions.
+    positions = []
+    offsets = group.get("offsets", {})
+    for obj in objects:
+        position = _offset_to_world_position(offsets.get(obj), obj)
+        if position:
+            positions.append(position)
+    if not positions:
+        return None
+
+    return [
+        sum(position[i] for position in positions) / float(len(positions))
+        for i in range(3)
+    ]
+
+
+def _save_temp_pivot_offsets_for_objects(objects, pivot_position):
+    objects = _selected_temp_pivot_objects(objects)
+    if not objects or not pivot_position:
+        return False
+
+    data = _load_temp_pivot_offsets()
+    pivot_matrix = _pivot_matrix_from_position(pivot_position, objects[-1])
+
+    if len(objects) == 1:
+        obj = objects[0]
+        try:
+            data["single_offsets"][obj] = list(pivot_matrix * _world_matrix(obj).inverse())
+        except Exception:
+            return False
+    else:
+        offsets = {}
+        for obj in objects:
+            if not cmds.objExists(obj):
+                continue
+            try:
+                offsets[obj] = list(pivot_matrix * _world_matrix(obj).inverse())
+            except Exception:
+                pass
+        if not offsets:
+            return False
+
+        group = _find_multi_offset_group(data, objects)
+        if group is None:
+            data["multi_offsets"].append({
+                "objects": list(objects),
+                "offsets": offsets,
+                "reference": objects[-1],
+                "offset_matrix": list(
+                    pivot_matrix * _world_matrix(objects[-1]).inverse()
+                ),
+            })
+        else:
+            group["objects"] = list(objects)
+            group["offsets"] = offsets
+            group["reference"] = objects[-1]
+            group["offset_matrix"] = list(
+                pivot_matrix * _world_matrix(objects[-1]).inverse()
+            )
+
+    _save_temp_pivot_offsets(data)
+    return True
+
+
+def reset_temp_pivot_offsets(objects=None):
+    """Reset TEMP pivot offsets to object center or last selected, like Animo."""
+    selected_objects = _selected_temp_pivot_objects(objects)
+    if not selected_objects:
+        cmds.warning("AnimKey Temp Pivot: nothing selected.")
+        return False
+
+    data = _load_temp_pivot_offsets()
+    if len(selected_objects) == 1:
+        obj = selected_objects[0]
+        data["single_offsets"][obj] = [
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1,
+        ]
+        pivot_position = list(cmds.xform(obj, query=True, worldSpace=True, rotatePivot=True))
+    else:
+        last_obj = selected_objects[-1]
+        last_matrix = _world_matrix(last_obj)
+        offsets = {}
+        for obj in selected_objects:
+            try:
+                offsets[obj] = list(last_matrix * _world_matrix(obj).inverse())
+            except Exception:
+                pass
+
+        group = _find_multi_offset_group(data, selected_objects)
+        if group is None:
+            data["multi_offsets"].append({
+                "objects": list(selected_objects),
+                "offsets": offsets,
+                "reference": last_obj,
+                "offset_matrix": [
+                    1, 0, 0, 0,
+                    0, 1, 0, 0,
+                    0, 0, 1, 0,
+                    0, 0, 0, 1,
+                ],
+            })
+        else:
+            group["objects"] = list(selected_objects)
+            group["offsets"] = offsets
+            group["reference"] = last_obj
+            group["offset_matrix"] = [
+                1, 0, 0, 0,
+                0, 1, 0, 0,
+                0, 0, 1, 0,
+                0, 0, 0, 1,
+            ]
+
+        pivot_position = list(cmds.xform(last_obj, query=True, worldSpace=True, rotatePivot=True))
+
+    _save_temp_pivot_offsets(data)
+    if is_active():
+        try:
+            cmds.manipPivot(position=pivot_position)
+            cmds.manipPivot(pinPivot=True)
+        except Exception:
+            pass
+    return True
 
 
 def _selected_temp_pivot_objects(selection=None):
@@ -76,6 +350,10 @@ def _selected_temp_pivot_objects(selection=None):
 
 
 def _temp_pivot_position(objects, pivot_mode="last"):
+    stored_position = _stored_temp_pivot_position(objects, pivot_mode=pivot_mode)
+    if stored_position:
+        return stored_position
+
     if pivot_mode == "center":
         bounds = cmds.exactWorldBoundingBox(objects)
         return [
@@ -97,6 +375,72 @@ def _query_rotate_context_flag(flag, default=False):
         return cmds.manipRotateContext("Rotate", query=True, **{flag: True})
     except Exception:
         return default
+
+
+def _capture_temp_pivot_curve_state(objects):
+    """Capture only transform keys needed to detect edits made this session."""
+    result = {}
+    for obj in objects or []:
+        if not cmds.objExists(obj):
+            continue
+        for attr in TEMP_BAKE_ATTRS:
+            plug = obj + "." + attr
+            if not cmds.objExists(plug):
+                continue
+            curves = []
+            layers = cmds.ls(type="animLayer") or []
+            for layer in layers:
+                try:
+                    curve = resolve_anim_curve(plug, layer_name=layer)
+                except Exception:
+                    curve = None
+                if curve and curve not in curves:
+                    curves.append(curve)
+            if not curves:
+                try:
+                    curves = cmds.keyframe(plug, query=True, name=True) or []
+                except Exception:
+                    curves = []
+            for curve in curves:
+                try:
+                    curve_id = (cmds.ls(curve, uuid=True) or [curve])[0]
+                    times = [
+                        round(float(value), 10)
+                        for value in (cmds.keyframe(curve, query=True, timeChange=True) or [])
+                    ]
+                    values = [
+                        float(value)
+                        for value in (cmds.keyframe(curve, query=True, valueChange=True) or [])
+                    ]
+                except Exception:
+                    continue
+                result[curve_id] = {
+                    "object": obj,
+                    "attribute": attr,
+                    "times": times,
+                    "values": values,
+                }
+    return result
+
+
+def _temp_pivot_changed_key_times(state):
+    """Return key times added, removed, or value-edited since activation."""
+    before = (state or {}).get("transform_curve_state", {})
+    after = _capture_temp_pivot_curve_state((state or {}).get("objects", []))
+    changed = set()
+
+    for curve_id in set(before).union(after):
+        old = before.get(curve_id, {})
+        new = after.get(curve_id, {})
+        old_values = dict(zip(old.get("times", []), old.get("values", [])))
+        new_values = dict(zip(new.get("times", []), new.get("values", [])))
+        for frame in set(old_values).union(new_values):
+            if frame not in old_values or frame not in new_values:
+                changed.add(float(frame))
+                continue
+            if abs(float(old_values[frame]) - float(new_values[frame])) > 1e-8:
+                changed.add(float(frame))
+    return sorted(changed)
 
 
 def _capture_temp_pivot_state(objects):
@@ -124,6 +468,8 @@ def _capture_temp_pivot_state(objects):
     return {
         "objects": list(objects),
         "object_pivots": object_pivots,
+        "activation_time": float(cmds.currentTime(query=True)),
+        "transform_curve_state": _capture_temp_pivot_curve_state(objects),
         "tool_context": cmds.currentCtx(),
         "manip_valid": manip_valid,
         "manip_position": (
@@ -147,14 +493,22 @@ def _capture_temp_pivot_state(objects):
     }
 
 
-def _restore_object_pivots(state):
+def _restore_object_pivots(state, preserve_current_pose=True):
+    """Restore object pivot attributes.
+
+    ``preserve_current_pose`` is useful for a simple pivot reset.  Temp Pivot
+    deactivation deliberately disables it, because it must first restore the
+    original pivot at every sampled time and then bake the compensation.
+    """
     for obj, pivots in (state or {}).get("object_pivots", {}).items():
         if not cmds.objExists(obj):
             continue
         try:
-            world_matrix = cmds.xform(
-                obj, query=True, worldSpace=True, matrix=True
-            )
+            world_matrix = None
+            if preserve_current_pose:
+                world_matrix = cmds.xform(
+                    obj, query=True, worldSpace=True, matrix=True
+                )
             for attr, value_key in (
                 ("rotatePivot", "rotate_pivot"),
                 ("scalePivot", "scale_pivot"),
@@ -168,19 +522,283 @@ def _restore_object_pivots(state):
                         *value,
                         type="double3"
                     )
-            cmds.xform(obj, worldSpace=True, matrix=world_matrix)
+            if world_matrix is not None:
+                cmds.xform(obj, worldSpace=True, matrix=world_matrix)
         except Exception as exc:
             cmds.warning(
                 "Temp Pivot: could not restore pivot for {}: {}".format(obj, exc)
             )
 
 
+def _values_match(first, second, epsilon=TEMP_PIVOT_MATRIX_EPSILON):
+    if first is None or second is None or len(first) != len(second):
+        return False
+    try:
+        return all(
+            abs(float(left) - float(right)) <= epsilon
+            for left, right in zip(first, second)
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _temp_pivot_objects_changed(state):
+    """Return whether Maya's edit-pivot mode changed any real object pivot."""
+    for obj, pivots in (state or {}).get("object_pivots", {}).items():
+        if not cmds.objExists(obj):
+            continue
+        try:
+            current_values = {
+                "rotate_pivot": list(
+                    cmds.xform(obj, query=True, objectSpace=True, rotatePivot=True)
+                ),
+                "scale_pivot": list(
+                    cmds.xform(obj, query=True, objectSpace=True, scalePivot=True)
+                ),
+                "rotate_pivot_translate": list(
+                    cmds.getAttr(obj + ".rotatePivotTranslate")[0]
+                ),
+                "scale_pivot_translate": list(
+                    cmds.getAttr(obj + ".scalePivotTranslate")[0]
+                ),
+            }
+        except Exception:
+            continue
+        for key, current_value in current_values.items():
+            if not _values_match(pivots.get(key), current_value):
+                return True
+    return False
+
+
+def _temp_pivot_dependency_nodes(objects):
+    """Include parents whose animation changes the selected controls' world pose."""
+    nodes = []
+    seen = set()
+    for obj in objects:
+        current = obj
+        while current and current not in seen:
+            seen.add(current)
+            nodes.append(current)
+            parents = cmds.listRelatives(
+                current, parent=True, fullPath=True
+            ) or []
+            current = parents[0] if parents else None
+    return nodes
+
+
+def _temp_pivot_sample_times(objects, state=None):
+    """Sample only the interval actually edited while Temp Pivot was active."""
+    selected_range = None
+    if not cmds.about(batch=True):
+        selected_range = selected_time_range()
+    current_time = float(cmds.currentTime(query=True))
+
+    if selected_range:
+        start, end = selected_range
+    else:
+        changed_times = _temp_pivot_changed_key_times(state)
+        if changed_times:
+            start = min(changed_times)
+            end = max(changed_times)
+        else:
+            start = current_time
+            end = current_time
+
+    range_start, range_end = float(start), float(end)
+    start = min(range_start, range_end)
+    end = max(range_start, range_end)
+    integer_start = int(math.ceil(start))
+    integer_end = int(math.floor(end))
+    values = {round(start, 10), round(end, 10)}
+    if integer_end >= integer_start:
+        values.update(float(frame) for frame in range(integer_start, integer_end + 1))
+
+    try:
+        key_times = cmds.keyframe(
+            objects, query=True, time=(start, end), timeChange=True
+        ) or []
+    except Exception:
+        key_times = []
+    for value in key_times:
+        value = float(value)
+        if start <= value <= end:
+            values.add(round(value, 10))
+
+    times = sorted(values)
+    if len(times) > TEMP_PIVOT_MAX_BAKE_SAMPLES:
+        raise RuntimeError(
+            "Temp Pivot range has {} samples. Select a shorter Time Slider range "
+            "(maximum {}).".format(len(times), TEMP_PIVOT_MAX_BAKE_SAMPLES)
+        )
+    return times
+
+
+def _world_matrix_values(obj):
+    return [
+        float(value)
+        for value in cmds.xform(obj, query=True, worldSpace=True, matrix=True)
+    ]
+
+
+def _sample_temp_pivot_world_matrices(objects, times):
+    samples = {}
+    current_time = cmds.currentTime(query=True)
+    try:
+        for frame in times:
+            cmds.currentTime(frame, edit=True)
+            for obj in objects:
+                if cmds.objExists(obj):
+                    samples.setdefault(obj, {})[frame] = _world_matrix_values(obj)
+    finally:
+        cmds.currentTime(current_time, edit=True)
+    return samples
+
+
+def _sample_temp_pivot_transform_values(objects, times):
+    samples = {}
+    current_time = cmds.currentTime(query=True)
+    try:
+        for frame in times:
+            cmds.currentTime(frame, edit=True)
+            for obj in objects:
+                if not cmds.objExists(obj):
+                    continue
+                object_samples = samples.setdefault(obj, {})
+                for attr in TEMP_BAKE_ATTRS:
+                    plug = obj + "." + attr
+                    if not cmds.objExists(plug):
+                        continue
+                    try:
+                        object_samples.setdefault(attr, []).append(
+                            (frame, float(cmds.getAttr(plug)))
+                        )
+                    except Exception:
+                        pass
+    finally:
+        cmds.currentTime(current_time, edit=True)
+    return samples
+
+
+def _restore_transform_sample(obj, values):
+    """Undo a temporary xform solve without touching connected anim curves."""
+    for attr, value in values.items():
+        plug = obj + "." + attr
+        try:
+            if not cmds.getAttr(plug, lock=True):
+                cmds.setAttr(plug, value)
+        except Exception:
+            pass
+
+
+def _solve_temp_pivot_transform_values(objects, times, world_samples, base_samples):
+    """Solve channel values that reproduce the pre-reset world matrices."""
+    final_samples = {}
+    current_time = cmds.currentTime(query=True)
+    try:
+        for frame in times:
+            cmds.currentTime(frame, edit=True)
+            for obj in objects:
+                desired_matrix = world_samples.get(obj, {}).get(frame)
+                if not desired_matrix or not cmds.objExists(obj):
+                    continue
+                base_values = {
+                    attr: dict(values).get(frame)
+                    for attr, values in base_samples.get(obj, {}).items()
+                }
+                try:
+                    cmds.xform(obj, worldSpace=True, matrix=desired_matrix)
+                except Exception:
+                    continue
+                for attr in TEMP_BAKE_ATTRS:
+                    plug = obj + "." + attr
+                    if attr not in base_values or not cmds.objExists(plug):
+                        continue
+                    try:
+                        final_samples.setdefault(obj, {}).setdefault(attr, []).append(
+                            (frame, float(cmds.getAttr(plug)))
+                        )
+                    except Exception:
+                        pass
+                _restore_transform_sample(obj, {
+                    attr: value for attr, value in base_values.items()
+                    if value is not None
+                })
+    finally:
+        cmds.currentTime(current_time, edit=True)
+    return final_samples
+
+
+def _capture_anim_layer_selection():
+    selected = []
+    for layer in cmds.ls(type="animLayer") or []:
+        try:
+            if cmds.animLayer(layer, query=True, selected=True):
+                selected.append(layer)
+        except Exception:
+            pass
+    return selected
+
+
+def _restore_anim_layer_selection(selected_layers):
+    for layer in cmds.ls(type="animLayer") or []:
+        try:
+            cmds.animLayer(layer, edit=True, selected=layer in selected_layers)
+        except Exception:
+            pass
+
+
+def _bake_temp_pivot_compensation(state):
+    """Restore edited pivots and preserve the resulting animation on a layer.
+
+    Editing a Maya pivot changes the transform evaluation at every frame.  A
+    one-frame restore therefore makes the visible animation jump when TEMP is
+    turned off.  This records the evaluated motion before restoring the real
+    pivots, then writes only the required delta to a dedicated additive layer.
+    """
+    objects = [
+        obj for obj in (state or {}).get("objects", []) if cmds.objExists(obj)
+    ]
+    if not objects or not _temp_pivot_objects_changed(state):
+        return None, 0
+
+    times = _temp_pivot_sample_times(objects, state=state)
+    world_samples = _sample_temp_pivot_world_matrices(objects, times)
+    selected_layers = _capture_anim_layer_selection()
+    current_time = cmds.currentTime(query=True)
+
+    try:
+        _restore_object_pivots(state, preserve_current_pose=False)
+        base_samples = _sample_temp_pivot_transform_values(objects, times)
+        final_samples = _solve_temp_pivot_transform_values(
+            objects, times, world_samples, base_samples
+        )
+        if not final_samples:
+            return None, 0
+
+        layer = _create_temp_bake_layer(objects)
+        key_count = _key_temp_bake_layer(
+            layer, final_samples, base_samples, min(times), max(times)
+        )
+        return layer, key_count
+    finally:
+        cmds.currentTime(current_time, edit=True)
+        _restore_anim_layer_selection(selected_layers)
+
+
 def _stop_temp_pivot_monitor():
-    global _temp_pivot_monitor
+    global _temp_pivot_monitor, _temp_pivot_edit_filter
 
     timer = _temp_pivot_monitor
     _temp_pivot_monitor = None
     application = QtWidgets.QApplication.instance()
+    event_filter = _temp_pivot_edit_filter
+    _temp_pivot_edit_filter = None
+    if application is not None and event_filter is not None:
+        try:
+            application.removeEventFilter(event_filter)
+            event_filter.deleteLater()
+        except RuntimeError:
+            pass
     if application is not None:
         for existing in application.findChildren(
             QtCore.QTimer, "AnimKeyTempPivotMonitor"
@@ -227,15 +845,21 @@ def _current_temp_pivot_position(state=None):
 
 
 def _finalize_temp_pivot_edit(pivot_position=None):
-    """Keep the custom manipulator pivot while restoring object pivots early."""
+    """Leave pivot-edit mode while keeping the temporary pivot active.
+
+    Maya can write real rotate/scale pivot attributes while the user positions
+    the handle.  Do not restore those attributes here: restoring them before
+    the animation has been sampled is what caused TEMP to change the pose.
+    They are restored and compensated atomically when TEMP is switched off.
+    """
     global _temp_pivot_restore_state
 
     state = _temp_pivot_restore_state
-    if not state or state.get("pivots_finalized"):
+    if not state or state.get("pivot_edit_finished"):
         return False
 
     pivot_position = pivot_position or _current_temp_pivot_position(state)
-    _restore_object_pivots(state)
+    _save_temp_pivot_offsets_for_objects(state.get("objects", []), pivot_position)
 
     cmds.manipRotateContext(
         "Rotate",
@@ -252,8 +876,8 @@ def _finalize_temp_pivot_edit(pivot_position=None):
     state["custom_pivot_position"] = (
         list(pivot_position) if pivot_position else None
     )
-    state["pivots_finalized"] = True
     state["edit_mode_seen"] = False
+    state["pivot_edit_finished"] = True
     return True
 
 
@@ -262,7 +886,7 @@ def _monitor_temp_pivot_edit_mode():
     if not state:
         _stop_temp_pivot_monitor()
         return
-    if state.get("pivots_finalized"):
+    if state.get("pivot_edit_finished"):
         _stop_temp_pivot_monitor()
         return
 
@@ -293,7 +917,7 @@ def _monitor_temp_pivot_edit_mode():
 
 
 def _start_temp_pivot_monitor():
-    global _temp_pivot_monitor
+    global _temp_pivot_monitor, _temp_pivot_edit_filter
 
     _stop_temp_pivot_monitor()
     application = QtWidgets.QApplication.instance()
@@ -302,10 +926,14 @@ def _start_temp_pivot_monitor():
 
     timer = QtCore.QTimer(application)
     timer.setObjectName("AnimKeyTempPivotMonitor")
-    timer.setInterval(16)
+    timer.setInterval(TEMP_PIVOT_MONITOR_INTERVAL_MS)
     timer.timeout.connect(_monitor_temp_pivot_edit_mode)
     timer.start()
     _temp_pivot_monitor = timer
+
+    event_filter = _TempPivotEditFilter(application)
+    application.installEventFilter(event_filter)
+    _temp_pivot_edit_filter = event_filter
 
 
 def activate_temp_pivot(objects=None, pivot_mode="last", edit_pivot=True):
@@ -321,8 +949,9 @@ def activate_temp_pivot(objects=None, pivot_mode="last", edit_pivot=True):
     _temp_pivot_restore_state = _capture_temp_pivot_state(selected_objects)
     _temp_pivot_restore_state.update({
         "custom_pivot_position": list(pivot_position),
-        "pivots_finalized": not edit_pivot,
+        "pivots_finalized": False,
         "edit_mode_seen": bool(edit_pivot),
+        "pivot_edit_finished": not edit_pivot,
     })
     undo_open = False
     try:
@@ -365,7 +994,7 @@ def activate_temp_pivot(objects=None, pivot_mode="last", edit_pivot=True):
 
 
 def deactivate_temp_pivot():
-    """Clear the custom pivot and restore Maya's previous manipulator state."""
+    """Clear TEMP while preserving animation made around the temporary pivot."""
     global _temp_pivot_restore_state
 
     _stop_temp_pivot_monitor()
@@ -381,9 +1010,12 @@ def deactivate_temp_pivot():
                 cmds.setToolTo("RotateSuperContext")
             cmds.ctxEditMode()
 
-        if not restore_state.get("pivots_finalized", False):
-            _restore_object_pivots(restore_state)
-            restore_state["pivots_finalized"] = True
+        pivot_position = _current_temp_pivot_position(restore_state)
+        _save_temp_pivot_offsets_for_objects(
+            restore_state.get("objects", []), pivot_position
+        )
+        layer, keyed_channels = _bake_temp_pivot_compensation(restore_state)
+        restore_state["pivots_finalized"] = True
 
         cmds.manipPivot(pinPivot=False)
         cmds.manipPivot(reset=True)
@@ -419,6 +1051,19 @@ def deactivate_temp_pivot():
             )
         ):
             cmds.ctxEditMode()
+
+        if layer and keyed_channels:
+            try:
+                cmds.inViewMessage(
+                    amg=(
+                        "<hl>Temp Pivot</hl> animation preserved on "
+                        "<hl>{}</hl>".format(layer)
+                    ),
+                    pos="midCenterTop",
+                    fade=True,
+                )
+            except Exception:
+                pass
 
         _temp_pivot_restore_state = None
         return True
@@ -495,11 +1140,23 @@ def _temp_anim_layer_name():
             return name
         index += 1
 
+def _interval_sample_times(start_frame, end_frame):
+    """Return dense UI-frame samples while preserving fractional endpoints."""
+    start = min(float(start_frame), float(end_frame))
+    end = max(float(start_frame), float(end_frame))
+    values = {round(start, 10), round(end, 10)}
+    first_integer = int(math.ceil(start))
+    last_integer = int(math.floor(end))
+    if last_integer >= first_integer:
+        values.update(float(frame) for frame in range(first_integer, last_integer + 1))
+    return sorted(values)
+
+
 def _sample_transform_values(objects, start_frame, end_frame):
     samples = {}
     current_time = cmds.currentTime(query=True)
     try:
-        for frame in range(int(start_frame), int(end_frame) + 1):
+        for frame in _interval_sample_times(start_frame, end_frame):
             cmds.currentTime(frame, edit=True)
             for obj in objects:
                 if not cmds.objExists(obj):
@@ -595,7 +1252,7 @@ def _create_temp_bake_layer(controlled):
 
 def _key_temp_bake_layer(layer, final_samples, base_samples, start_frame, end_frame):
     keyed_channels = 0
-    guard_frames = [int(start_frame) - 1, int(end_frame) + 1]
+    guard_frames = [float(start_frame) - 1.0, float(end_frame) + 1.0]
 
     for obj, obj_samples in final_samples.items():
         if not cmds.objExists(obj):
@@ -718,7 +1375,22 @@ def _controlled_from_temp_network(temp_controls=None):
             if "." not in plug:
                 continue
             obj, attr = plug.rsplit(".", 1)
-            if attr in TEMP_BAKE_ATTRS:
+            if attr not in TEMP_BAKE_ATTRS or not cmds.objExists(obj):
+                continue
+            # TEMP nodes are legitimate destinations in the matrix and
+            # follow networks, but they are implementation details rather
+            # than controls that Smart Bake is allowed to touch.
+            try:
+                is_temp_node = (
+                    obj.split("|")[-1].startswith("TEMP_CTRL")
+                    or (
+                        cmds.attributeQuery("tempTag", node=obj, exists=True)
+                        and cmds.getAttr(obj + ".tempTag") == TOOL_TAG
+                    )
+                )
+            except Exception:
+                is_temp_node = obj.split("|")[-1].startswith("TEMP_CTRL")
+            if not is_temp_node:
                 controlled.append(obj)
 
     return _unique_existing(controlled)
@@ -824,46 +1496,97 @@ def get_frame_range():
     end = int(cmds.playbackOptions(query=True, maxTime=True))
     return start, end
 
-def get_smart_frame_range(objects):
-    """
-    Bake inteligente: detecta el rango real de keyframes
-    de los objetos controlados y locators temporales.
-    Usa el rango mas amplio entre keys existentes y timeline.
-    """
-    key_times = []
-    
-    # Buscar keyframes en los locators temporales (tienen la animacion bakeada)
-    tagged = get_tagged()
-    for node in tagged:
-        if not cmds.objExists(node):
-            continue
-        if "_TEMP_loc" in node:
-            keys = cmds.keyframe(node, query=True, timeChange=True)
-            if keys:
-                key_times.extend(keys)
-    
-    # Tambien verificar los objetos controlados
-    for obj in objects:
-        if not cmds.objExists(obj):
-            continue
-        keys = cmds.keyframe(obj, query=True, timeChange=True)
-        if keys:
-            key_times.extend(keys)
-    
+def _all_temp_controls():
+    return _unique_existing([
+        node for node in get_tagged()
+        if cmds.objExists(node)
+        and node.split("|")[-1].startswith("TEMP_CTRL")
+        and not node.split("|")[-1].endswith("_OFFSET")
+    ])
+
+
+def _transform_key_times(nodes):
+    key_times = set()
+    curve_state = _capture_temp_pivot_curve_state(_unique_existing(nodes))
+    for curve_data in curve_state.values():
+        key_times.update(
+            round(float(value), 10)
+            for value in curve_data.get("times", [])
+        )
+    return sorted(key_times)
+
+
+def _explicit_temp_range():
+    if cmds.about(batch=True):
+        return None
+    try:
+        value = selected_time_range()
+    except Exception:
+        value = None
+    if not value:
+        return None
+    return tuple(sorted((float(value[0]), float(value[1]))))
+
+
+def _has_transform_driver(nodes):
+    """Detect non-curve upstream motion that requires the playback range."""
+    for node in _unique_existing(nodes):
+        for attr in TEMP_BAKE_ATTRS:
+            try:
+                sources = cmds.listConnections(
+                    node + "." + attr,
+                    source=True,
+                    destination=False,
+                    skipConversionNodes=True,
+                ) or []
+            except Exception:
+                sources = []
+            for source in sources:
+                try:
+                    if not cmds.nodeType(source).startswith("animCurve"):
+                        return True
+                except Exception:
+                    return True
+    return False
+
+
+def _temp_control_creation_range(objects):
+    """Smallest safe source-motion range used to build temporary locators."""
+    explicit_range = _explicit_temp_range()
+    if explicit_range:
+        return explicit_range
+
+    dependency_nodes = _temp_pivot_dependency_nodes(objects)
+    key_times = _transform_key_times(dependency_nodes)
     if key_times:
-        key_start = int(min(key_times))
-        key_end = int(max(key_times))
-    else:
-        key_start, key_end = get_frame_range()
-    
-    # Usar el rango del timeline como referencia
-    tl_start, tl_end = get_frame_range()
-    
-    # Usar el rango mas amplio
-    final_start = min(key_start, tl_start)
-    final_end = max(key_end, tl_end)
-    
-    return final_start, final_end
+        return float(min(key_times)), float(max(key_times))
+
+    if _has_transform_driver(dependency_nodes):
+        start, end = get_frame_range()
+        return float(start), float(end)
+
+    current = float(cmds.currentTime(query=True))
+    return current, current
+
+
+def get_smart_frame_range(objects, temp_controls=None):
+    """Return only the interval explicitly edited with the temp control.
+
+    Locator and controlled-object curves describe the original shot, not the
+    animator's Temp Pivot edit.  Including them was the reason Smart Bake
+    wrote compensation across the whole playback range.
+    """
+    explicit_range = _explicit_temp_range()
+    if explicit_range:
+        return explicit_range
+
+    controls = temp_controls or get_selected_temp_controls() or _all_temp_controls()
+    key_times = _transform_key_times(controls)
+    if key_times:
+        return float(min(key_times)), float(max(key_times))
+
+    current = float(cmds.currentTime(query=True))
+    return current, current
 
 def get_controlled_objects():
     """Buscar todos los objetos marcados como controlados.
@@ -921,6 +1644,14 @@ def filter_controlled_by_temp_controls(controlled, temp_controls):
     filtered.extend(_controlled_from_temp_network(temp_controls))
     return _unique_existing(filtered)
 
+
+def _can_drive_temp_attr(obj, attr):
+    plug = obj + "." + attr
+    try:
+        return cmds.objExists(plug) and not cmds.getAttr(plug, lock=True)
+    except Exception:
+        return False
+
 def create_temp_control_for_object(ctrl, ctrl_grp, obj, start_frame, end_frame):
     base_name = obj.split(":")[-1].split("|")[-1]
     obj_parent = cmds.listRelatives(obj, parent=True, fullPath=True)
@@ -975,6 +1706,8 @@ def create_temp_control_for_object(ctrl, ctrl_grp, obj, start_frame, end_frame):
     
     for attr in attrs_to_check:
         full_attr = obj + "." + attr
+        if not _can_drive_temp_attr(obj, attr):
+            continue
         conns = cmds.listConnections(full_attr, source=True, 
                                       plugs=True, destination=False)
         if conns:
@@ -1053,14 +1786,15 @@ def create_temp_control_for_object(ctrl, ctrl_grp, obj, start_frame, end_frame):
             cmds.setAttr(jo_compose + ".inputRotateY", jo_y)
             cmds.setAttr(jo_compose + ".inputRotateZ", jo_z)
             cmds.setAttr(jo_compose + ".inputRotateOrder", ro)
-            
-            jo_inv = cmds.createNode("inverseMatrix", 
-                                     name=base_name + "_TEMP_joInv")
-            tag(jo_inv)
-            add_string_attr(jo_inv, "tempControlOwner", ctrl)
-            _parent_under_temp_container(jo_inv)
-            cmds.connectAttr(jo_compose + ".outputMatrix", 
-                           jo_inv + ".inputMatrix")
+
+            # Maya has no built-in ``inverseMatrix`` dependency node.  Build
+            # the joint-orient inverse once from composeMatrix instead, then
+            # feed it directly into multMatrix.  This keeps the decompose
+            # result in the joint's rotate space on every supported Maya.
+            jo_matrix = _flat_vector(
+                cmds.getAttr(jo_compose + ".outputMatrix")
+            )
+            jo_inverse = list(om.MMatrix(jo_matrix).inverse())
             
             mult_jo = cmds.createNode("multMatrix", 
                                       name=base_name + "_TEMP_multJO")
@@ -1069,8 +1803,9 @@ def create_temp_control_for_object(ctrl, ctrl_grp, obj, start_frame, end_frame):
             _parent_under_temp_container(mult_jo)
             cmds.connectAttr(mult + ".matrixSum", 
                            mult_jo + ".matrixIn[0]")
-            cmds.connectAttr(jo_inv + ".outputMatrix", 
-                           mult_jo + ".matrixIn[1]")
+            cmds.setAttr(
+                mult_jo + ".matrixIn[1]", *jo_inverse, type="matrix"
+            )
             
             decomp_jo = cmds.createNode("decomposeMatrix", 
                                         name=base_name + "_TEMP_decompJO")
@@ -1082,28 +1817,34 @@ def create_temp_control_for_object(ctrl, ctrl_grp, obj, start_frame, end_frame):
                            decomp_jo + ".inputMatrix")
             
             for axis in ['X', 'Y', 'Z']:
-                cmds.connectAttr(
-                    decomp + ".outputTranslate" + axis, 
-                    obj + ".translate" + axis, force=True)
-                cmds.connectAttr(
-                    decomp_jo + ".outputRotate" + axis, 
-                    obj + ".rotate" + axis, force=True)
+                if _can_drive_temp_attr(obj, "translate" + axis):
+                    cmds.connectAttr(
+                        decomp + ".outputTranslate" + axis,
+                        obj + ".translate" + axis, force=True)
+                if _can_drive_temp_attr(obj, "rotate" + axis):
+                    cmds.connectAttr(
+                        decomp_jo + ".outputRotate" + axis,
+                        obj + ".rotate" + axis, force=True)
         else:
             for axis in ['X', 'Y', 'Z']:
-                cmds.connectAttr(
-                    decomp + ".outputTranslate" + axis, 
-                    obj + ".translate" + axis, force=True)
-                cmds.connectAttr(
-                    decomp + ".outputRotate" + axis, 
-                    obj + ".rotate" + axis, force=True)
+                if _can_drive_temp_attr(obj, "translate" + axis):
+                    cmds.connectAttr(
+                        decomp + ".outputTranslate" + axis,
+                        obj + ".translate" + axis, force=True)
+                if _can_drive_temp_attr(obj, "rotate" + axis):
+                    cmds.connectAttr(
+                        decomp + ".outputRotate" + axis,
+                        obj + ".rotate" + axis, force=True)
     else:
         for axis in ['X', 'Y', 'Z']:
-            cmds.connectAttr(
-                decomp + ".outputTranslate" + axis, 
-                obj + ".translate" + axis, force=True)
-            cmds.connectAttr(
-                decomp + ".outputRotate" + axis, 
-                obj + ".rotate" + axis, force=True)
+            if _can_drive_temp_attr(obj, "translate" + axis):
+                cmds.connectAttr(
+                    decomp + ".outputTranslate" + axis,
+                    obj + ".translate" + axis, force=True)
+            if _can_drive_temp_attr(obj, "rotate" + axis):
+                cmds.connectAttr(
+                    decomp + ".outputRotate" + axis,
+                    obj + ".rotate" + axis, force=True)
     
     return loc
 
@@ -1132,7 +1873,7 @@ def create_group_control(objects, pivot_mode="center", follow=True):
         return None
     
     _create_temp_controls_container()
-    start_frame, end_frame = get_frame_range()
+    start_frame, end_frame = _temp_control_creation_range(objects)
     
     # Determinar posicion y rotacion del control
     ctrl_rot = [0, 0, 0]
@@ -1205,7 +1946,7 @@ def create_individual_controls(objects):
         return []
     
     _create_temp_controls_container()
-    start_frame, end_frame = get_frame_range()
+    start_frame, end_frame = _temp_control_creation_range(objects)
     controls = []
     
     for obj in objects:
@@ -1278,8 +2019,14 @@ def smart_bake_and_delete():
             cmds.warning("Temp Control: no active temp controls found.")
         return False
     
-    start_frame, end_frame = get_smart_frame_range(controlled)
-    
+    active_temp_controls = (
+        selected_temp_controls if selected_temp_controls else _all_temp_controls()
+    )
+    start_frame, end_frame = get_smart_frame_range(
+        controlled, active_temp_controls
+    )
+    selected_layers = _capture_anim_layer_selection()
+
     cmds.undoInfo(openChunk=True)
     try:
         final_samples = _sample_transform_values(controlled, start_frame, end_frame)
@@ -1325,6 +2072,7 @@ def smart_bake_and_delete():
             pass
         return False
     finally:
+        _restore_anim_layer_selection(selected_layers)
         cmds.undoInfo(closeChunk=True)
 
 def _cleanup_temp_system(controlled=None, temp_controls=None):
@@ -1387,7 +2135,13 @@ def _cleanup_temp_system(controlled=None, temp_controls=None):
     _cleanup_empty_temp_container()
 
 def delete_temp_system():
-    _cleanup_temp_system()
+    controlled = get_controlled_objects()
+    # Deleting a temporary control is a cancel operation.  Its original
+    # animation must be reconnected before the matrix nodes are removed;
+    # otherwise the control is left at whichever value happened to be
+    # evaluated in the current frame.
+    _restore_original_animation(controlled)
+    _cleanup_temp_system(controlled)
     return True
 
 # =============================================================================
@@ -1571,12 +2325,7 @@ class TempPivotWindow(ContextPopupWindow):
             btn_top_y = btn_top_left.y()
             btn_bottom_y = btn_top_y + btn_rect.height()
 
-            screen = QtWidgets.QApplication.screenAt(btn_top_left) if hasattr(QtWidgets.QApplication, 'screenAt') else None
-            if screen:
-                screen_rect = screen.availableGeometry()
-            else:
-                desktop = QtWidgets.QApplication.desktop()
-                screen_rect = desktop.availableGeometry(self.anchor_button)
+            screen_rect = screen_available_geometry(self.anchor_button, btn_top_left)
 
             x_pos = btn_center_x - self.width() // 2
             if x_pos < screen_rect.left():

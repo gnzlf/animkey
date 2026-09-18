@@ -24,6 +24,7 @@ from AnimKey.sliders.slider_utils import (
     get_slider_value,
     get_value_at_time,
     should_process_attribute,
+    slider_attribute_is_editable,
     slider_amount
 )
 
@@ -47,7 +48,7 @@ def prepare_blend_data(objs=None, attrs=None):
     global _blend_undo_data_cache, _processing_context
     _blend_undo_data_cache = {}
     
-    _processing_context = get_processing_context()
+    _processing_context = get_processing_context(explicit_attributes=attrs is not None)
     selected_channels = _processing_context.get('selected_channels')
     
     objects = objs if objs else cmds.ls(selection=True)
@@ -154,7 +155,6 @@ def execute(percentage):
     for cache_key, cache in _blend_undo_data_cache.items():
         attr_full = cache.get("attr_full")
         frame = cache.get("frame")
-        has_keyframe = cache.get("hasKeyframe", False)
         
         if not attr_full:
             continue
@@ -162,7 +162,7 @@ def execute(percentage):
         try:
             if not cmds.objExists(attr_full):
                 continue
-            if cmds.getAttr(attr_full, lock=True) or not cmds.getAttr(attr_full, settable=True):
+            if not slider_attribute_is_editable(attr_full):
                 continue
             
             current_value = cache.get("currentValue")
@@ -197,10 +197,7 @@ def execute(percentage):
                 pass
             
             # Apply value
-            if has_keyframe:
-                apply_slider_value(attr_full, frame, blended_value, current_time)
-            else:
-                cmds.setAttr(attr_full, blended_value)
+            apply_slider_value(attr_full, frame, blended_value, current_time)
             
         except Exception:
             continue
@@ -216,16 +213,12 @@ def reset():
             try:
                 attr_full = cache_data.get("attr_full")
                 frame = cache_data.get("frame")
-                has_keyframe = cache_data.get("hasKeyframe", False)
                 
                 if not attr_full:
                     continue
                 
                 # Get the current value after slider manipulation
-                if has_keyframe:
-                    current_value = get_slider_value(attr_full, frame, current_time)
-                else:
-                    current_value = cmds.getAttr(attr_full)
+                current_value = get_slider_value(attr_full, frame, current_time)
                 
                 if isinstance(current_value, (list, tuple)):
                     if len(current_value) == 1:

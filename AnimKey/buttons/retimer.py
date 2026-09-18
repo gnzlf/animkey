@@ -13,12 +13,9 @@ import maya.mel as mel
 import maya.OpenMayaUI as omui
 import json
 
-try:
-    from PySide2 import QtWidgets, QtCore, QtGui
-    from shiboken2 import wrapInstance
-except ImportError:
-    from PySide6 import QtWidgets, QtCore, QtGui
-    from shiboken6 import wrapInstance
+from AnimKey.mods.maya_compat import (
+    QtCore, QtGui, QtWidgets, wrap_instance as wrapInstance,
+)
 
 
 WINDOW_OBJECT = "AnimKey_Retimer"

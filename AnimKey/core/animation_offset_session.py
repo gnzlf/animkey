@@ -8,16 +8,14 @@ from dataclasses import dataclass, field
 from enum import Enum
 import logging
 import time
+from typing import Dict, Optional, Tuple
 
 import maya.cmds as cmds
 import maya.mel as mel
 import maya.api.OpenMaya as om
 import maya.api.OpenMayaAnim as oma
 
-try:
-    from PySide2 import QtCore, QtWidgets
-except ImportError:
-    from PySide6 import QtCore, QtWidgets
+from AnimKey.mods.maya_compat import QtCore, QtWidgets
 
 from AnimKey.core.animation_offset_math import (
     FRAME_EPSILON,
@@ -35,7 +33,7 @@ from AnimKey.core.animation_offset_math import (
 
 LOGGER = logging.getLogger("AnimKey.AnimationOffset")
 
-ANIMATION_OFFSET_ENGINE_REVISION = 3
+ANIMATION_OFFSET_ENGINE_REVISION = 5
 
 SUPPORTED_TYPES = {
     "double",
@@ -73,17 +71,18 @@ class TrackState:
     node_path: str
     attr: str
     attr_type: str
-    curve: str | None
-    target_layer: str | None
-    key_times: tuple[float, ...]
-    key_values: dict[float, float]
-    key_indices: dict[float, int]
-    evaluated_baselines: dict[float, float] = field(default_factory=dict)
+    curve: Optional[str]
+    target_layer: Optional[str]
+    key_times: Tuple[float, ...]
+    key_values: Dict[float, float]
+    key_indices: Dict[float, int]
+    observe_plug: bool = True
+    evaluated_baselines: Dict[float, float] = field(default_factory=dict)
     applied_delta: float = 0.0
     dirty: bool = False
-    dirty_time: float | None = None
-    last_observed_value: float | None = None
-    pending_key_values: dict[float, float] = field(default_factory=dict)
+    dirty_time: Optional[float] = None
+    last_observed_value: Optional[float] = None
+    pending_key_values: Dict[float, float] = field(default_factory=dict)
 
     @property
     def plug(self):
@@ -184,18 +183,10 @@ def get_selected_animation_layer():
     if not all_layers:
         return None
 
-    selected = []
-    for layer in all_layers:
-        try:
-            if cmds.animLayer(layer, query=True, selected=True):
-                selected.append(layer)
-        except Exception:
-            continue
-
-    if selected:
-        real_layers = [layer for layer in selected if not _is_base_layer(layer)]
-        return (real_layers or selected)[-1]
-
+    # Maya can leave an older layer marked as ``selected`` while the layer
+    # that will actually receive keys is marked ``preferred``.  The latter is
+    # the authoritative state used by the animation editors, so resolve it
+    # first (the same ordering used by Animo's Global Offset).
     preferred = []
     for layer in all_layers:
         try:
@@ -206,6 +197,17 @@ def get_selected_animation_layer():
     if preferred:
         real_layers = [layer for layer in preferred if not _is_base_layer(layer)]
         return (real_layers or preferred)[-1]
+
+    selected = []
+    for layer in all_layers:
+        try:
+            if cmds.animLayer(layer, query=True, selected=True):
+                selected.append(layer)
+        except Exception:
+            continue
+    if selected:
+        real_layers = [layer for layer in selected if not _is_base_layer(layer)]
+        return (real_layers or selected)[-1]
 
     try:
         root_layer = cmds.animLayer(query=True, root=True)
@@ -273,6 +275,38 @@ def _fallback_layer_curve_for_attr(attr_full_name, layer_name):
                     return curve
         except Exception:
             continue
+    return None
+
+
+def _find_curve_for_layer_plug(attr_full_name, layer_name):
+    """Use Maya's native layer lookup before walking the blend graph.
+
+    ``findCurveForPlug`` is substantially more reliable for custom facial
+    attributes and nested animation layers than inferring ownership only from
+    connections.  Older Maya releases can reject the flag for BaseAnimation,
+    so every call remains guarded and the existing graph resolver is kept as
+    the fallback.
+    """
+    if not layer_name:
+        return None
+    for candidate in _plug_candidates(attr_full_name):
+        try:
+            result = cmds.animLayer(
+                layer_name,
+                query=True,
+                findCurveForPlug=candidate,
+            )
+        except Exception:
+            continue
+        curves = result if isinstance(result, (list, tuple)) else [result]
+        for curve in curves:
+            if not curve:
+                continue
+            try:
+                if cmds.objExists(curve) and cmds.nodeType(curve).startswith("animCurve"):
+                    return curve
+            except Exception:
+                continue
     return None
 
 
@@ -355,8 +389,107 @@ def _layered_plug_for_attr(attr_full_name, layer_name):
     return None
 
 
-def resolve_target_curve_for_layer(attr_full_name, layer_name):
+def _blend_input_weight_attr(input_attr):
+    """Return the blend weight that controls one anim-layer input plug."""
+    if input_attr.startswith("inputA"):
+        return "weightA"
+    if input_attr.startswith("inputB"):
+        return "weightB"
+    return None
+
+
+def _blend_output_attr(input_attr):
+    """Map inputA/inputBX style names to output/outputX."""
+    if input_attr.startswith("inputA") or input_attr.startswith("inputB"):
+        suffix = input_attr[6:]
+        return "output{}".format(suffix)
+    return None
+
+
+def _layer_output_influence(attr_full_name, layer_name):
+    """
+    Return the effective contribution of a layer driver to the final channel.
+
+    Maya exposes the evaluated foreground/background weights on every
+    animBlendNode. Following those values is more reliable than reconstructing
+    mute, solo, override and nested-layer rules ourselves, and works for both
+    scalar and rotation blend nodes.
+    """
     if not _has_any_animation_layers():
+        return 1.0
+
+    current_plug = _layered_plug_for_attr(attr_full_name, layer_name)
+    if not current_plug:
+        return None
+
+    influence = 1.0
+    visited = set()
+    while current_plug and current_plug not in visited:
+        visited.add(current_plug)
+        node, input_attr = _split_plug(current_plug)
+        if not node or not input_attr:
+            return None
+        try:
+            node_type = cmds.nodeType(node)
+        except Exception:
+            return None
+        if not node_type.startswith("animBlendNode"):
+            return 1.0 if _plugs_match(current_plug, attr_full_name) else None
+
+        weight_attr = _blend_input_weight_attr(input_attr)
+        output_attr = _blend_output_attr(input_attr)
+        if not weight_attr or not output_attr:
+            return None
+        try:
+            influence *= float(cmds.getAttr("{}.{}".format(node, weight_attr)))
+        except Exception:
+            return None
+
+        output_plug = "{}.{}".format(node, output_attr)
+        try:
+            destinations = cmds.listConnections(
+                output_plug,
+                source=False,
+                destination=True,
+                plugs=True,
+                skipConversionNodes=True,
+            ) or []
+        except Exception:
+            return None
+
+        if any(_plugs_match(destination, attr_full_name) for destination in destinations):
+            return influence
+
+        current_plug = None
+        for destination in destinations:
+            destination_node, destination_attr = _split_plug(destination)
+            try:
+                destination_type = cmds.nodeType(destination_node)
+            except Exception:
+                continue
+            if destination_type.startswith("animBlendNode") and _blend_input_weight_attr(destination_attr):
+                current_plug = destination
+                break
+
+    return None
+
+
+def _layer_is_locked(layer_name):
+    if not layer_name:
+        return False
+    try:
+        if not cmds.animLayer(layer_name, query=True, exists=True):
+            return True
+        return bool(cmds.getAttr("{}.lock".format(layer_name)))
+    except Exception:
+        return False
+
+
+def resolve_target_curve_for_layer(attr_full_name, layer_name,
+                                   has_animation_layers=None):
+    if has_animation_layers is None:
+        has_animation_layers = _has_any_animation_layers()
+    if not has_animation_layers:
         try:
             curves = cmds.listConnections(
                 attr_full_name,
@@ -367,7 +500,29 @@ def resolve_target_curve_for_layer(attr_full_name, layer_name):
             ) or []
         except Exception:
             curves = []
+        # Constraints can place the original animation behind a pairBlend, so
+        # it is no longer a direct connection of the driven channel. Maya's
+        # keyframe query still resolves the actual editable animCurve.
+        if not curves:
+            try:
+                candidates = cmds.keyframe(
+                    attr_full_name,
+                    query=True,
+                    name=True,
+                ) or []
+            except Exception:
+                candidates = []
+            for candidate in candidates:
+                try:
+                    if cmds.nodeType(candidate).startswith("animCurve"):
+                        curves.append(candidate)
+                except Exception:
+                    continue
         return curves[0] if curves else None
+
+    native_curve = _find_curve_for_layer_plug(attr_full_name, layer_name)
+    if native_curve:
+        return native_curve
 
     plug = _layered_plug_for_attr(attr_full_name, layer_name)
     if not plug:
@@ -384,6 +539,24 @@ def resolve_target_curve_for_layer(attr_full_name, layer_name):
     except Exception:
         curves = []
     return curves[0] if curves else None
+
+
+def _curve_directly_drives_attr(curve, attr_full_name):
+    """True when the curve reaches the channel without a blending node."""
+    if not curve:
+        return False
+    try:
+        direct_curves = cmds.listConnections(
+            attr_full_name,
+            source=True,
+            destination=False,
+            type="animCurve",
+            skipConversionNodes=True,
+        ) or []
+    except Exception:
+        return False
+    curve_uuid = _query_node_uuid(curve)
+    return any(_query_node_uuid(candidate) == curve_uuid for candidate in direct_curves)
 
 
 def _selected_objects_long():
@@ -806,7 +979,27 @@ class OffsetSession(QtCore.QObject):
         if not self._is_supported_plug(plug):
             return None
 
-        curve = resolve_target_curve_for_layer(plug, self.target_layer)
+        # Most rig controls expose many keyable channels but animate only a
+        # small subset. This cheap query avoids layer graph/MEL resolution for
+        # every unanimated channel, which is the dominant activation cost on
+        # large selections.
+        try:
+            key_count = cmds.keyframe(
+                plug,
+                query=True,
+                time=self.time_range,
+                keyframeCount=True,
+            )
+        except Exception:
+            key_count = 0
+        if not key_count:
+            return None
+
+        curve = resolve_target_curve_for_layer(
+            plug,
+            self.target_layer,
+            has_animation_layers=self.has_animation_layers,
+        )
         if curve is None:
             if _has_any_animation_layers():
                 return None
@@ -837,6 +1030,11 @@ class OffsetSession(QtCore.QObject):
             key_times=key_times,
             key_values=key_values,
             key_indices=key_indices,
+            observe_plug=(
+                self.has_animation_layers
+                or curve is None
+                or _curve_directly_drives_attr(curve, plug)
+            ),
         )
 
     def _query_curve_key_data(self, curve, node_path, attr):
@@ -1263,6 +1461,8 @@ class OffsetSession(QtCore.QObject):
             curve_value = self._evaluate_curve(track, frame)
             if self.has_animation_layers and curve_value is not None:
                 return curve_value
+            if not track.observe_plug and curve_value is not None:
+                return curve_value
             if baseline is not None:
                 expected = float(baseline) + float(track.applied_delta)
                 plug_distance = abs(float(plug_value) - expected) if plug_value is not None else -1.0
@@ -1295,6 +1495,18 @@ class OffsetSession(QtCore.QObject):
         except Exception:
             return None
 
+        # A muted/zero-weight layer, or BaseAnimation hidden by a full
+        # override, has no influence on the evaluated channel. Asking Maya to
+        # solve a key for such a driver produces arbitrary curve values and
+        # can corrupt an otherwise untouched layer. Direct Graph Editor edits
+        # are still handled by the animCurve callback; only composite channel
+        # capture is skipped here.
+        if _layer_is_locked(layer_name):
+            return None
+        influence = _layer_output_influence(track.plug, layer_name)
+        if influence is not None and abs(influence) <= VALUE_EPSILON:
+            return None
+
         try:
             cmds.setKeyframe(
                 track.node_path,
@@ -1311,7 +1523,11 @@ class OffsetSession(QtCore.QObject):
             )
             return None
 
-        resolved_curve = resolve_target_curve_for_layer(track.plug, layer_name)
+        resolved_curve = resolve_target_curve_for_layer(
+            track.plug,
+            layer_name,
+            has_animation_layers=self.has_animation_layers,
+        )
         if resolved_curve and resolved_curve != track.curve:
             track.curve = resolved_curve
             self._index_track_curve(track)

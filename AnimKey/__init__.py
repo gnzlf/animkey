@@ -7,24 +7,30 @@
     Developed with ❤️ for the animation community
 """
 
-__version__ = "1.0.0"
+from AnimKey.version import __version__
 __author__ = "AnimKey Team"
 
 
 def reload():
     """Reload the AnimKey toolbar"""
+    from AnimKey.mods.maya_compat import warn_if_unsupported
+    warn_if_unsupported()
     import AnimKey.core.toolbar as t
     t.animkey_toolbar.reload()
 
 
 def toggle():
     """Toggle the AnimKey toolbar visibility"""
+    from AnimKey.mods.maya_compat import warn_if_unsupported
+    warn_if_unsupported()
     import AnimKey.core.toolbar as t
     t.animkey_toolbar.toggle()
 
 
 def show():
     """Show the AnimKey toolbar"""
+    from AnimKey.mods.maya_compat import warn_if_unsupported
+    warn_if_unsupported()
     import AnimKey.core.toolbar as t
     t.animkey_toolbar.show()
 
@@ -79,6 +85,13 @@ def uninstall():
     print("=" * 60)
     print("  AnimKey Uninstallation")
     print("=" * 60)
+
+    try:
+        from AnimKey.mods import uiMod
+        uiMod.cleanup_animkey_runtime(full=True)
+        uiMod.unload_animkey_entry_plugin()
+    except Exception:
+        pass
     
     # 1. Close toolbar first
     try:
@@ -176,5 +189,5 @@ def uninstall():
     
     print("\n" + "=" * 60)
     print("  ✓ Uninstallation complete!")
-    print("  Please restart Maya to complete the process.")
+    print("  AnimKey has been removed from the current Maya session.")
     print("=" * 60)

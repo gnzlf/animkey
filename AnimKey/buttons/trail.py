@@ -23,6 +23,7 @@ import time
 import sys
 
 from AnimKey.mods import configMod as config
+from AnimKey.buttons import trail_runtime
 
 
 TRAIL_ROOT = "animkey_trail"
@@ -34,6 +35,7 @@ TRAIL_SCRIPTJOBS_ATTR = "animKeyTrailScriptJobs"
 TRAIL_TANGENT_GROUP_ATTR = "animKeyTrailTangentGroup"
 TRAIL_KEY_GROUP_ATTR = "animKeyTrailKeyGroup"
 TRAIL_KEY_SIGNATURE_ATTR = "animKeyTrailKeySignature"
+TRAIL_COLOR_INDEX_ATTR = "animKeyTrailColorIndex"
 TRAIL_RANGE_START_ATTR = "animKeyTrailStartFrame"
 TRAIL_RANGE_END_ATTR = "animKeyTrailEndFrame"
 TRAIL_DIRTY_START_ATTR = "dirtyStartTime"
@@ -42,6 +44,51 @@ TRAIL_SETTINGS_KEY = "motion_trail_settings"
 TRAIL_MAX_SAMPLES = 180
 TRAIL_MAX_KEY_MARKERS = 70
 TRAIL_USE_CUSTOM_TANGENT_NODES = True
+TRAIL_COLOR_MODES = {
+    "solid": 0,
+    "spectrum": 1,
+    "warm": 2,
+    "ocean": 3,
+    "candy": 4,
+}
+ANIMO_OBJECT_COLORS = (
+    (0.85, 0.12, 0.11),
+    (1.0, 0.4, 0.7),
+    (1.0, 0.9, 0.15),
+    (0.7, 0.3, 0.9),
+    (0.3, 0.6, 1.0),
+)
+TRAIL_QUALITY_PRESETS = {
+    "performance": {
+        "trail_increment": 4,
+        "sample_density": 1,
+        "max_samples": 180,
+        "max_key_markers": 35,
+        "display_frame_range": 18,
+    },
+    "balanced": {
+        "trail_increment": 2,
+        "sample_density": 1,
+        "max_samples": 360,
+        "max_key_markers": 70,
+        "display_frame_range": 24,
+    },
+    "frame": {
+        "trail_increment": 1,
+        "sample_density": 1,
+        "max_samples": 1000,
+        "max_key_markers": 160,
+        "display_frame_range": 0,
+    },
+    "fine": {
+        "trail_increment": 1,
+        "sample_density": 2,
+        "max_samples": 1600,
+        "max_key_markers": 200,
+        "display_frame_range": 0,
+    },
+}
+TRAIL_ALL_CONTAINERS_TOKEN = "__animkey_all_trails__"
 _TRAIL_SCRIPTJOBS = []
 _TRAIL_REBUILD_PENDING = set()
 _TRAIL_REDRAW_PENDING = set()
@@ -64,34 +111,52 @@ _TRAIL_TANGENT_REDRAW_INTERVAL = 0.18
 DEFAULT_TRAIL_SETTINGS = {
     "trail_increment": 1,
     "sample_density": 1,
-    "max_samples": 180,
+    "max_samples": 1000,
     "max_key_markers": 70,
-    "show_key_markers": True,
+    "display_frame_range": 18,
+    "show_key_markers": False,
+    "show_frame_markers": True,
     "show_glow": False,
-    "line_width": 2.0,
+    "line_width": 4.0,
+    "marker_size": 5.0,
+    "frame_marker_size": 3.0,
+    "color_mode": "solid",
     "glow_width": 7.0,
     "marker_scale": 1.0,
     "live_refresh": False,
-    "show_key_handles": True,
+    "show_key_handles": False,
     "show_tangent_handles": False,
-    "show_pop_warnings": True,
+    "show_pop_warnings": False,
     "pop_threshold": 0.4,
-    "palette": "cyan",
+    "camera_space": False,
+    "palette": "animo",
     "custom_colors": {},
 }
 
 TRAIL_PALETTES = {
-    "cyan": {
-        "main": (1.0, 0.82, 0.18),
-        "past": (1.0, 0.82, 0.18),
-        "future": (1.0, 0.82, 0.18),
-        "extra": (0.60, 0.42, 0.08),
-        "glow": (0.18, 0.12, 0.03),
-        "key": (1.0, 0.86, 0.36),
-        "past_key": (1.0, 0.82, 0.18),
-        "future_key": (1.0, 0.82, 0.18),
+    "animo": {
+        "main": ANIMO_OBJECT_COLORS[0],
+        "past": ANIMO_OBJECT_COLORS[0],
+        "future": ANIMO_OBJECT_COLORS[0],
+        "extra": ANIMO_OBJECT_COLORS[0],
+        "glow": (0.18, 0.03, 0.03),
+        "key": (0.95, 0.45, 0.45),
+        "past_key": (0.95, 0.45, 0.45),
+        "future_key": (0.95, 0.45, 0.45),
         "pop": (1.0, 0.12, 0.24),
-        "current": (0.18, 0.56, 1.0),
+        "current": (1.0, 0.2, 0.2),
+    },
+    "cyan": {
+        "main": (0.12, 0.90, 0.82),
+        "past": (0.92, 0.14, 0.74),
+        "future": (0.12, 0.90, 0.82),
+        "extra": (0.34, 0.06, 0.28),
+        "glow": (0.035, 0.16, 0.15),
+        "key": (0.98, 0.94, 1.0),
+        "past_key": (0.92, 0.14, 0.74),
+        "future_key": (0.12, 0.90, 0.82),
+        "pop": (1.0, 0.12, 0.24),
+        "current": (1.0, 0.48, 0.90),
     },
     "red": {
         "main": (1.0, 0.34, 0.30),
@@ -249,27 +314,24 @@ def _ensure_plugin_loaded():
 
 
 def _reload_motion_trail_plugin():
-    """Reload the plugin from disk so new attributes are registered in Maya."""
+    """Load the trail plugin only when it is not already active.
+
+    Unloading a Python VP2 plugin while its draw overrides are alive is unsafe in
+    Maya. The active copy remains until the next Maya launch.
+    """
+    if _is_motion_trail_plugin_loaded():
+        cmds.warning(
+            "AnimKey: The Motion Trail plugin is active and was left loaded to keep the "
+            "viewport stable. Its new version will load the next time Maya opens."
+        )
+        return False
+
     plugin_path = _motion_trail_plugin_path()
     if not plugin_path:
         cmds.warning("AnimKey: Motion trail plugin file was not found.")
         return False
 
     _cleanup_failed_custom_trail_nodes()
-
-    for query_name in _motion_trail_plugin_names():
-        try:
-            if cmds.pluginInfo(query_name, query=True, loaded=True):
-                cmds.unloadPlugin(query_name, force=True)
-                break
-        except Exception:
-            pass
-
-    for module_name in ("animKeyTrailPlugin", "AnimKey.plugins.animKeyTrailPlugin"):
-        try:
-            sys.modules.pop(module_name, None)
-        except Exception:
-            pass
 
     try:
         cmds.loadPlugin(plugin_path)
@@ -280,9 +342,9 @@ def _reload_motion_trail_plugin():
     return _is_motion_trail_plugin_loaded()
 
 
-def _create_animkey_motion_trail_shape():
+def _create_animkey_motion_trail_shape(name="trailShape"):
     try:
-        return cmds.createNode("animKeyMotionTrail", name="trailShape")
+        return cmds.createNode("animKeyMotionTrail", name=name)
     except Exception:
         return None
 
@@ -296,18 +358,58 @@ def _cleanup_failed_custom_trail_nodes():
                 pass
 
 
-def _create_custom_trail_node(object_name, start_frame, end_frame, increment, sample_density=1, source_component=""):
+def _create_custom_trail_node(
+    object_name,
+    start_frame,
+    end_frame,
+    increment,
+    sample_density=1,
+    source_component="",
+    trail_name=None,
+):
     if not _ensure_plugin_loaded():
         return None
 
+    node_fragment = _safe_node_fragment(trail_name or object_name)
+    shape_name = "{}_shape".format(node_fragment)
+    handle_name = "{}_handle".format(node_fragment)
     trail_node = None
     for attempt in range(2):
-        trail_node = _create_animkey_motion_trail_shape()
+        trail_node = _create_animkey_motion_trail_shape(shape_name)
         if not trail_node or not cmds.objExists(trail_node) or cmds.nodeType(trail_node) != "animKeyMotionTrail":
             _cleanup_failed_custom_trail_nodes()
             raise RuntimeError("custom motion trail node was not registered")
 
+        required_attrs = (
+            "cacheData",
+            "timeInput",
+            "cameraSpace",
+            "cameraWorldMatrix",
+            "displayFrameRange",
+            "showKeyMarkers",
+            "showFrameMarkers",
+            "markerSize",
+            "frameMarkerSize",
+            "colorMode",
+        )
+        if any(
+            not cmds.attributeQuery(attr, node=trail_node, exists=True)
+            for attr in required_attrs
+        ):
+            try:
+                cmds.delete(trail_node)
+            except Exception:
+                pass
+            _cleanup_failed_custom_trail_nodes()
+            if attempt == 0 and _reload_motion_trail_plugin():
+                continue
+            raise RuntimeError(
+                "the active motion trail plugin is outdated and could not be reloaded"
+            )
+
         cmds.connectAttr(object_name + ".worldMatrix[0]", trail_node + ".targetMatrix", force=True)
+        if cmds.objExists("time1.outTime"):
+            cmds.connectAttr("time1.outTime", trail_node + ".timeInput", force=True)
         if not source_component:
             break
         if _set_attr_if_exists(trail_node, "sourceComponent", source_component, attr_type="string"):
@@ -329,9 +431,10 @@ def _create_custom_trail_node(object_name, start_frame, end_frame, increment, sa
         _cleanup_failed_custom_trail_nodes()
         raise RuntimeError("custom motion trail node has no transform parent")
 
-    trail_transform = cmds.rename(trail_parent[0], "trailHandle")
+    trail_transform = cmds.rename(trail_parent[0], handle_name)
     _make_node_display_only(trail_transform)
-    return trail_transform
+    long_names = cmds.ls(trail_transform, long=True) or [trail_transform]
+    return long_names[0]
 
 
 def _create_fallback_trail_visuals(trail_container, object_name):
@@ -452,6 +555,19 @@ def _resolved_trail_palette(settings=None):
     return base
 
 
+def _palette_for_trail(trail_container, settings=None):
+    settings = settings or get_trail_settings()
+    palette = _resolved_trail_palette(settings).copy()
+    if settings.get("palette") == "animo":
+        color_index = int(round(_get_double_attr(trail_container, TRAIL_COLOR_INDEX_ATTR, 0.0)))
+        object_color = ANIMO_OBJECT_COLORS[color_index % len(ANIMO_OBJECT_COLORS)]
+        palette["main"] = object_color
+        palette["past"] = object_color
+        palette["future"] = object_color
+        palette["extra"] = object_color
+    return palette
+
+
 def _coerce_trail_settings(settings):
     merged = DEFAULT_TRAIL_SETTINGS.copy()
     if isinstance(settings, dict):
@@ -473,19 +589,32 @@ def _coerce_trail_settings(settings):
 
     _int_value("trail_increment", 1, 12)
     _int_value("sample_density", 1, 8)
-    _int_value("max_samples", 24, 500)
+    _int_value("max_samples", 24, 2000)
     _int_value("max_key_markers", 0, 240)
+    _int_value("display_frame_range", 0, 10000)
     _float_value("line_width", 1.0, 10.0)
+    _float_value("marker_size", 2.0, 24.0)
+    _float_value("frame_marker_size", 1.0, 16.0)
     _float_value("glow_width", 1.0, 16.0)
     _float_value("marker_scale", 0.25, 4.0)
     _float_value("pop_threshold", 0.1, 3.0)
 
-    for key in ("show_key_markers", "show_glow", "show_key_handles", "show_tangent_handles", "show_pop_warnings"):
+    for key in (
+        "show_key_markers",
+        "show_frame_markers",
+        "show_glow",
+        "show_key_handles",
+        "show_tangent_handles",
+        "show_pop_warnings",
+        "camera_space",
+    ):
         merged[key] = bool(merged.get(key, DEFAULT_TRAIL_SETTINGS[key]))
     merged["live_refresh"] = False
 
     if merged.get("palette") not in TRAIL_PALETTES:
         merged["palette"] = DEFAULT_TRAIL_SETTINGS["palette"]
+    if merged.get("color_mode") not in TRAIL_COLOR_MODES:
+        merged["color_mode"] = DEFAULT_TRAIL_SETTINGS["color_mode"]
 
     custom_colors = merged.get("custom_colors")
     if not isinstance(custom_colors, dict):
@@ -509,6 +638,13 @@ def _save_trail_settings(settings):
     config.set_setting(TRAIL_SETTINGS_KEY, _coerce_trail_settings(settings))
 
 
+def reset_trail_settings(refresh=True):
+    """Restore Animo-style defaults while keeping AnimKey's optional handles."""
+    _save_trail_settings(DEFAULT_TRAIL_SETTINGS.copy())
+    if refresh and has_active_trail():
+        _apply_trail_appearance()
+
+
 def _refresh_active_trail_if_needed(refresh=True):
     if refresh and has_active_trail():
         _apply_trail_appearance()
@@ -523,12 +659,7 @@ def set_trail_setting(key, value, refresh=True):
 
 def set_trail_quality(preset, refresh=True):
     settings = get_trail_settings()
-    if preset == "performance":
-        settings.update({"trail_increment": 4, "sample_density": 1, "max_samples": 90, "max_key_markers": 35})
-    elif preset == "cinematic":
-        settings.update({"trail_increment": 1, "sample_density": 4, "max_samples": 360, "max_key_markers": 160})
-    else:
-        settings.update({"trail_increment": 2, "sample_density": 1, "max_samples": 180, "max_key_markers": 70})
+    settings.update(TRAIL_QUALITY_PRESETS.get(preset, TRAIL_QUALITY_PRESETS["frame"]))
     _save_trail_settings(settings)
     _refresh_active_trail_if_needed(refresh)
 
@@ -632,12 +763,29 @@ def set_trail_key_markers(enabled, refresh=True):
     settings["show_key_markers"] = bool(enabled)
     _save_trail_settings(settings)
     if refresh:
-        _apply_trail_appearance()
+        _apply_trail_appearance(rebuild_cache=False)
+
+
+def set_trail_frame_markers(enabled, refresh=True):
+    settings = get_trail_settings()
+    settings["show_frame_markers"] = bool(enabled)
+    _save_trail_settings(settings)
+    if refresh:
+        _apply_trail_appearance(rebuild_cache=False)
+
+
+def set_trail_display_range(frame_range, refresh=True):
+    """Set the visible past/future window; zero keeps the complete trail visible."""
+    settings = get_trail_settings()
+    settings["display_frame_range"] = max(0, min(10000, int(frame_range)))
+    _save_trail_settings(settings)
+    if refresh:
+        _apply_trail_appearance(rebuild_cache=False)
 
 
 def set_trail_glow(enabled, refresh=True):
     settings = get_trail_settings()
-    settings["show_glow"] = False
+    settings["show_glow"] = bool(enabled)
     _save_trail_settings(settings)
     if refresh:
         _apply_trail_appearance()
@@ -649,7 +797,47 @@ def set_trail_line_width(width, refresh=True):
     settings["glow_width"] = max(float(width) + 3.5, float(width) * 2.2)
     _save_trail_settings(settings)
     if refresh:
-        _apply_trail_appearance()
+        _apply_trail_appearance(rebuild_cache=False)
+
+
+def set_trail_marker_size(size, refresh=True):
+    settings = get_trail_settings()
+    settings["marker_size"] = max(2.0, min(24.0, float(size)))
+    _save_trail_settings(settings)
+    if refresh:
+        _apply_trail_appearance(rebuild_cache=False)
+
+
+def set_trail_frame_marker_size(size, refresh=True):
+    settings = get_trail_settings()
+    settings["frame_marker_size"] = max(1.0, min(16.0, float(size)))
+    _save_trail_settings(settings)
+    if refresh:
+        _apply_trail_appearance(rebuild_cache=False)
+
+
+def set_trail_sample_density(density, refresh=True):
+    settings = get_trail_settings()
+    settings["sample_density"] = max(1, min(8, int(density)))
+    _save_trail_settings(settings)
+    _refresh_active_trail_if_needed(refresh)
+
+
+def set_trail_color_mode(mode, refresh=True):
+    settings = get_trail_settings()
+    settings["color_mode"] = mode if mode in TRAIL_COLOR_MODES else "solid"
+    _save_trail_settings(settings)
+    if refresh:
+        _apply_trail_appearance(rebuild_cache=False)
+
+
+def set_trail_camera_space(enabled, refresh=True):
+    """Flatten active trails against the current viewport camera."""
+    settings = get_trail_settings()
+    settings["camera_space"] = bool(enabled)
+    _save_trail_settings(settings)
+    if refresh:
+        _apply_trail_appearance(rebuild_cache=False)
 
 
 def _safe_node_fragment(name):
@@ -671,7 +859,7 @@ def _component_owner_node(component):
     return node
 
 
-def _selected_trail_source():
+def _selected_trail_sources():
     raw_selection = cmds.ls(selection=True, long=True, flatten=True) or []
     vertices = cmds.filterExpand(raw_selection, selectionMask=31, fullPath=True) or []
     if vertices:
@@ -684,24 +872,43 @@ def _selected_trail_source():
             cmds.warning("AnimKey: Could not resolve the selected vertex owner.")
             return None
         label = f"{_safe_node_fragment(owner)}_{_safe_node_fragment(component)}"
-        return {
+        return [{
             "object": owner,
             "component": component,
             "label": label,
             "is_component": True,
-        }
+        }]
 
-    selected_objects = cmds.ls(selection=True, long=True) or []
-    if len(selected_objects) != 1:
-        cmds.warning("AnimKey: Please select only one object or one vertex.")
-        return None
-    object_name = selected_objects[0]
-    return {
-        "object": object_name,
-        "component": "",
-        "label": object_name,
-        "is_component": False,
-    }
+    selected_objects = cmds.ls(selection=True, long=True, objectsOnly=True) or []
+    sources = []
+    seen = set()
+    for selected in selected_objects:
+        object_name = selected
+        try:
+            if cmds.nodeType(object_name) not in ("transform", "joint", "ikHandle"):
+                parents = cmds.listRelatives(object_name, parent=True, fullPath=True) or []
+                object_name = parents[0] if parents else object_name
+        except Exception:
+            pass
+        if not object_name or object_name in seen or not cmds.objExists(object_name):
+            continue
+        seen.add(object_name)
+        sources.append({
+            "object": object_name,
+            "component": "",
+            "label": object_name,
+            "is_component": False,
+        })
+
+    if not sources:
+        cmds.warning("AnimKey: Select one or more objects, or one vertex.")
+    return sources
+
+
+def _selected_trail_source():
+    """Compatibility helper for code paths that intentionally use one source."""
+    sources = _selected_trail_sources()
+    return sources[0] if sources else None
 
 
 def _vertex_bake_times(start, end):
@@ -1164,8 +1371,11 @@ def _native_trail_shape(trail_container=None):
     if not existing_trail:
         existing_trail, _ = _find_existing_trail()
     if existing_trail and cmds.objExists(existing_trail):
+        registered_shape = _trail_shape_in_container(existing_trail)
+        if registered_shape and cmds.objExists(registered_shape):
+            return registered_shape
         try:
-            shapes = cmds.listRelatives(existing_trail, allDescendents=True, shapes=True, fullPath=False) or []
+            shapes = cmds.listRelatives(existing_trail, allDescendents=True, shapes=True, fullPath=True) or []
             for shape in shapes:
                 if cmds.nodeType(shape) == "animKeyMotionTrail":
                     return shape
@@ -1198,7 +1408,7 @@ def _apply_trail_appearance(rebuild_cache=True):
         existing_trail, object_name = _find_existing_trail()
         trail_targets = [(existing_trail, object_name)]
 
-    refresh_keys = (not rebuild_cache and settings.get("show_key_handles", True))
+    refresh_keys = (not rebuild_cache and settings.get("show_key_handles", False))
     refresh_tangents = (not rebuild_cache and settings.get("show_tangent_handles", False))
     if refresh_keys:
         _clear_key_callbacks()
@@ -1210,6 +1420,7 @@ def _apply_trail_appearance(rebuild_cache=True):
         _set_attr_if_exists("trail", "increment", increment)
 
     for existing_trail, _object_name in trail_targets:
+        palette = _palette_for_trail(existing_trail, settings)
         source_component = _get_string_attr(existing_trail, TRAIL_COMPONENT_ATTR, "") if existing_trail else ""
         trail_shape = _native_trail_shape(existing_trail)
         if not trail_shape:
@@ -1223,6 +1434,8 @@ def _apply_trail_appearance(rebuild_cache=True):
             _set_attr_if_exists(trail_shape, "endTime", int(end))
             _set_attr_if_exists(trail_shape, "increment", effective_increment)
             _set_attr_if_exists(trail_shape, "sampleDensity", max(1, int(settings.get("sample_density", 1))))
+            _set_attr_if_exists(trail_shape, "displayFrameRange", int(settings.get("display_frame_range", 24)))
+            _set_attr_if_exists(trail_shape, "cameraSpace", bool(settings.get("camera_space", False)))
             _set_attr_if_exists(trail_shape, "trailColor", *palette["main"], attr_type="double3")
             _set_attr_if_exists(trail_shape, "pastColor", *palette.get("past", palette["extra"]), attr_type="double3")
             _set_attr_if_exists(trail_shape, "futureColor", *palette.get("future", palette["main"]), attr_type="double3")
@@ -1232,9 +1445,24 @@ def _apply_trail_appearance(rebuild_cache=True):
             _set_attr_if_exists(trail_shape, "nextKeyColor", *palette["future_key"], attr_type="double3")
             _set_attr_if_exists(trail_shape, "popColor", *palette["pop"], attr_type="double3")
             _set_attr_if_exists(trail_shape, "showPopWarnings", bool(settings.get("show_pop_warnings", True)))
+            _set_attr_if_exists(trail_shape, "showKeyMarkers", bool(settings.get("show_key_markers", True)))
+            _set_attr_if_exists(trail_shape, "showFrameMarkers", bool(settings.get("show_frame_markers", True)))
             _set_attr_if_exists(trail_shape, "popThreshold", float(settings.get("pop_threshold", 0.4)))
             line_width = max(1.0, float(settings.get("line_width", 3.0)))
             _set_attr_if_exists(trail_shape, "trailLineWidth", line_width)
+            _set_attr_if_exists(
+                trail_shape, "markerSize", float(settings.get("marker_size", 5.5))
+            )
+            _set_attr_if_exists(
+                trail_shape,
+                "frameMarkerSize",
+                float(settings.get("frame_marker_size", 3.0)),
+            )
+            _set_attr_if_exists(
+                trail_shape,
+                "colorMode",
+                int(TRAIL_COLOR_MODES.get(settings.get("color_mode"), 0)),
+            )
             if existing_trail and rebuild_cache:
                 _dirty_custom_trail(existing_trail)
             elif existing_trail:
@@ -1281,6 +1509,8 @@ def _apply_trail_appearance(rebuild_cache=True):
             for attr in ("lineWidth", "trailLineWidth", "width"):
                 if _set_attr_if_exists(trail_shape, attr, line_width):
                     break
+
+    trail_runtime.update_settings(settings)
 
 
 def _frame_range(trail_container=None, use_time_slider_selection=False):
@@ -1526,7 +1756,8 @@ def _matrix_position_from_plug_at_time(matrix_plug, frame):
         selection.add(matrix_plug)
         plug = selection.getPlug(0)
         context = om.MDGContext(om.MTime(float(frame), om.MTime.uiUnit()))
-        mat_obj = plug.asMObject(context)
+        with om.MDGContextGuard(context):
+            mat_obj = plug.asMObject()
         if mat_obj.isNull():
             return None
         matrix = om.MFnMatrixData(mat_obj).matrix()
@@ -2061,7 +2292,7 @@ def _key_handle_signature_from_handles(trail_container):
 
 def _register_all_key_handle_callbacks():
     _clear_key_callbacks()
-    if not get_trail_settings().get("show_key_handles", True):
+    if not get_trail_settings().get("show_key_handles", False):
         return
     for trail_container, _ in _iter_trail_containers():
         if trail_container and cmds.objExists(trail_container):
@@ -2069,7 +2300,7 @@ def _register_all_key_handle_callbacks():
 
 
 def _sync_editable_key_handles_if_needed(trail_container, object_name=None, force=False):
-    if not get_trail_settings().get("show_key_handles", True):
+    if not get_trail_settings().get("show_key_handles", False):
         return False
     if not trail_container or not cmds.objExists(trail_container):
         return False
@@ -2330,13 +2561,26 @@ def _trail_anim_curve_edited_callback(*args):
         if isinstance(arg, str):
             container = arg
             break
+    curve_names = _curve_names_from_callback_args(args)
+    if container == TRAIL_ALL_CONTAINERS_TOKEN:
+        for trail_container, object_name in _iter_trail_containers():
+            if _get_string_attr(trail_container, TRAIL_COMPONENT_ATTR, ""):
+                _schedule_vertex_trail_rebake(trail_container)
+                continue
+            dirty_range = _dirty_range_for_anim_curves(
+                trail_container, object_name, curve_names
+            )
+            if dirty_range:
+                _schedule_trail_cache_dirty(
+                    trail_container, dirty_range=dirty_range, sync_key_handles=True
+                )
+        return
     if not container:
         container, _ = _find_existing_trail()
     if _get_string_attr(container, TRAIL_COMPONENT_ATTR, ""):
         _schedule_vertex_trail_rebake(container)
         return
     object_name = _get_string_attr(container, TRAIL_OBJECT_ATTR)
-    curve_names = _curve_names_from_callback_args(args)
     dirty_range = _dirty_range_for_anim_curves(container, object_name, curve_names)
     if dirty_range:
         _schedule_trail_cache_dirty(container, dirty_range=dirty_range, sync_key_handles=True)
@@ -2462,12 +2706,7 @@ def _register_vertex_source_callbacks(container):
 
 def _register_anim_curve_callbacks(container):
     global _TRAIL_ANIM_CALLBACKS
-    _clear_anim_callbacks()
-    if not container or not cmds.objExists(container):
-        return []
-
-    object_name = _get_string_attr(container, TRAIL_OBJECT_ATTR)
-    if not object_name or not cmds.objExists(object_name):
+    if _TRAIL_ANIM_CALLBACKS:
         return []
 
     callback_ids = []
@@ -2475,7 +2714,11 @@ def _register_anim_curve_callbacks(container):
     try:
         add_edited_callback = getattr(oma.MAnimMessage, "addAnimCurveEditedCallback", None)
         if add_edited_callback:
-            callback_ids.append(add_edited_callback(_trail_anim_curve_edited_callback, container))
+            callback_ids.append(
+                add_edited_callback(
+                    _trail_anim_curve_edited_callback, TRAIL_ALL_CONTAINERS_TOKEN
+                )
+            )
     except Exception:
         pass
 
@@ -2794,7 +3037,7 @@ def _create_editable_key_handles(trail_container, object_name):
     _clear_editable_key_handles(trail_container)
 
     settings = get_trail_settings()
-    if not settings.get("show_key_handles", True):
+    if not settings.get("show_key_handles", False):
         return []
     if not cmds.objExists(trail_container) or not cmds.objExists(object_name):
         return []
@@ -3081,6 +3324,7 @@ def _kill_scriptjob(job_id):
 
 def _clear_trail_scriptjobs(container=None):
     global _TRAIL_SCRIPTJOBS
+    trail_runtime.shutdown()
     _clear_key_callbacks()
     _clear_tangent_callbacks()
     _clear_anim_callbacks()
@@ -3110,6 +3354,11 @@ def _clear_trail_scriptjobs(container=None):
         _set_string_attr(container, TRAIL_SCRIPTJOBS_ATTR, "")
 
 
+def shutdown_runtime():
+    """Stop trail jobs/callbacks without deleting trail data from the scene."""
+    _clear_trail_scriptjobs()
+
+
 def handle_scene_changed(*args):
     """Reset trail runtime state after Maya opens or creates a scene."""
     _clear_trail_scriptjobs()
@@ -3133,19 +3382,18 @@ def handle_scene_changed(*args):
         except Exception:
             pass
 
-    registered_callbacks = False
     for container, object_name in trail_containers:
         if not container or not cmds.objExists(container):
             continue
         try:
             _set_string_attr(container, TRAIL_SCRIPTJOBS_ATTR, "")
             if object_name and cmds.objExists(object_name):
-                if not registered_callbacks:
-                    _register_trail_scriptjobs(container)
-                    registered_callbacks = True
                 _redraw_custom_trail(container)
         except Exception:
             pass
+
+    if trail_containers:
+        _register_trail_scriptjobs()
 
 
 def _rebuild_trail_from_container(container):
@@ -3175,6 +3423,8 @@ def _rebuild_trail_from_container(container):
 
 
 def _schedule_trail_rebuild(container):
+    if trail_runtime.is_scene_save_in_progress():
+        return
     if _TRAIL_REBUILDING or not cmds.objExists(container):
         return
     if container in _TRAIL_REBUILD_PENDING:
@@ -3183,6 +3433,8 @@ def _schedule_trail_rebuild(container):
 
     def _do_rebuild(c=container):
         try:
+            if trail_runtime.is_scene_save_in_progress():
+                return
             if cmds.objExists(c):
                 _rebuild_trail_from_container(c)
         finally:
@@ -3199,7 +3451,7 @@ def _trail_shape_in_container(container):
         return None
     shapes = []
     try:
-        shapes.extend(cmds.listRelatives(container, allDescendents=True, shapes=True, fullPath=False) or [])
+        shapes.extend(cmds.listRelatives(container, allDescendents=True, shapes=True, fullPath=True) or [])
     except Exception:
         pass
     try:
@@ -3258,21 +3510,16 @@ def _redraw_custom_trail(container):
 
 
 def _dirty_custom_trail(container, dirty_range=None):
+    if trail_runtime.is_scene_save_in_progress():
+        return None
+
     def _apply_dirty():
         shape = _trail_shape_in_container(container)
         if not shape or not cmds.objExists(shape):
             return
 
         _set_custom_trail_dirty_range(shape, dirty_range)
-
-        # Bump cacheVersion to force cache update on next draw.
-        try:
-            if cmds.attributeQuery("cacheVersion", node=shape, exists=True):
-                current_version = cmds.getAttr(f"{shape}.cacheVersion")
-                cmds.setAttr(f"{shape}.cacheVersion", current_version + 1)
-        except Exception:
-            pass
-
+        trail_runtime.mark_dirty(container, dirty_range=dirty_range)
         _redraw_custom_trail(container)
 
     return _run_without_undo(_apply_dirty)
@@ -3293,6 +3540,8 @@ def _merge_pending_dirty_range(container, dirty_range):
 
 
 def _schedule_trail_redraw(container, dirty_range=None, sync_key_handles=False):
+    if trail_runtime.is_scene_save_in_progress():
+        return
     if not container or not cmds.objExists(container):
         return
     _merge_pending_dirty_range(container, dirty_range)
@@ -3304,6 +3553,8 @@ def _schedule_trail_redraw(container, dirty_range=None, sync_key_handles=False):
 
     def _do_redraw(c=container):
         try:
+            if trail_runtime.is_scene_save_in_progress():
+                return
             dirty_range_to_apply = _TRAIL_PENDING_RANGES.pop(c, None)
             if not cmds.objExists(c):
                 return
@@ -3362,30 +3613,47 @@ def _schedule_undo_redo_trail_update(container):
     )
 
 
-def _register_trail_scriptjobs(container):
+def _trail_runtime_entries():
+    entries = []
+    settings = get_trail_settings()
+    for container, object_name in _iter_trail_containers():
+        shape = _trail_shape_in_container(container)
+        if not shape or not object_name or not cmds.objExists(object_name):
+            continue
+        start, end = _frame_range(container)
+        entries.append({
+            "container": container,
+            "shape": shape,
+            "source": object_name,
+            "start": start,
+            "end": end,
+            "increment": _effective_trail_increment(start, end, settings),
+            "density": max(1, int(settings.get("sample_density", 1))),
+        })
+    return entries
+
+
+def _register_trail_scriptjobs(container=None):
+    """Start the Animo-style cache runtime and AnimKey tangent callbacks."""
     global _TRAIL_SCRIPTJOBS
-    _clear_trail_scriptjobs(container)
-    if not container or not cmds.objExists(container):
+    _clear_trail_scriptjobs()
+    trail_targets = _iter_trail_containers()
+    if not trail_targets:
         return
 
-    _register_key_handle_callbacks(container)
-    _register_tangent_handle_callbacks(container)
-    _register_vertex_source_callbacks(container)
-    _register_anim_curve_callbacks(container)
+    for trail_container, _object_name in trail_targets:
+        if not trail_container or not cmds.objExists(trail_container):
+            continue
+        _register_key_handle_callbacks(trail_container)
+        _register_tangent_handle_callbacks(trail_container)
+        _register_vertex_source_callbacks(trail_container)
+        _register_anim_curve_callbacks(trail_container)
 
-    jobs = []
-    for event_name in ("Undo", "Redo"):
-        try:
-            job = cmds.scriptJob(
-                event=[event_name, lambda c=container: _schedule_undo_redo_trail_update(c)],
-                protected=True
-            )
-            jobs.append(job)
-        except Exception:
-            pass
-
-    _TRAIL_SCRIPTJOBS.extend(jobs)
-    _set_string_attr(container, TRAIL_SCRIPTJOBS_ATTR, ",".join(str(job) for job in jobs))
+    trail_runtime.initialize(_trail_runtime_entries(), get_trail_settings())
+    _TRAIL_SCRIPTJOBS = trail_runtime.job_ids()
+    jobs_text = ",".join(str(job) for job in _TRAIL_SCRIPTJOBS)
+    for trail_container, _object_name in trail_targets:
+        _set_string_attr(trail_container, TRAIL_SCRIPTJOBS_ATTR, jobs_text)
 
 
 def _create_trail_container(object_name, source_label=None):
@@ -3756,57 +4024,30 @@ def execute(*args, button=None):
     from AnimKey.core.executionGuard import require_animkey_context
     if not require_animkey_context("AnimKey.buttons.trail.execute"):
         return None
-    # First, check if there's any existing trail and remove it
-    existing_trail, existing_object = _find_existing_trail()
+    # A single click toggles the complete multi-object trail set.
+    existing_trail, _existing_object = _find_existing_trail()
     if existing_trail:
-        # Remove the existing trail (this will work regardless of current selection)
-        _clear_trail_scriptjobs(existing_trail)
-        if cmds.objExists(existing_trail):
-            cmds.delete(existing_trail)
-        # Also clean up legacy Maya snapshot nodes if they exist.
-        _cleanup_legacy_snapshot_nodes()
-        
-        # Update button state to inactive
+        remove_all_trails()
         set_button_active(button, False)
-        cmds.warning(f"AnimKey: Removed existing trail")
+        cmds.warning("AnimKey: Removed motion trails")
         return
-    
-    # If no existing trail, check if we can create a new one
-    source = _selected_trail_source()
-    if not source:
+
+    if not _selected_trail_sources():
         return
-    
-    # Create new trail
-    create_trail()
-    
-    # Update button state to active
-    set_button_active(button, True)
+
+    created = create_trail()
+    set_button_active(button, bool(created))
 
 
-def create_trail(*args):
-    """
-    Create an AnimKey-managed custom motion trail on the selected object.
-    """
-    source = _selected_trail_source()
-    if not source:
-        return
-    
+def _create_trail_for_source(source, start_frame, end_frame, color_index=0):
+    """Build one trail without resetting the shared multi-trail runtime."""
     source_object = source["object"]
     source_component = source.get("component", "")
     is_component_source = bool(source.get("is_component"))
     object_name = source_object
-    original_selection = cmds.ls(selection=True, long=True) or []
-    
-    # Create container structure
-    _create_animkey_container()
-    _create_trail_root_container()
-    _cleanup_legacy_snapshot_nodes()
-    
-    # Create trail container for this object
     trail_container = _create_trail_container(source_object, source.get("label"))
 
     try:
-        start_frame, end_frame = _frame_range(use_time_slider_selection=True)
         settings = get_trail_settings()
         increment = _effective_trail_increment(start_frame, end_frame, settings)
         sample_density = max(1, int(settings.get("sample_density", 1)))
@@ -3817,6 +4058,7 @@ def create_trail(*args):
         _set_string_attr(trail_container, TRAIL_OBJECT_ATTR, object_name)
         _set_string_attr(trail_container, TRAIL_COMPONENT_ATTR, source_component)
         _set_string_attr(trail_container, TRAIL_SCRIPTJOBS_ATTR, "")
+        _set_double_attr(trail_container, TRAIL_COLOR_INDEX_ATTR, color_index)
         _store_trail_frame_range(trail_container, start_frame, end_frame)
 
         trail_transform = None
@@ -3827,6 +4069,7 @@ def create_trail(*args):
                 end_frame,
                 increment,
                 sample_density,
+                trail_name=trail_container,
             )
         except Exception as plugin_error:
             _cleanup_failed_custom_trail_nodes()
@@ -3838,12 +4081,10 @@ def create_trail(*args):
             except Exception:
                 pass
 
-            _apply_trail_appearance()
-            if settings.get("show_key_handles", True) and not is_component_source:
+            if settings.get("show_key_handles", False) and not is_component_source:
                 _create_editable_key_handles(trail_container, object_name)
-            if not is_component_source:
+            if settings.get("show_tangent_handles", False) and not is_component_source:
                 _create_editable_tangent_handles(trail_container, object_name)
-            _register_trail_scriptjobs(trail_container)
         else:
             if is_component_source:
                 raise RuntimeError("vertex motion trails require the custom AnimKey trail plugin")
@@ -3856,13 +4097,42 @@ def create_trail(*args):
                 pass
         _cleanup_legacy_snapshot_nodes()
         cmds.warning(f"AnimKey: Could not create motion trail: {e}")
-        return
-    
-    # Restore original selection (the object being followed, not the constraint)
-    if original_selection:
-        cmds.select(original_selection, replace=True)
-    else:
-        cmds.select(object_name, replace=True)
+        return None
+
+    return trail_container
+
+
+def create_trail(*args):
+    """Create cached motion trails for every selected object in one operation."""
+    sources = _selected_trail_sources()
+    if not sources:
+        return []
+
+    original_selection = cmds.ls(selection=True, long=True) or []
+    _create_animkey_container()
+    _create_trail_root_container()
+    _cleanup_legacy_snapshot_nodes()
+    start_frame, end_frame = _frame_range(use_time_slider_selection=True)
+
+    created = []
+    try:
+        for color_index, source in enumerate(sources):
+            trail_container = _create_trail_for_source(
+                source, start_frame, end_frame, color_index=color_index
+            )
+            if trail_container:
+                created.append(trail_container)
+        if created:
+            _apply_trail_appearance()
+            _register_trail_scriptjobs()
+    finally:
+        try:
+            if original_selection:
+                cmds.select(original_selection, replace=True)
+        except Exception:
+            pass
+
+    return created
 
 
 def select_trail_container(object_name):
@@ -3888,55 +4158,51 @@ def remove_trail(object_name):
         _clear_trail_scriptjobs(trail_name)
         # Delete the trail container (this will remove all its contents)
         cmds.delete(trail_name)
+        _register_trail_scriptjobs()
     
     _cleanup_legacy_snapshot_nodes()
 
 
 def remove_all_trails(*args):
     """Remove all trails (delete animkey_trail container)"""
+    _clear_trail_scriptjobs()
     if cmds.objExists(TRAIL_ROOT):
-        try:
-            children = cmds.listRelatives(TRAIL_ROOT, children=True, fullPath=False) or []
-            for child in children:
-                _clear_trail_scriptjobs(child)
-        except Exception:
-            pass
         cmds.delete(TRAIL_ROOT)
     _cleanup_legacy_snapshot_nodes()
 
 
 def trail_refresh(*args):
-    """Refresh the active trail in place without deleting the trail container."""
-    existing_trail, object_name = _find_existing_trail()
-    if not existing_trail or not object_name or not cmds.objExists(object_name):
+    """Refresh every active trail and rebuild its visible cache in place."""
+    trail_targets = _iter_trail_containers()
+    if not trail_targets:
         cmds.warning("AnimKey: No custom trail in the scene")
         return
 
     selection = cmds.ls(selection=True, long=True) or []
-    _clear_trail_scriptjobs(existing_trail)
+    _clear_trail_scriptjobs()
     try:
         settings = get_trail_settings()
-        source_component = _get_string_attr(existing_trail, TRAIL_COMPONENT_ATTR, "")
-        if source_component:
-            start_frame, end_frame = _frame_range(existing_trail)
-            object_name = _bake_vertex_locator(
-                existing_trail,
-                source_component,
-                start_frame,
-                end_frame,
-                locator=object_name,
-            )
-            _set_string_attr(existing_trail, TRAIL_OBJECT_ATTR, object_name)
-            _connect_custom_trail_target(existing_trail, object_name)
+        for existing_trail, object_name in trail_targets:
+            source_component = _get_string_attr(existing_trail, TRAIL_COMPONENT_ATTR, "")
+            if source_component:
+                start_frame, end_frame = _frame_range(existing_trail)
+                object_name = _bake_vertex_locator(
+                    existing_trail,
+                    source_component,
+                    start_frame,
+                    end_frame,
+                    locator=object_name,
+                )
+                _set_string_attr(existing_trail, TRAIL_OBJECT_ATTR, object_name)
+                _connect_custom_trail_target(existing_trail, object_name)
+            _clear_editable_key_handles(existing_trail)
+            _clear_editable_tangent_handles(existing_trail)
+            if settings.get("show_key_handles", False) and not source_component:
+                _create_editable_key_handles(existing_trail, object_name)
+            if settings.get("show_tangent_handles", False) and not source_component:
+                _create_editable_tangent_handles(existing_trail, object_name)
         _apply_trail_appearance()
-        _clear_editable_key_handles(existing_trail)
-        _clear_editable_tangent_handles(existing_trail)
-        if settings.get("show_key_handles", True) and not source_component:
-            _create_editable_key_handles(existing_trail, object_name)
-        if settings.get("show_tangent_handles", False) and not source_component:
-            _create_editable_tangent_handles(existing_trail, object_name)
-        _register_trail_scriptjobs(existing_trail)
-        _dirty_custom_trail(existing_trail)
+        _register_trail_scriptjobs()
     finally:
         try:
             if selection:
@@ -3985,11 +4251,10 @@ def set_trail_grey_color(*args):
 
 def trail_show_hide(*args):
     """Toggle trail visibility"""
-    existing_trail, _ = _find_existing_trail()
-    if not existing_trail or not cmds.objExists(existing_trail):
+    if not cmds.objExists(TRAIL_ROOT):
         return
-    visibility = cmds.getAttr(f"{existing_trail}.visibility")
-    cmds.setAttr(f"{existing_trail}.visibility", not visibility)
+    visibility = cmds.getAttr(f"{TRAIL_ROOT}.visibility")
+    cmds.setAttr(f"{TRAIL_ROOT}.visibility", not visibility)
 
 
 def get_info():
@@ -4000,4 +4265,3 @@ def get_info():
         "icon": "trail.svg",
         "shortcut": None,
     }
-

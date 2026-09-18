@@ -13,21 +13,20 @@ import importlib
 import threading
 import time
 
-# Try importing PySide2 or PySide6
-try:
-    from PySide2 import QtWidgets, QtCore, QtGui
-    from PySide2.QtWidgets import QApplication
-    from PySide2.QtCore import QTimer
-    from PySide2.QtGui import QColor
-    import shiboken2 as shiboken
-    from shiboken2 import wrapInstance
-except ImportError:
-    from PySide6 import QtWidgets, QtCore, QtGui
-    from PySide6.QtWidgets import QApplication
-    from PySide6.QtCore import QTimer
-    from PySide6.QtGui import QColor
-    import shiboken6 as shiboken
-    from shiboken6 import wrapInstance
+from AnimKey.mods.maya_compat import (
+    QApplication,
+    QColor,
+    QTimer,
+    QtCore,
+    QtGui,
+    QtWidgets,
+    is_qt_object_valid,
+    execute_qt,
+    shiboken,
+    wrap_instance,
+)
+
+wrapInstance = wrap_instance
 
 # AnimKey modules
 from AnimKey.mods.themes import ThemeManager
@@ -38,16 +37,7 @@ from AnimKey.core.executionGuard import animkey_execution
 
 
 def _qt_object_is_alive(obj):
-    if obj is None:
-        return False
-    try:
-        return bool(shiboken.isValid(obj))
-    except Exception:
-        try:
-            obj.objectName()
-            return True
-        except Exception:
-            return False
+    return is_qt_object_valid(obj)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -126,7 +116,7 @@ from AnimKey.buttons.tangents import (
 )
 
 from AnimKey.buttons.gimbalFixer import execute as gimbal_execute
-from AnimKey.buttons.collisionTool import execute as collision_execute
+from AnimKey.buttons.switcher import execute as switcher_execute
 from AnimKey.buttons.bakeAnim import execute as bake_execute
 from AnimKey.buttons.retimer import execute as retimer_execute
 from AnimKey.buttons.animCleaner import execute as cleaner_execute
@@ -1304,6 +1294,19 @@ class AnimKeyToolbar:
                 pass
         AnimKeyToolbar._scene_callback = callbacks
 
+    def _remove_scene_callbacks(self):
+        """Remove scene jobs owned by the toolbar during reload/uninstall."""
+        callbacks = AnimKeyToolbar._scene_callback or []
+        if not isinstance(callbacks, (list, tuple)):
+            callbacks = [callbacks]
+        for callback in callbacks:
+            try:
+                if cmds.scriptJob(exists=callback):
+                    cmds.scriptJob(kill=callback, force=True)
+            except Exception:
+                pass
+        AnimKeyToolbar._scene_callback = None
+
     def _apply_wide_button_icon(self, button, icon_key, base_width=50):
         """Apply a non-square toolbar icon without distorting its aspect ratio."""
         from AnimKey.mods import mediaMod as media
@@ -1358,6 +1361,7 @@ class AnimKeyToolbar:
     
     def show(self):
         """Show the AnimKey toolbar"""
+        self._setup_scene_callback()
         self._create_workspace()
         self.is_visible = True
         
@@ -1408,23 +1412,7 @@ class AnimKeyToolbar:
             if cmds.workspaceControl(WORKSPACE_NAME, query=True, visible=True):
                 self.hide()
             else:
-                cmds.workspaceControl(WORKSPACE_NAME, edit=True, restore=True)
-                self.is_visible = True
-                try:
-                    from AnimKey.mods import viewportGimbal
-                    viewportGimbal.apply()
-                except Exception:
-                    pass
-                try:
-                    from AnimKey.mods import tumbleAroundSelection
-                    tumbleAroundSelection.apply()
-                except Exception:
-                    pass
-                try:
-                    from AnimKey.mods import channelBoxMultiSelection
-                    channelBoxMultiSelection.apply()
-                except Exception:
-                    pass
+                self.show()
         else:
             self.show()
     
@@ -1432,7 +1420,7 @@ class AnimKeyToolbar:
         """Reload the toolbar"""
         self._hide_toolbar_gif_preview()
         try:
-            ui.cleanup_animkey_runtime()
+            ui.cleanup_animkey_runtime(full=True)
         except Exception:
             pass
         # Delete existing workspace
@@ -1648,11 +1636,25 @@ class AnimKeyToolbar:
     #                           WORKSPACE CREATION
     # ═══════════════════════════════════════════════════════════════════════════
     
+    def _connect_guarded_action(self, action, action_name, callback):
+        """Run context-menu actions through the same gate as toolbar buttons.
+
+        Qt invokes QAction callbacks from C++, so the Python stack no longer
+        contains the toolbar dispatcher when the slot begins.  Keeping the
+        execution context open here makes guarded tools behave identically
+        whether they are launched from a button, shortcut, or context menu.
+        """
+        def _run(_checked=False):
+            with animkey_execution("toolbar_menu", action_name):
+                return callback()
+
+        action.triggered.connect(_run)
+        return action
+
     def _add_menu_action(self, menu, text, action_key=None):
         """Add a menu action with shortcut icon support on the right side"""
         from AnimKey.core.settings import load_shortcuts
         from AnimKey.mods import mediaMod
-        from PySide2 import QtGui, QtWidgets, QtCore
         import os
         
         shortcut_parts = None
@@ -2201,7 +2203,6 @@ class AnimKeyToolbar:
         layout.setSpacing(4)
         
         # Define slider mode options with colors (name, description, color)
-        from PySide2.QtGui import QColor
         self._tween_mode_options = [
             ("Tweener", "Interpolate between keyframes", QColor(0, 200, 255)),          # Cyan
             ("Tweener World Space", "Tween in world space", QColor(0, 200, 255)),       # Cyan
@@ -2534,7 +2535,7 @@ class AnimKeyToolbar:
             ("C", "Copy Animation", copy_animation_execute, "#a3be8c"),    # Green - Copy Animation with submenu
             ("LKN", "Link Objects", link_objects_execute, "#b48ead"),      # Purple - Link Objects
             ("CAM", "Follow Cam", follow_cam_execute, "#5e81ac"),          # Dark Blue - Follow Cam
-            ("WS", "World Space Copy", copy_worldspace_execute, "#a3be8c"), # Green - Copy Worldspace
+            ("WS", "World Space — Click: copy frame | Shift: paste | Ctrl: Auto | Right-click: ranges", copy_worldspace_execute, "#a3be8c"),
             ("PIV", "TEMP (Right-click: Temp Control)", temp_pivot_quick_execute, "#bf616a"),
             ("RUL", "Micro Move", None, "#ebcb8b"),                        # Yellow - Micro Move (callback set separately)
         ]
@@ -2551,7 +2552,7 @@ class AnimKeyToolbar:
         
         extra_buttons = [
             ("GMB", "Gimbal Fixer", gimbal_execute, "#d08770"),       # Orange
-            ("COL", "Collision Tool", collision_execute, "#5bc0be"), # Cyan
+            ("SWT", "Switcher", switcher_execute, "#5bc0be"),        # Cyan
             ("BAK", "Bake Animation", bake_execute, "#a3be8c"),       # Green
             ("RTM", "Retimer", retimer_execute, "#b48ead"),           # Purple
             ("ACL", "Animation Cleaner", cleaner_execute, "#88c0d0"), # Light Blue - Animation Cleaner
@@ -2660,12 +2661,14 @@ class AnimKeyToolbar:
                         lambda checked=False, b=piv_btn: temp_pivot_quick_execute(button=b)
                     )
                 )
+                if is_temp_pivot_active():
+                    set_temp_pivot_button_active(piv_btn, True)
             # Special handling for C button (copy animation) – pass button ref for popup anchoring
             elif text == "C":
                 copy_btn = btn
                 btn.clicked.connect(picking_wrapper(lambda checked=False, b=copy_btn: copy_animation_execute(button=b)))
             # Special handling for tools that need button ref for popup anchoring
-            elif text in ["GMB", "COL", "BAK", "RTM", "ACL"]:
+            elif text in ["GMB", "SWT", "BAK", "RTM", "ACL"]:
                 tool_btn = btn
                 btn.clicked.connect(picking_wrapper(lambda checked=False, b=tool_btn, cb=callback: cb(button=b)))
             else:
@@ -2962,7 +2965,7 @@ class AnimKeyToolbar:
         target_layout.addWidget(ui.AnimKeySeparator("vertical"))
         
         # ─────────────────────────────────────────────────────────────────────
-        # Group 5: Extra tools - GMB, COL, BAK, RTM, BTNS
+        # Group 5: Extra tools - GMB, SWT, BAK, RTM, BTNS
         for text, tooltip, callback, color in extra_buttons:
             btn = create_button(text, tooltip, callback, color)
             target_layout.addWidget(btn)
@@ -3130,7 +3133,9 @@ class AnimKeyToolbar:
         self.crash_indicator_dot = QtWidgets.QLabel()
         self.crash_indicator_dot.setObjectName("ACR_STATUS_DOT")
         self.crash_indicator_dot.setFixedSize(dot_size, dot_size)
-        self.crash_indicator_dot.setToolTip("AnimCrash recovery is active")
+        self.crash_indicator_dot.setToolTip(
+            "AnimCrash is active; waiting for the first checkpoint"
+        )
         self.crash_indicator_dot.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
         self.crash_indicator_dot.setStyleSheet(self._crash_dot_style_off)
         target_layout.addWidget(self.crash_indicator_dot, 0, QtCore.Qt.AlignVCenter)
@@ -3147,6 +3152,7 @@ class AnimKeyToolbar:
         self._blink_state = False
         
         try:
+            RecoverySystem.ensure_preferred_state()
             if RecoverySystem.is_active():
                 self._start_crash_blink()
         except Exception:
@@ -3192,6 +3198,9 @@ class AnimKeyToolbar:
             self._blink_state = True
             if hasattr(self, 'crash_btn') and self.crash_btn:
                 self.crash_btn.setStyleSheet(self._crash_style_off)
+                self.crash_btn.setToolTip(
+                    "AnimCrash is active; waiting for the first checkpoint"
+                )
             self.crash_indicator_dot.setStyleSheet(self._crash_dot_style_on)
         except RuntimeError:
             pass
@@ -3211,6 +3220,12 @@ class AnimKeyToolbar:
         if hasattr(self, 'crash_indicator_dot') and self.crash_indicator_dot:
             try:
                 self.crash_indicator_dot.setStyleSheet(self._crash_dot_style_off)
+                self.crash_indicator_dot.setToolTip("AnimCrash recovery is off")
+            except RuntimeError:
+                pass
+        if hasattr(self, 'crash_btn') and self.crash_btn:
+            try:
+                self.crash_btn.setToolTip("AnimCrash recovery is off")
             except RuntimeError:
                 pass
     
@@ -3234,6 +3249,28 @@ class AnimKeyToolbar:
             self._start_crash_blink()
         else:
             self._stop_crash_blink()
+
+    def update_recovery_checkpoint(self, filepath):
+        """Expose the last completed write instead of only showing power."""
+        if not filepath:
+            return
+        tooltip = "AnimCrash active\nLast checkpoint: {}\n{}".format(
+            time.strftime("%H:%M:%S"), filepath
+        )
+        try:
+            # Blinking only means "waiting for the first real file".  Once a
+            # checkpoint exists, keep a steady dot and no visual timer.
+            self._blink_timer.stop()
+            self._blink_state = True
+            if hasattr(self, "crash_indicator_dot") and self.crash_indicator_dot:
+                self.crash_indicator_dot.setStyleSheet(
+                    self._crash_dot_style_on
+                )
+                self.crash_indicator_dot.setToolTip(tooltip)
+            if hasattr(self, "crash_btn") and self.crash_btn:
+                self.crash_btn.setToolTip(tooltip)
+        except RuntimeError:
+            pass
     
     # ═══════════════════════════════════════════════════════════════════════════
     #                           CALLBACK METHODS
@@ -3545,7 +3582,14 @@ class AnimKeyToolbar:
         
         try:
             if mode == "Tweener":
-                tweener_execute(value)
+                # Match Animo's responsive preview: suppress intermediate
+                # viewport paints while all selected curves are updated, then
+                # let Maya draw the completed slider tick once.
+                cmds.refresh(suspend=True)
+                try:
+                    tweener_execute(value)
+                finally:
+                    cmds.refresh(suspend=False)
             elif mode == "Tweener World Space":
                 tweener_ws_execute(value)
             elif mode == "Blend to Buffer":
@@ -3646,8 +3690,12 @@ class AnimKeyToolbar:
         # IMPORTANT: Apply the final slider value and create keyframes
         try:
             if mode == "Tweener":
-                exe_tween(final_value)
-                res_tween()
+                cmds.refresh(suspend=True)
+                try:
+                    exe_tween(final_value)
+                    res_tween()
+                finally:
+                    cmds.refresh(suspend=False)
             elif mode == "Tweener World Space":
                 exe_tween_ws(final_value)
                 res_tween_ws()
@@ -3778,7 +3826,6 @@ class AnimKeyToolbar:
     
     def _on_curve_mode_change_new(self, mode):
         """Handle curve mode change from new dropdown"""
-        from PySide2.QtGui import QColor
         
         # Store current mode
         self._current_curve_mode = mode
@@ -3876,8 +3923,48 @@ class AnimKeyToolbar:
             }}
         ''')
 
+        def _add_trail_slider(parent_menu, label, value, minimum, maximum, step, callback):
+            scale = max(1, int(round(1.0 / float(step))))
+            widget = QtWidgets.QWidget(parent_menu)
+            layout = QtWidgets.QHBoxLayout(widget)
+            layout.setContentsMargins(10, 4, 10, 4)
+            layout.setSpacing(8)
+
+            value_label = QtWidgets.QLabel()
+            value_label.setMinimumWidth(98)
+            slider = QtWidgets.QSlider(QtCore.Qt.Horizontal, widget)
+            slider.setRange(int(round(float(minimum) * scale)), int(round(float(maximum) * scale)))
+            slider.setValue(int(round(float(value) * scale)))
+            slider.setMinimumWidth(145)
+            slider.setFocusPolicy(QtCore.Qt.NoFocus)
+
+            def _set_value_label(raw_value):
+                numeric_value = float(raw_value) / float(scale)
+                if scale == 1:
+                    value_label.setText(f"{label}: {int(numeric_value)}")
+                else:
+                    value_label.setText(f"{label}: {numeric_value:.1f}")
+
+            def _apply_slider(raw_value):
+                _set_value_label(raw_value)
+                numeric_value = float(raw_value) / float(scale)
+                callback(int(numeric_value) if scale == 1 else numeric_value)
+
+            _set_value_label(slider.value())
+            slider.valueChanged.connect(_apply_slider)
+            layout.addWidget(value_label)
+            layout.addWidget(slider, 1)
+
+            action = QtWidgets.QWidgetAction(parent_menu)
+            action.setDefaultWidget(widget)
+            parent_menu.addAction(action)
+            return slider
+
         action_refresh = menu.addAction("Refresh Trail")
         action_refresh.triggered.connect(trail.trail_refresh)
+
+        action_reset = menu.addAction("Reset Trail Settings")
+        action_reset.triggered.connect(trail.reset_trail_settings)
 
         action_show_hide = menu.addAction("Show / Hide Trail")
         action_show_hide.triggered.connect(trail.trail_show_hide)
@@ -3889,10 +3976,25 @@ class AnimKeyToolbar:
         action_keys.setChecked(bool(settings.get("show_key_markers", True)))
         action_keys.toggled.connect(trail.set_trail_key_markers)
 
+        action_frames = menu.addAction("Show Frame Markers")
+        action_frames.setCheckable(True)
+        action_frames.setChecked(bool(settings.get("show_frame_markers", True)))
+        action_frames.toggled.connect(trail.set_trail_frame_markers)
+
+        action_camera_space = menu.addAction("Camera Space")
+        action_camera_space.setCheckable(True)
+        action_camera_space.setChecked(bool(settings.get("camera_space", False)))
+        action_camera_space.toggled.connect(trail.set_trail_camera_space)
+
         action_key_handles = menu.addAction("Editable Key Handles")
         action_key_handles.setCheckable(True)
-        action_key_handles.setChecked(bool(settings.get("show_key_handles", True)))
+        action_key_handles.setChecked(bool(settings.get("show_key_handles", False)))
         action_key_handles.toggled.connect(trail.set_trail_key_handles)
+
+        action_tangent_handles = menu.addAction("Editable Tangent Handles")
+        action_tangent_handles.setCheckable(True)
+        action_tangent_handles.setChecked(bool(settings.get("show_tangent_handles", False)))
+        action_tangent_handles.toggled.connect(trail.set_trail_tangent_handles)
 
         action_pop = menu.addAction("Show Pop Warnings")
         action_pop.setCheckable(True)
@@ -3901,23 +4003,75 @@ class AnimKeyToolbar:
 
         quality_menu = menu.addMenu("Quality")
         quality_options = [
-            ("Performance", "performance", 4),
-            ("Balanced", "balanced", 2),
-            ("Cinematic", "cinematic", 1),
+            ("Performance (4 Frames)", "performance", 4, 1),
+            ("Balanced (2 Frames)", "balanced", 2, 1),
+            ("Every Frame", "frame", 1, 1),
+            ("Fine (2 Dots per Frame)", "fine", 1, 2),
         ]
         current_increment = int(settings.get("trail_increment", 1))
-        for label, preset, increment in quality_options:
+        current_density = int(settings.get("sample_density", 1))
+        for label, preset, increment, density in quality_options:
             action = quality_menu.addAction(label)
             action.setCheckable(True)
-            action.setChecked(current_increment == increment)
+            action.setChecked(
+                current_increment == increment and current_density == density
+            )
             action.triggered.connect(lambda checked=False, p=preset: trail.set_trail_quality(p))
 
-        width_menu = menu.addMenu("Line Width")
-        for label, width in (("Thin", 2.0), ("Normal", 3.0), ("Bold", 5.0)):
-            action = width_menu.addAction(label)
+        quality_menu.addSeparator()
+        _add_trail_slider(
+            quality_menu,
+            "Subframe Density",
+            current_density,
+            1,
+            8,
+            1,
+            trail.set_trail_sample_density,
+        )
+
+        range_menu = menu.addMenu("Visible Range")
+        current_display_range = int(settings.get("display_frame_range", 24))
+        for label, frame_range in (
+            ("+- 12 Frames", 12),
+            ("+- 18 Frames", 18),
+            ("+- 24 Frames", 24),
+            ("+- 48 Frames", 48),
+            ("Full Trail", 0),
+        ):
+            action = range_menu.addAction(label)
             action.setCheckable(True)
-            action.setChecked(abs(float(settings.get("line_width", 3.0)) - width) < 0.1)
-            action.triggered.connect(lambda checked=False, w=width: trail.set_trail_line_width(w))
+            action.setChecked(current_display_range == frame_range)
+            action.triggered.connect(
+                lambda checked=False, value=frame_range: trail.set_trail_display_range(value)
+            )
+
+        _add_trail_slider(
+            menu,
+            "Line Size",
+            float(settings.get("line_width", 2.0)),
+            1.0,
+            10.0,
+            0.25,
+            trail.set_trail_line_width,
+        )
+        _add_trail_slider(
+            menu,
+            "Frame Dot Size",
+            float(settings.get("frame_marker_size", 3.0)),
+            1.0,
+            12.0,
+            0.25,
+            trail.set_trail_frame_marker_size,
+        )
+        _add_trail_slider(
+            menu,
+            "Key Dot Size",
+            float(settings.get("marker_size", 5.5)),
+            2.0,
+            24.0,
+            0.5,
+            trail.set_trail_marker_size,
+        )
 
         pop_menu = menu.addMenu("Pop Sensitivity")
         current_pop_threshold = float(settings.get("pop_threshold", 0.4))
@@ -3944,7 +4098,23 @@ class AnimKeyToolbar:
                 trail.set_trail_custom_color(slot, (color.redF(), color.greenF(), color.blueF()))
 
         color_menu = menu.addMenu("Color")
+        color_mode_menu = color_menu.addMenu("Color Mode")
+        for label, mode in (
+            ("Solid", "solid"),
+            ("Spectrum", "spectrum"),
+            ("Warm", "warm"),
+            ("Ocean", "ocean"),
+            ("Candy", "candy"),
+        ):
+            action = color_mode_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(settings.get("color_mode", "solid") == mode)
+            action.triggered.connect(
+                lambda checked=False, value=mode: trail.set_trail_color_mode(value)
+            )
+        color_menu.addSeparator()
         for label, palette in (
+            ("Animo", "animo"),
             ("Default", "cyan"),
             ("Red", "red"),
             ("Grey", "grey"),
@@ -3971,7 +4141,7 @@ class AnimKeyToolbar:
             action = custom_color_menu.addAction(label)
             action.triggered.connect(lambda checked=False, s=slot, l=label: _choose_trail_color(s, l))
 
-        menu.exec_(button.mapToGlobal(position))
+        execute_qt(menu, button.mapToGlobal(position))
 
     def _show_isolate_context_menu(self, button, position):
         """Show context menu for Isolate Selection button"""
@@ -4006,9 +4176,9 @@ class AnimKeyToolbar:
         include_action.setToolTip("Also isolate children/accessories parented under the selected object or rig.")
         include_action.toggled.connect(isolate.set_include_parented_objects)
 
-        menu.exec_(button.mapToGlobal(position))
+        execute_qt(menu, button.mapToGlobal(position))
     
-    def _show_align_context_menu(self, button, position):
+    def _show_legacy_align_context_menu(self, button, position):
         """Show context menu for Align Objects button"""
         from AnimKey.buttons.align_objects import (
             align_position,
@@ -4043,12 +4213,12 @@ class AnimKeyToolbar:
         action_scale = self._add_menu_action(menu, "Scale", "Align Scale")
         
         # Connect actions
-        action_position.triggered.connect(align_position)
-        action_orientation.triggered.connect(align_orientation)
-        action_scale.triggered.connect(align_scale)
+        self._connect_guarded_action(action_position, "Align Translate", align_position)
+        self._connect_guarded_action(action_orientation, "Align Rotate", align_orientation)
+        self._connect_guarded_action(action_scale, "Align Scale", align_scale)
         
         # Show menu at cursor position
-        menu.exec_(button.mapToGlobal(position))
+        execute_qt(menu, button.mapToGlobal(position))
     
     
     
@@ -4088,12 +4258,12 @@ class AnimKeyToolbar:
         action_clear = self._add_menu_action(menu, "Clear All Saved Data", "Clear All Saved Data")
         
         # Connect actions
-        action_save.triggered.connect(save_default_values)
-        action_restore.triggered.connect(remove_default_values_for_selected_object)
-        action_clear.triggered.connect(restore_default_data)
+        self._connect_guarded_action(action_save, "Snapshot Default Values", save_default_values)
+        self._connect_guarded_action(action_restore, "Delete Default Snapshot", remove_default_values_for_selected_object)
+        self._connect_guarded_action(action_clear, "Clear Default Snapshots", restore_default_data)
         
         # Show menu at cursor position
-        menu.exec_(button.mapToGlobal(position))
+        execute_qt(menu, button.mapToGlobal(position))
     
     
     def _show_select_opposite_context_menu(self, button, position):
@@ -4125,16 +4295,19 @@ class AnimKeyToolbar:
         action_add = self._add_menu_action(menu, "Add Select Opposite", "Add Select Opposite")
         
         # Connect action
-        action_add.triggered.connect(add_select_opposite)
+        self._connect_guarded_action(action_add, "Add Select Opposite", add_select_opposite)
         
         # Show menu at cursor position
-        menu.exec_(button.mapToGlobal(position))
+        execute_qt(menu, button.mapToGlobal(position))
     
     
     def _show_mirror_context_menu(self, button, position):
         """Show context menu for Mirror button"""
         from AnimKey.buttons.mirror import (
             all_mirror,
+            quick_mirror,
+            mirror_to_left,
+            mirror_to_right,
             toggle_auto_mirror,
             is_auto_mirror_enabled,
             snapshot_mirror_settings,
@@ -4174,6 +4347,18 @@ class AnimKeyToolbar:
         # Mirror modes section
         action_all_mirror = self._add_menu_action(menu, "All Mirror (Swap Both Sides)", "All Mirror (Swap Both Sides)")
         action_all_mirror.setToolTip("Swap values between left/right controls")
+
+        action_mirror_left = self._add_menu_action(menu, "Mirror to Left", "Mirror to Left")
+        action_mirror_left.setToolTip("Copy selected right-side controls onto the left side")
+        action_mirror_right = self._add_menu_action(menu, "Mirror to Right", "Mirror to Right")
+        action_mirror_right.setToolTip("Copy selected left-side controls onto the right side")
+
+        action_quick_mirror = self._add_menu_action(
+            menu, "Quick Mirror (No Snapshot)", "Quick Mirror (No Snapshot)"
+        )
+        action_quick_mirror.setToolTip(
+            "Mirror the current pose immediately using automatic left/right detection"
+        )
         
         menu.addSeparator()
         
@@ -4186,20 +4371,23 @@ class AnimKeyToolbar:
         menu.addSeparator()
         
         # Snapshot section
-        action_snapshot = self._add_menu_action(menu, "Snapshot Mirror", "Snapshot Mirror")
-        action_snapshot.setToolTip("Auto-detect mirror settings from T-Pose. Run once per rig.")
+        action_snapshot = self._add_menu_action(menu, "Snapshot", "Snapshot")
+        action_snapshot.setToolTip("Calibrate and validate a reusable precise mirror profile for the selected rig")
         
         action_delete_snapshot = self._add_menu_action(menu, "Delete Snapshot", "Delete Snapshot")
         action_delete_snapshot.setToolTip("Delete mirror snapshot for current rig")
         
         # Connect actions
-        action_all_mirror.triggered.connect(all_mirror)
-        action_auto_mirror.triggered.connect(toggle_auto_mirror)
-        action_snapshot.triggered.connect(snapshot_mirror_settings)
-        action_delete_snapshot.triggered.connect(delete_mirror_snapshot)
+        self._connect_guarded_action(action_all_mirror, "All Mirror", all_mirror)
+        self._connect_guarded_action(action_mirror_left, "Mirror to Left", mirror_to_left)
+        self._connect_guarded_action(action_mirror_right, "Mirror to Right", mirror_to_right)
+        self._connect_guarded_action(action_quick_mirror, "Quick Mirror", quick_mirror)
+        self._connect_guarded_action(action_auto_mirror, "Toggle Auto Mirror", toggle_auto_mirror)
+        self._connect_guarded_action(action_snapshot, "Mirror Snapshot", snapshot_mirror_settings)
+        self._connect_guarded_action(action_delete_snapshot, "Delete Mirror Snapshot", delete_mirror_snapshot)
         
         # Show menu at cursor position
-        menu.exec_(button.mapToGlobal(position))
+        execute_qt(menu, button.mapToGlobal(position))
     
     
     def _show_copy_animation_context_menu(self, button, position):
@@ -4262,16 +4450,16 @@ class AnimKeyToolbar:
         menu.addSeparator()
         
         # Connect actions
-        act_copy.triggered.connect(copy_animation)
-        act_save.triggered.connect(lambda: save_animation(button=button))
-        act_paste.triggered.connect(paste_animation)
-        act_insert.triggered.connect(paste_insert_animation)
-        act_opposite.triggered.connect(paste_opposite_animation)
-        act_copy_pose.triggered.connect(copy_pose)
-        act_paste_pose.triggered.connect(paste_pose)
+        self._connect_guarded_action(act_copy, "Copy Animation", copy_animation)
+        self._connect_guarded_action(act_save, "Save Animation", lambda: save_animation(button=button))
+        self._connect_guarded_action(act_paste, "Paste Animation", paste_animation)
+        self._connect_guarded_action(act_insert, "Paste Insert Animation", paste_insert_animation)
+        self._connect_guarded_action(act_opposite, "Paste Opposite Animation", paste_opposite_animation)
+        self._connect_guarded_action(act_copy_pose, "Copy Pose", copy_pose)
+        self._connect_guarded_action(act_paste_pose, "Paste Pose", paste_pose)
         
         # Show menu at cursor position
-        menu.exec_(button.mapToGlobal(position))
+        execute_qt(menu, button.mapToGlobal(position))
     def _show_hierarchy_context_menu(self, button, position):
         """Show context menu for Select Hierarchy button"""
         # select_hierarchy_execute, select_rig_controls, select_animated_controls are imported at module level
@@ -4280,20 +4468,20 @@ class AnimKeyToolbar:
         menu.setStyleSheet(style.get_menu_style())
         
         act_children = menu.addAction("Select Hierarchy Controls")
-        act_children.triggered.connect(lambda: select_hierarchy_execute())
+        self._connect_guarded_action(act_children, "Select Hierarchy Controls", select_hierarchy_execute)
         
         menu.addSeparator()
         
         act_controls = menu.addAction("Select Rig Controls")
-        act_controls.triggered.connect(lambda: select_rig_controls())
+        self._connect_guarded_action(act_controls, "Select Rig Controls", select_rig_controls)
         
         act_animated = menu.addAction("Select Animated Controls")
-        act_animated.triggered.connect(lambda: select_animated_controls())
+        self._connect_guarded_action(act_animated, "Select Animated Controls", select_animated_controls)
 
         act_visible_curves = menu.addAction("Select Visible NURBS Curves")
-        act_visible_curves.triggered.connect(lambda: select_visible_nurbs_curves())
+        self._connect_guarded_action(act_visible_curves, "Select Visible NURBS Curves", select_visible_nurbs_curves)
         
-        menu.exec_(button.mapToGlobal(position))
+        execute_qt(menu, button.mapToGlobal(position))
 
     def _show_align_context_menu(self, button, position):
         """Show context menu for Align button"""
@@ -4339,9 +4527,9 @@ class AnimKeyToolbar:
 
         menu.addSeparator()
         act_apply = menu.addAction("Apply Align")
-        act_apply.triggered.connect(lambda: align_objects.execute())
+        self._connect_guarded_action(act_apply, "Align Objects", align_objects.execute)
         
-        menu.exec_(button.mapToGlobal(position))
+        execute_qt(menu, button.mapToGlobal(position))
 
     def _show_offset_context_menu(self, button, position):
         """Show context menu for Offset button"""
@@ -4353,7 +4541,7 @@ class AnimKeyToolbar:
         act_info = menu.addAction("Animation Offset Active" if has_active_offset() else "No Active Offset")
         act_info.setEnabled(False)
         
-        menu.exec_(button.mapToGlobal(position))
+        execute_qt(menu, button.mapToGlobal(position))
 
     def _show_follow_cam_context_menu(self, button, position):
         """Show context menu for Follow Cam button"""
@@ -4401,13 +4589,25 @@ class AnimKeyToolbar:
         action_remove.setToolTip("Remove the follow camera")
         
         # Connect actions
-        action_both.triggered.connect(lambda: create_follow_cam(translation=True, rotation=True))
-        action_translation.triggered.connect(lambda: create_follow_cam(translation=True, rotation=False))
-        action_rotation.triggered.connect(lambda: create_follow_cam(translation=False, rotation=True))
-        action_remove.triggered.connect(remove_follow_cam)
+        self._connect_guarded_action(
+            action_both,
+            "Follow Camera Translation Rotation",
+            lambda: create_follow_cam(translation=True, rotation=True),
+        )
+        self._connect_guarded_action(
+            action_translation,
+            "Follow Camera Translation",
+            lambda: create_follow_cam(translation=True, rotation=False),
+        )
+        self._connect_guarded_action(
+            action_rotation,
+            "Follow Camera Rotation",
+            lambda: create_follow_cam(translation=False, rotation=True),
+        )
+        self._connect_guarded_action(action_remove, "Remove Follow Camera", remove_follow_cam)
         
         # Show menu at cursor position
-        menu.exec_(button.mapToGlobal(position))
+        execute_qt(menu, button.mapToGlobal(position))
     
     
     def _show_link_objects_context_menu(self, button, position):
@@ -4469,25 +4669,29 @@ class AnimKeyToolbar:
         action_auto.setToolTip("Update object relationship in real-time")
         
         # Connect actions
-        action_copy_frame.triggered.connect(copy_link_frame)
-        action_copy_range.triggered.connect(copy_link_playback_range)
-        action_paste_frame.triggered.connect(paste_link_frame)
-        action_paste_range.triggered.connect(paste_link_playback_range)
-        action_auto.triggered.connect(toggle_auto_link)
+        self._connect_guarded_action(action_copy_frame, "Copy Link Frame", copy_link_frame)
+        self._connect_guarded_action(action_copy_range, "Copy Link Playback Range", copy_link_playback_range)
+        self._connect_guarded_action(action_paste_frame, "Paste Link Frame", paste_link_frame)
+        self._connect_guarded_action(action_paste_range, "Paste Link Playback Range", paste_link_playback_range)
+        self._connect_guarded_action(action_auto, "Toggle Auto Link", toggle_auto_link)
         
         # Show menu at cursor position
-        menu.exec_(button.mapToGlobal(position))
+        execute_qt(menu, button.mapToGlobal(position))
     
     
     def _show_worldspace_context_menu(self, button, position):
         """Show context menu for Copy Worldspace button"""
         from AnimKey.buttons.copyWorldspace import (
             copy_worldspace_all_animation,
+            copy_worldspace_selected_range,
             copy_worldspace_playback_range,
             copy_worldspace_current_frame,
             paste_worldspace_animation,
+            paste_worldspace_selected_range,
             paste_worldspace_playback_range,
-            paste_worldspace_current_frame
+            paste_worldspace_current_frame,
+            toggle_auto_worldspace,
+            is_auto_worldspace_enabled,
         )
         
         menu = QtWidgets.QMenu(button)
@@ -4522,36 +4726,52 @@ class AnimKeyToolbar:
         
         # Copy section
         action_copy_all = self._add_menu_action(menu, "Copy Worldspace - All Animation", "Copy Worldspace All Animation")
-        action_copy_all.setToolTip("Copy worldspace values for all keyframes")
+        action_copy_all.setToolTip("Bake evaluated world matrices over the full animation range")
         
-        action_copy_range = self._add_menu_action(menu, "Copy Worldspace - Playback Range", "Copy Worldspace Selected Range")
-        action_copy_range.setToolTip("Copy worldspace values for playback range")
+        action_copy_selected = self._add_menu_action(menu, "Copy Worldspace - Selected Timeline Range", "Copy Worldspace Selected Range")
+        action_copy_selected.setToolTip("Bake evaluated world matrices over the highlighted timeline range")
+
+        action_copy_playback = menu.addAction("Copy Worldspace - Playback Range")
+        action_copy_playback.setToolTip("Bake evaluated world matrices over the playback range")
         
         action_copy_frame = self._add_menu_action(menu, "Copy Worldspace - Current Frame", "Copy Worldspace Current Frame")
-        action_copy_frame.setToolTip("Copy worldspace values at current frame")
+        action_copy_frame.setToolTip("Copy the evaluated world matrix at the current frame")
         
         menu.addSeparator()
         
         # Paste section
         action_paste_anim = self._add_menu_action(menu, "Paste Worldspace Animation", "Paste Worldspace Animation")
         action_paste_anim.setToolTip("Paste all worldspace animation")
+
+        action_paste_selected = menu.addAction("Paste Worldspace - Selected Timeline Range")
+        action_paste_selected.setToolTip("Paste only samples inside the highlighted timeline range")
         
         action_paste_range = menu.addAction("Paste Worldspace - Playback Range") # Not in shortcuts yet
         action_paste_range.setToolTip("Paste worldspace values within playback range")
         
         action_paste_frame = self._add_menu_action(menu, "Paste Worldspace Frame", "Paste Worldspace Frame")
         action_paste_frame.setToolTip("Paste worldspace values at current frame")
+
+        menu.addSeparator()
+
+        action_auto = self._add_menu_action(menu, "Auto Worldspace Pin", "Toggle Auto Worldspace")
+        action_auto.setToolTip("Keep copied controls fixed in world space while parents or spaces change")
+        action_auto.setCheckable(True)
+        action_auto.setChecked(is_auto_worldspace_enabled())
         
         # Connect actions
-        action_copy_all.triggered.connect(copy_worldspace_all_animation)
-        action_copy_range.triggered.connect(copy_worldspace_playback_range)
-        action_copy_frame.triggered.connect(copy_worldspace_current_frame)
-        action_paste_anim.triggered.connect(paste_worldspace_animation)
-        action_paste_range.triggered.connect(paste_worldspace_playback_range)
-        action_paste_frame.triggered.connect(paste_worldspace_current_frame)
+        self._connect_guarded_action(action_copy_all, "Copy Worldspace All", copy_worldspace_all_animation)
+        self._connect_guarded_action(action_copy_selected, "Copy Worldspace Selected", copy_worldspace_selected_range)
+        self._connect_guarded_action(action_copy_playback, "Copy Worldspace Playback", copy_worldspace_playback_range)
+        self._connect_guarded_action(action_copy_frame, "Copy Worldspace Frame", copy_worldspace_current_frame)
+        self._connect_guarded_action(action_paste_anim, "Paste Worldspace Animation", paste_worldspace_animation)
+        self._connect_guarded_action(action_paste_selected, "Paste Worldspace Selected", paste_worldspace_selected_range)
+        self._connect_guarded_action(action_paste_range, "Paste Worldspace Playback", paste_worldspace_playback_range)
+        self._connect_guarded_action(action_paste_frame, "Paste Worldspace Frame", paste_worldspace_current_frame)
+        self._connect_guarded_action(action_auto, "Toggle Auto Worldspace", toggle_auto_worldspace)
         
         # Show menu at cursor position
-        menu.exec_(button.mapToGlobal(position))
+        execute_qt(menu, button.mapToGlobal(position))
     
     
     def _show_micro_move_context_menu(self, button, position):
@@ -4594,7 +4814,11 @@ class AnimKeyToolbar:
         # Toggle
         toggle_text = "Disable" if active else "Enable"
         action_toggle = menu.addAction(toggle_text)
-        action_toggle.triggered.connect(partial(micro_move_execute, button=button))
+        self._connect_guarded_action(
+            action_toggle,
+            "Toggle Micro Move",
+            partial(micro_move_execute, button=button),
+        )
         
         menu.addSeparator()
         
@@ -4602,13 +4826,13 @@ class AnimKeyToolbar:
         for mag in [2, 4, 6, 10, 20]:
             mark = "● " if mag == current_mag else "   "
             action = menu.addAction(f"{mark}{mag}x")
-            action.triggered.connect(partial(set_magnitude, mag))
+            self._connect_guarded_action(action, "Set Micro Move Magnitude", partial(set_magnitude, mag))
         
         menu.addSeparator()
         act_children = menu.addAction("Select Hierarchy Controls")
-        act_children.triggered.connect(lambda: select_hierarchy_execute())
+        self._connect_guarded_action(act_children, "Select Hierarchy Controls", select_hierarchy_execute)
         
-        menu.exec_(button.mapToGlobal(position))
+        execute_qt(menu, button.mapToGlobal(position))
     
     def _show_selection_sets_context_menu(self, button, position):
         """Show context menu for Selection Sets button"""
@@ -4651,12 +4875,12 @@ class AnimKeyToolbar:
         action_clear.setToolTip("Delete all sets and tabs to start fresh")
         
         # Connect actions
-        action_export.triggered.connect(export_sets)
-        action_import.triggered.connect(import_sets)
-        action_clear.triggered.connect(clear_all_sets)
+        self._connect_guarded_action(action_export, "Export Selection Sets", export_sets)
+        self._connect_guarded_action(action_import, "Import Selection Sets", import_sets)
+        self._connect_guarded_action(action_clear, "Clear Selection Sets", clear_all_sets)
         
         # Show menu at cursor position
-        menu.exec_(button.mapToGlobal(position))
+        execute_qt(menu, button.mapToGlobal(position))
     
     def _show_flash_buttons_context_menu(self, button, position):
         """Show context menu for Flash Buttons button"""
@@ -4694,11 +4918,11 @@ class AnimKeyToolbar:
         action_import.setToolTip("Import flash buttons configuration from a file")
         
         # Connect actions
-        action_export.triggered.connect(export_config)
-        action_import.triggered.connect(import_config)
+        self._connect_guarded_action(action_export, "Export Flash Buttons", export_config)
+        self._connect_guarded_action(action_import, "Import Flash Buttons", import_config)
         
         # Show menu at cursor position
-        menu.exec_(button.mapToGlobal(position))
+        execute_qt(menu, button.mapToGlobal(position))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

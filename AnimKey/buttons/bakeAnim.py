@@ -17,12 +17,9 @@ from AnimKey.mods.uiMod import ContextPopupWindow
 import maya.mel as mel
 import maya.OpenMayaUI as mui
 
-try:
-    from PySide2 import QtWidgets, QtCore, QtGui
-    from shiboken2 import wrapInstance
-except ImportError:
-    from PySide6 import QtWidgets, QtCore, QtGui
-    from shiboken6 import wrapInstance
+from AnimKey.mods.maya_compat import (
+    QtCore, QtGui, QtWidgets, wrap_instance as wrapInstance,
+)
 
 
 WINDOW_OBJECT = "AnimKey_BakeFactory"
@@ -37,17 +34,28 @@ def get_maya_main_window():
 
 def get_time_range():
     """Get selected time range or full playback range"""
-    # Try to get selected range from timeline
-    time_slider = mel.eval('$tmpVar=$gPlayBackSlider')
-    range_array = cmds.timeControl(time_slider, query=True, rangeArray=True)
-    
-    if range_array[0] + 1 == range_array[1]:
-        # No range selected, use full playback range
-        min_time = cmds.playbackOptions(query=True, minTime=True)
-        max_time = cmds.playbackOptions(query=True, maxTime=True)
-        return min_time, max_time
-    else:
-        return range_array[0], range_array[1]
+    try:
+        time_slider = mel.eval('$tmpVar=$gPlayBackSlider')
+        if cmds.timeControl(time_slider, query=True, rangeVisible=True):
+            range_array = cmds.timeControl(
+                time_slider,
+                query=True,
+                rangeArray=True,
+            ) or []
+            if len(range_array) >= 2:
+                start_time = float(range_array[0])
+                # Maya returns the right boundary, one frame past the last
+                # highlighted frame.
+                end_time = float(range_array[1]) - 1.0
+                if end_time >= start_time:
+                    return start_time, end_time
+    except Exception:
+        pass
+
+    # No highlighted range: preserve the original visible playback scope.
+    min_time = cmds.playbackOptions(query=True, minTime=True)
+    max_time = cmds.playbackOptions(query=True, maxTime=True)
+    return min_time, max_time
 
 
 def constrain_save():

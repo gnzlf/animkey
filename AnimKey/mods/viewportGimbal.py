@@ -7,12 +7,9 @@ Adds a small control in the active model panel that rolls the viewport camera.
 import maya.cmds as cmds
 import maya.OpenMayaUI as mui
 
-try:
-    from PySide2 import QtWidgets, QtCore
-    from shiboken2 import wrapInstance
-except ImportError:
-    from PySide6 import QtWidgets, QtCore
-    from shiboken6 import wrapInstance
+from AnimKey.mods.maya_compat import (
+    QtCore, QtWidgets, wrap_instance as wrapInstance,
+)
 
 from AnimKey.mods import configMod
 

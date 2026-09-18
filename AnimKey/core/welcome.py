@@ -7,27 +7,37 @@
 
 import os
 
-try:
-    from PySide2 import QtWidgets, QtCore, QtGui
-    from PySide2.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                                   QPushButton, QComboBox, QFrame, QSpacerItem,
-                                   QSizePolicy, QGraphicsDropShadowEffect)
-    from PySide2.QtCore import Qt, QPropertyAnimation, QEasingCurve, QSize
-    from PySide2.QtGui import QColor, QPainter, QPixmap, QFont, QLinearGradient, QPainterPath, QBrush, QPen
-except ImportError:
-    from PySide6 import QtWidgets, QtCore, QtGui
-    from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                                   QPushButton, QComboBox, QFrame, QSpacerItem,
-                                   QSizePolicy, QGraphicsDropShadowEffect)
-    from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QSize
-    from PySide6.QtGui import QColor, QPainter, QPixmap, QFont, QLinearGradient, QPainterPath, QBrush, QPen
+from AnimKey.mods.maya_compat import QtCore, QtGui, QtWidgets, execute_qt
+
+QWidget = QtWidgets.QWidget
+QVBoxLayout = QtWidgets.QVBoxLayout
+QHBoxLayout = QtWidgets.QHBoxLayout
+QLabel = QtWidgets.QLabel
+QPushButton = QtWidgets.QPushButton
+QComboBox = QtWidgets.QComboBox
+QFrame = QtWidgets.QFrame
+QSpacerItem = QtWidgets.QSpacerItem
+QSizePolicy = QtWidgets.QSizePolicy
+QGraphicsDropShadowEffect = QtWidgets.QGraphicsDropShadowEffect
+Qt = QtCore.Qt
+QPropertyAnimation = QtCore.QPropertyAnimation
+QEasingCurve = QtCore.QEasingCurve
+QSize = QtCore.QSize
+QColor = QtGui.QColor
+QPainter = QtGui.QPainter
+QPixmap = QtGui.QPixmap
+QFont = QtGui.QFont
+QLinearGradient = QtGui.QLinearGradient
+QPainterPath = QtGui.QPainterPath
+QBrush = QtGui.QBrush
+QPen = QtGui.QPen
 
 try:
     import maya.cmds as cmds
     import maya.OpenMayaUI as omui
-    from shiboken2 import wrapInstance
+    from AnimKey.mods.maya_compat import wrap_instance as wrapInstance
     MAYA_AVAILABLE = True
-except ImportError:
+except (ImportError, RuntimeError):
     MAYA_AVAILABLE = False
 
 
@@ -408,7 +418,6 @@ if __name__ == "__main__":
         window = WelcomeWindow()
         window.show()
         
-        sys.exit(app.exec_())
+        sys.exit(execute_qt(app))
     else:
         show_welcome()
-

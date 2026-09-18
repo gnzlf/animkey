@@ -12,16 +12,46 @@ import json
 import os
 import random
 
-try:
-    from PySide2.QtCore import *
-    from PySide2.QtGui import *
-    from PySide2.QtWidgets import *
-    from shiboken2 import wrapInstance
-except ImportError:
-    from PySide6.QtCore import *
-    from PySide6.QtGui import *
-    from PySide6.QtWidgets import *
-    from shiboken6 import wrapInstance
+from AnimKey.mods.storage import atomic_write_json, read_json
+
+from AnimKey.mods.maya_compat import (
+    QtCore, QtGui, QtWidgets, execute_qt, wrap_instance as wrapInstance,
+)
+
+Qt = QtCore.Qt
+QApplication = QtWidgets.QApplication
+QAbstractItemView = QtWidgets.QAbstractItemView
+QComboBox = QtWidgets.QComboBox
+QDialog = QtWidgets.QDialog
+QGraphicsOpacityEffect = QtWidgets.QGraphicsOpacityEffect
+QGroupBox = QtWidgets.QGroupBox
+QHBoxLayout = QtWidgets.QHBoxLayout
+QLabel = QtWidgets.QLabel
+QLineEdit = QtWidgets.QLineEdit
+QMenu = QtWidgets.QMenu
+QMessageBox = QtWidgets.QMessageBox
+QPushButton = QtWidgets.QPushButton
+QTabBar = QtWidgets.QTabBar
+QTabWidget = QtWidgets.QTabWidget
+QTextEdit = QtWidgets.QTextEdit
+QVBoxLayout = QtWidgets.QVBoxLayout
+QWidget = QtWidgets.QWidget
+QColor = QtGui.QColor
+QCursor = QtGui.QCursor
+QIcon = QtGui.QIcon
+QLinearGradient = QtGui.QLinearGradient
+QPainter = QtGui.QPainter
+QPen = QtGui.QPen
+QPixmap = QtGui.QPixmap
+QRadialGradient = QtGui.QRadialGradient
+QEasingCurve = QtCore.QEasingCurve
+QPoint = QtCore.QPoint
+QPropertyAnimation = QtCore.QPropertyAnimation
+QRect = QtCore.QRect
+QRectF = QtCore.QRectF
+QSize = QtCore.QSize
+QTimer = QtCore.QTimer
+Signal = QtCore.Signal
 
 
 def get_maya_main_window():
@@ -356,7 +386,7 @@ class FlashButton(QPushButton):
         menu.addSeparator()
         delete_action = menu.addAction("🗑️ Delete Button")
         
-        action = menu.exec_(self.mapToGlobal(pos))
+        action = execute_qt(menu, self.mapToGlobal(pos))
         
         if action == edit_action:
             self.edit_requested.emit(self.button_id)
@@ -1325,7 +1355,7 @@ class FlashButtonsPanel(QWidget):
             return
         
         dialog = ButtonEditDialog(button, self)
-        if dialog.exec_():
+        if execute_qt(dialog):
             data = dialog.get_data()
             button.set_function_data(data)
             self.update_button_function(button_id, data)
@@ -1672,8 +1702,7 @@ class FlashButtonsPanel(QWidget):
             }
         
         try:
-            with open(self.get_config_path(), 'w') as f:
-                json.dump(config, f, indent=2)
+            atomic_write_json(self.get_config_path(), config, indent=2)
         except Exception as e:
             print(f"Flash Buttons: Error saving config: {e}")
     
@@ -1685,8 +1714,9 @@ class FlashButtonsPanel(QWidget):
             return
         
         try:
-            with open(config_path, 'r') as f:
-                config = json.load(f)
+            config = read_json(config_path, default=None, backup_corrupt=True)
+            if not isinstance(config, dict):
+                raise ValueError("invalid or corrupt configuration")
             
             self.next_button_id = config.get('next_id', 0)
             
@@ -1824,8 +1854,9 @@ def export_config():
         
         if os.path.exists(config_path):
             try:
-                with open(config_path, 'r') as f:
-                    config = json.load(f)
+                config = read_json(config_path, default=None, backup_corrupt=True)
+                if not isinstance(config, dict):
+                    raise ValueError("invalid or corrupt configuration")
                 config['version'] = '1.0'
                 config['exported_at'] = datetime.now().isoformat()
             except Exception as e:
@@ -1837,8 +1868,9 @@ def export_config():
     
     # Write to file
     try:
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
+        atomic_write_json(
+            file_path, config, indent=2, ensure_ascii=False
+        )
         
         button_count = len(config.get('buttons', {}))
         cmds.inViewMessage(
@@ -1902,8 +1934,9 @@ def import_config():
     }
     
     try:
-        with open(local_config_path, 'w', encoding='utf-8') as f:
-            json.dump(local_config, f, indent=2, ensure_ascii=False)
+        atomic_write_json(
+            local_config_path, local_config, indent=2, ensure_ascii=False
+        )
     except Exception as e:
         cmds.warning(f"Flash Buttons: Error saving config: {e}")
         return

@@ -1,1 +1,0 @@
-"""AnimKey tests."""

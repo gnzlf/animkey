@@ -10,12 +10,12 @@ import maya.OpenMayaUI as omui
 import json
 import os
 
-try:
-    from PySide2 import QtWidgets, QtCore, QtGui
-    from shiboken2 import wrapInstance
-except ImportError:
-    from PySide6 import QtWidgets, QtCore, QtGui
-    from shiboken6 import wrapInstance
+from AnimKey.mods.storage import atomic_write_json
+
+from AnimKey.mods.maya_compat import (
+    QtCore, QtGui, QtWidgets, execute_qt, screen_available_geometry,
+    wrap_instance as wrapInstance,
+)
 
 
 WINDOW_OBJECT = "setManagerV7"
@@ -42,6 +42,14 @@ SET_BUTTON_MIN_WIDTH = 40
 SET_BUTTON_MIN_HEIGHT = 24
 SET_BUTTON_MAX_WIDTH = 720
 SET_BUTTON_MAX_HEIGHT = 320
+BOARD_SNAP_STEP = 16
+BOARD_BUTTON_SHAPES = (
+    ("rounded", "Rounded"),
+    ("pill", "Pill"),
+    ("circle", "Circle"),
+    ("diamond", "Diamond"),
+    ("hexagon", "Hexagon"),
+)
 
 # Global window instance
 _win = None
@@ -199,7 +207,10 @@ def _load_from_scene():
 
 
 def get_maya_main_window():
-    return wrapInstance(int(omui.MQtUtil.mainWindow()), QtWidgets.QWidget)
+    main_window = omui.MQtUtil.mainWindow()
+    if not main_window:
+        return None
+    return wrapInstance(int(main_window), QtWidgets.QWidget)
 
 
 def text_color_for_bg(bg):
@@ -739,7 +750,7 @@ class ButtonResizeGrip(QtWidgets.QWidget):
         painter.end()
 
     def mousePressEvent(self, event):
-        if event.button() == QtCore.Qt.LeftButton:
+        if event.button() == QtCore.Qt.LeftButton and not self.button.board_locked:
             self._drag_global = event.globalPos()
             self._start_size = QtCore.QSize(self.button.board_size)
             self.setCursor(QtCore.Qt.SizeFDiagCursor)
@@ -748,7 +759,11 @@ class ButtonResizeGrip(QtWidgets.QWidget):
         super(ButtonResizeGrip, self).mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self._drag_global and event.buttons() & QtCore.Qt.LeftButton:
+        if (
+            self._drag_global
+            and not self.button.board_locked
+            and event.buttons() & QtCore.Qt.LeftButton
+        ):
             diff = event.globalPos() - self._drag_global
             zoom = self.button._board_zoom()
             self.button.set_board_size(
@@ -765,8 +780,9 @@ class ButtonResizeGrip(QtWidgets.QWidget):
         if self._drag_global and event.button() == QtCore.Qt.LeftButton:
             self._drag_global = None
             self._start_size = None
-            self.button.position_changed.emit(self.button)
-            self.button._auto_save()
+            if not self.button.board_locked:
+                self.button.position_changed.emit(self.button)
+                self.button._auto_save()
             event.accept()
             return
         super(ButtonResizeGrip, self).mouseReleaseEvent(event)
@@ -781,7 +797,8 @@ class SetButton(QtWidgets.QFrame):
         self, name, members, color=DEFAULT_COLOR, get_namespace_func=None,
         get_namespaces_func=None, board_pos=None, namespaces=None, size_scale=1.0,
         board_size=None, namespace_mode="page", member_namespaces=None,
-        namespace_dynamic_func=None, member_bindings=None, members_hidden=None
+        namespace_dynamic_func=None, member_bindings=None, members_hidden=None,
+        board_shape="rounded", board_locked=False
     ):
         super(SetButton, self).__init__()
         self.set_name = name
@@ -868,8 +885,15 @@ class SetButton(QtWidgets.QFrame):
         self.board_size = self._size_from_data(board_size)
         if self.board_size is None:
             self.board_size = self._default_size_for_scale(self.size_scale)
+        self.board_shape = self._normalized_board_shape(board_shape)
+        self.board_locked = bool(board_locked)
+        if self.board_shape == "circle":
+            diameter = max(self.board_size.width(), self.board_size.height())
+            self.board_size = QtCore.QSize(diameter, diameter)
         self._drag_pos = None
         self._drag_start_global = None
+        self._drag_group = []
+        self._drag_group_start_positions = []
         self._was_dragged = False
         self._resize_active = False
         self._resize_drag_start = None
@@ -911,13 +935,19 @@ class SetButton(QtWidgets.QFrame):
         self.free_move_mode = bool(enabled)
         self._drag_pos = None
         self._drag_start_global = None
+        self._drag_group = []
+        self._drag_group_start_positions = []
         self._was_dragged = False
         self._resize_active = False
-        self.setCursor(QtCore.Qt.OpenHandCursor if self.free_move_mode else QtCore.Qt.PointingHandCursor)
+        self.setCursor(
+            QtCore.Qt.OpenHandCursor
+            if self.free_move_mode and not self.board_locked
+            else QtCore.Qt.PointingHandCursor
+        )
         self._apply_button_size()
         if hasattr(self, "resize_grip"):
             self._position_resize_grip()
-            self.resize_grip.setVisible(self.free_move_mode)
+            self.resize_grip.setVisible(self.free_move_mode and not self.board_locked)
 
     def setup_ui(self):
         self.setCursor(QtCore.Qt.PointingHandCursor)
@@ -969,12 +999,27 @@ class SetButton(QtWidgets.QFrame):
             max(SET_BUTTON_MIN_HEIGHT, min(SET_BUTTON_MAX_HEIGHT, int(height)))
         )
 
+    @staticmethod
+    def _normalized_board_shape(shape):
+        valid_shapes = {key for key, _label in BOARD_BUTTON_SHAPES}
+        return shape if shape in valid_shapes else "rounded"
+
+    def _board_shape_label(self):
+        for key, label in BOARD_BUTTON_SHAPES:
+            if key == self.board_shape:
+                return label
+        return "Rounded"
+
     def _resize_handle_rect(self):
         size = self._current_resize_handle_size()
         return QtCore.QRect(self.width() - size, self.height() - size, size, size)
 
     def _is_over_resize_handle(self, pos):
-        return self.free_move_mode and self._resize_handle_rect().contains(pos)
+        return (
+            self.free_move_mode
+            and not self.board_locked
+            and self._resize_handle_rect().contains(pos)
+        )
 
     def _board_parent(self):
         parent = self.parent()
@@ -1022,12 +1067,22 @@ class SetButton(QtWidgets.QFrame):
         self.resize_grip.move(self.width() - self.resize_grip.width(), self.height() - self.resize_grip.height())
         self.resize_grip.raise_()
 
+    def _normalized_board_size(self, width, height):
+        width = max(SET_BUTTON_MIN_WIDTH, min(SET_BUTTON_MAX_WIDTH, int(round(width))))
+        height = max(SET_BUTTON_MIN_HEIGHT, min(SET_BUTTON_MAX_HEIGHT, int(round(height))))
+        parent = self._board_parent()
+        if parent is not None and parent.board_snap_enabled:
+            width, height = parent._snap_board_size(width, height)
+        return QtCore.QSize(width, height)
+
     def set_board_size(self, width, height, save=True, custom=True):
         self.custom_size = bool(custom)
-        self.board_size = QtCore.QSize(
-            max(SET_BUTTON_MIN_WIDTH, min(SET_BUTTON_MAX_WIDTH, int(width))),
-            max(SET_BUTTON_MIN_HEIGHT, min(SET_BUTTON_MAX_HEIGHT, int(height)))
-        )
+        if self.board_shape == "circle":
+            width = height = max(width, height)
+        self.board_size = self._normalized_board_size(width, height)
+        if self.board_shape == "circle":
+            diameter = max(self.board_size.width(), self.board_size.height())
+            self.board_size = self._normalized_board_size(diameter, diameter)
         self._apply_button_size()
         self.update_tooltip()
         parent = self.parent()
@@ -1036,6 +1091,42 @@ class SetButton(QtWidgets.QFrame):
                 parent.update_board_bounds()
             elif hasattr(parent, "reflow"):
                 parent.reflow()
+        if save:
+            self._auto_save()
+
+    def set_board_shape(self, shape, save=True):
+        shape = self._normalized_board_shape(shape)
+        if shape == self.board_shape:
+            return
+        self.board_shape = shape
+        if shape == "circle":
+            diameter = max(self.board_size.width(), self.board_size.height())
+            self.custom_size = True
+            self.set_board_size(diameter, diameter, save=False, custom=True)
+        else:
+            self._apply_button_size()
+        self.update_tooltip()
+        parent = self.parentWidget()
+        if hasattr(parent, "update_board_bounds"):
+            parent.update_board_bounds()
+        if save:
+            self._auto_save()
+
+    def set_board_locked(self, locked, save=True):
+        locked = bool(locked)
+        if locked == self.board_locked:
+            return
+        self.board_locked = locked
+        self._drag_pos = None
+        self._drag_start_global = None
+        self._drag_group = []
+        self._drag_group_start_positions = []
+        self._resize_active = False
+        self._resize_drag_start = None
+        self._resize_start_size = None
+        self.set_free_move_mode(self.free_move_mode)
+        self.update_tooltip()
+        self.update()
         if save:
             self._auto_save()
         
@@ -1047,6 +1138,20 @@ class SetButton(QtWidgets.QFrame):
         zoom = self._board_zoom() if self.free_move_mode else 1.0
         font_size = max(4, min(28, int(round(11 * zoom))))
         radius = max(1, min(18, int(round(6 * zoom))))
+        if self.free_move_mode:
+            self.setStyleSheet(f"""
+                SetButton {{
+                    background: transparent;
+                    border: none;
+                }}
+                QLabel {{
+                    color: {tc};
+                    font-size: {font_size}px;
+                    font-weight: 500;
+                    background: transparent;
+                }}
+            """)
+            return
         self.setStyleSheet(f"""
             SetButton {{
                 background-color: {background};
@@ -1075,7 +1180,10 @@ class SetButton(QtWidgets.QFrame):
         
     def update_size(self):
         if not self.custom_size:
-            self.board_size = self._default_size_for_scale(self.size_scale)
+            default_size = self._default_size_for_scale(self.size_scale)
+            self.board_size = self._normalized_board_size(
+                default_size.width(), default_size.height()
+            )
         self._apply_button_size()
 
     def set_size_scale(self, scale, save=True):
@@ -1110,34 +1218,34 @@ class SetButton(QtWidgets.QFrame):
             f"{len(self.member_bindings)} members\n"
             f"Targets: {ns_display}\n"
             f"Button size: {self.width()} x {self.height()} px\n"
-            f"Board: drag bottom-right corner to resize"
+            f"Board shape: {self._board_shape_label()}\n"
+            f"Board position: {'locked' if self.board_locked else 'movable'}\n"
+            f"Board: drag bottom-right corner to resize\n"
+            f"Alt + drag background to pan"
         )
 
     def _uses_dynamic_namespace(self):
-        if self.namespace_mode == "custom":
-            return False
         try:
             return bool(self.get_namespace_dynamic())
         except Exception:
             return True
 
     def _target_namespaces(self):
-        if self.namespace_mode == "custom" and self.namespaces:
-            return list(self.namespaces)
-        if not self._uses_dynamic_namespace() and self.namespaces:
-            return list(self.namespaces)
-        try:
-            namespaces = self.get_namespaces() or []
-        except Exception:
+        if self._uses_dynamic_namespace():
+            try:
+                namespaces = self.get_namespaces() or []
+            except Exception:
+                namespaces = []
+        elif self.namespaces:
+            namespaces = list(self.namespaces)
+        else:
             namespaces = []
         clean = []
         for ns in namespaces:
             ns = ns or ""
             if ns not in clean:
                 clean.append(ns)
-        if clean:
-            return clean
-        return [self.get_namespace() or ""]
+        return clean
 
     def _resolve_static_members(self):
         resolved = []
@@ -1162,7 +1270,9 @@ class SetButton(QtWidgets.QFrame):
         return resolved
         
     def get_resolved_members(self):
-        if self.namespace_mode != "custom" and not self._uses_dynamic_namespace():
+        # The page lock is authoritative: closed means only the original rig,
+        # prop, or geometry captured in each member binding may be resolved.
+        if not self._uses_dynamic_namespace():
             return self._resolve_static_members()
 
         resolved = []
@@ -1226,6 +1336,184 @@ class SetButton(QtWidgets.QFrame):
         action.setDefaultWidget(widget)
         menu.addAction(action)
         return action
+
+    def _context_target_buttons(self):
+        """Return the Board/UI selection when this button belongs to it."""
+        parent = self.parentWidget()
+        if hasattr(parent, "selected_buttons"):
+            selected = parent.selected_buttons()
+            if self in selected:
+                return selected
+        return [self]
+
+    def _context_parent(self):
+        parent = self.parentWidget()
+        return parent if hasattr(parent, "_auto_save") else None
+
+    def _save_context_targets(self, refresh_selection=False):
+        parent = self._context_parent()
+        if parent is None:
+            self._auto_save()
+            return
+        if refresh_selection:
+            parent.selection_changed.emit()
+        parent._auto_save()
+
+    def _context_members(self):
+        members = []
+        seen = set()
+        for button in self._context_target_buttons():
+            for member in button._resolved_members_for_action():
+                if member not in seen:
+                    members.append(member)
+                    seen.add(member)
+        return members
+
+    def do_context_select(self):
+        members = self._context_members()
+        if members:
+            cmds.select(members, r=True)
+        else:
+            cmds.warning("No valid objects found")
+
+    def _set_context_members_hidden(self, hidden):
+        targets = self._context_target_buttons()
+        cmds.undoInfo(openChunk=True, chunkName="AnimKey_SetVisibility")
+        try:
+            for button in targets:
+                button._set_members_hidden(
+                    hidden, manage_undo=False, save=False
+                )
+        finally:
+            cmds.undoInfo(closeChunk=True)
+        self._save_context_targets(refresh_selection=True)
+
+    def do_context_hide_members(self):
+        self._set_context_members_hidden(True)
+
+    def do_context_show_members(self):
+        self._set_context_members_hidden(False)
+
+    def do_context_add_selection(self):
+        selection = cmds.ls(sl=True, long=True) or []
+        if not selection:
+            return
+        added = 0
+        for button in self._context_target_buttons():
+            for member in selection:
+                if button._add_member_binding(make_member_binding(member)):
+                    added += 1
+            button._rebuild_member_metadata()
+            if button.namespace_mode != "custom":
+                button.namespaces = unique_namespaces_from_member_map(
+                    button.member_namespaces
+                )
+            button.update_tooltip()
+        self._save_context_targets()
+        cmds.inViewMessage(msg="Added {} member(s)".format(added), pos="midCenter", fade=True)
+
+    def do_context_remove_selection(self):
+        selection = cmds.ls(sl=True, long=True) or []
+        if not selection:
+            return
+        selected_bindings = [make_member_binding(member) for member in selection]
+        selected_ids = {binding_identity(binding) for binding in selected_bindings}
+        selected_names = {
+            (binding.get("member"), binding.get("namespace") or "")
+            for binding in selected_bindings
+        }
+        removed = 0
+        for button in self._context_target_buttons():
+            kept = []
+            for binding in button.member_bindings:
+                exact_match = binding_identity(binding) in selected_ids
+                name_match = (
+                    not binding.get("uuid")
+                    and (binding.get("member"), binding.get("namespace") or "") in selected_names
+                )
+                if exact_match or name_match:
+                    removed += 1
+                else:
+                    kept.append(binding)
+            button.member_bindings = kept
+            button._rebuild_member_metadata()
+            if button.namespace_mode != "custom":
+                button.namespaces = unique_namespaces_from_member_map(
+                    button.member_namespaces
+                )
+            button.update_tooltip()
+        self._save_context_targets()
+        cmds.inViewMessage(msg="Removed {} member(s)".format(removed), pos="midCenter", fade=True)
+
+    def do_context_follow_panel_namespace(self):
+        for button in self._context_target_buttons():
+            button.namespace_mode = "page"
+            if not button.namespaces:
+                button.namespaces = unique_namespaces_from_member_map(
+                    button.member_namespaces
+                )
+            button.update_tooltip()
+        self._save_context_targets()
+
+    def do_context_use_selection_namespaces(self, add=False):
+        namespaces = self._selection_namespaces()
+        if not namespaces:
+            cmds.warning("No namespace found in current selection.")
+            return
+        for button in self._context_target_buttons():
+            button.namespace_mode = "custom"
+            if not add:
+                button.namespaces = []
+            for namespace in namespaces:
+                if namespace not in button.namespaces:
+                    button.namespaces.append(namespace)
+            button.update_tooltip()
+        self._save_context_targets()
+
+    def set_context_board_shape(self, shape):
+        for button in self._context_target_buttons():
+            button.set_board_shape(shape, save=False)
+        self._save_context_targets()
+
+    def set_context_board_locked(self, locked):
+        for button in self._context_target_buttons():
+            button.set_board_locked(locked, save=False)
+        self._save_context_targets()
+
+    def set_context_size_scale(self, scale):
+        for button in self._context_target_buttons():
+            button.set_size_scale(scale, save=False)
+        self._save_context_targets()
+
+    def set_context_board_dimension(self, dimension, value):
+        for button in self._context_target_buttons():
+            width = value if dimension == "width" else button.board_size.width()
+            height = value if dimension == "height" else button.board_size.height()
+            button.set_board_size(width, height, save=False, custom=True)
+
+    def _set_context_color(self, color):
+        color = _palette_color(color)
+        targets = self._context_target_buttons()
+        changed = False
+        for button in targets:
+            if button.color == color:
+                continue
+            button.color = color
+            button.apply_style()
+            button.update()
+            changed = True
+        parent = self._context_parent()
+        if changed and parent is not None:
+            parent.on_button_color_changed(self)
+        self._save_context_targets()
+
+    def do_context_delete(self):
+        parent = self._context_parent()
+        if parent is not None and hasattr(parent, "remove_buttons"):
+            parent.remove_buttons(self._context_target_buttons())
+            parent._auto_save()
+            return
+        self.do_delete()
         
     def show_menu(self, pos):
         m = QtWidgets.QMenu(self)
@@ -1238,34 +1526,78 @@ class SetButton(QtWidgets.QFrame):
             QSlider::handle:horizontal { width: 13px; margin: -5px 0; background: #3498DB; border-radius: 6px; }
             QSlider::sub-page:horizontal { background: #3498DB; border-radius: 2px; }
         """)
-        
-        m.addAction("Select", self.do_select)
-        m.addAction("Hide Members", self.do_hide_members)
-        m.addAction("Show Members", self.do_show_members)
-        m.addAction("Add Selection to Set", self.do_add_sel)
-        m.addAction("Remove Selection from Set", self.do_rem_sel)
+
+        context_targets = self._context_target_buttons()
+        multiple_targets = len(context_targets) > 1
+        m.addAction("Select", self.do_context_select)
+        m.addAction("Hide Members", self.do_context_hide_members)
+        m.addAction("Show Members", self.do_context_show_members)
+        m.addAction("Add Selection to Set", self.do_context_add_selection)
+        m.addAction("Remove Selection from Set", self.do_context_remove_selection)
         m.addSeparator()
-        follow_action = m.addAction("Use Panel Lock Mode", self.do_follow_panel_namespace)
+        follow_action = m.addAction("Use Panel Lock Mode", self.do_context_follow_panel_namespace)
         follow_action.setCheckable(True)
-        follow_action.setChecked(self.namespace_mode != "custom")
-        m.addAction("Use Selection Namespaces", self.do_use_selection_namespaces)
-        m.addAction("Add Selection Namespaces", self.do_add_selection_namespaces)
+        follow_action.setChecked(all(
+            button.namespace_mode != "custom" for button in context_targets
+        ))
+        m.addAction(
+            "Use Selection Namespaces",
+            lambda: self.do_context_use_selection_namespaces(add=False),
+        )
+        m.addAction(
+            "Add Selection Namespaces",
+            lambda: self.do_context_use_selection_namespaces(add=True),
+        )
         if self.free_move_mode:
+            parent = self.parentWidget()
+            if hasattr(parent, "mirror_selected_buttons"):
+                mirror_action = m.addAction("Mirror Selected Buttons")
+                mirror_action.setEnabled(bool(parent.selected_buttons()) or not self.filtered_out)
+                mirror_action.setToolTip(
+                    "Create opposite-side copies of the selected Board buttons"
+                )
+                mirror_action.triggered.connect(
+                    lambda checked=False, owner=parent: owner.mirror_selected_buttons(
+                        None if self.ui_selected else [self]
+                    )
+                )
+                m.addSeparator()
+            shape_menu = m.addMenu("Board Shape")
+            for shape, label in BOARD_BUTTON_SHAPES:
+                act = shape_menu.addAction(label)
+                act.setCheckable(True)
+                act.setChecked(shape == self.board_shape)
+                act.triggered.connect(
+                    lambda checked=False, value=shape: self.set_context_board_shape(value)
+                )
+            lock_action = m.addAction("Lock Board Position")
+            lock_action.setCheckable(True)
+            lock_action.setChecked(all(
+                button.board_locked for button in context_targets
+            ))
+            lock_action.setToolTip("Prevent moving or resizing this Board button")
+            lock_action.triggered.connect(self.set_context_board_locked)
+            m.addSeparator()
             size_menu = m.addMenu("Board Size")
+            size_menu.setEnabled(not self.board_locked)
             for label, scale in (("Small", 0.85), ("Normal", 1.0), ("Large", 1.3), ("XL", 1.65), ("XXL", 2.0)):
                 act = size_menu.addAction(label)
                 act.setCheckable(True)
                 act.setChecked((not self.custom_size) and abs(self.size_scale - scale) < 0.05)
-                act.triggered.connect(lambda checked=False, s=scale: self.set_size_scale(s))
+                act.triggered.connect(
+                    lambda checked=False, s=scale: self.set_context_size_scale(s)
+                )
             size_menu.addSeparator()
-            size_menu.addAction("Auto Fit Text", lambda: self.set_size_scale(1.0))
+            size_menu.addAction(
+                "Auto Fit Text", lambda: self.set_context_size_scale(1.0)
+            )
             self._add_dimension_slider_action(
                 size_menu,
                 "Width",
                 self.board_size.width(),
                 SET_BUTTON_MIN_WIDTH,
                 max(SET_BUTTON_MAX_WIDTH, self.board_size.width()),
-                lambda v: self.set_board_size(v, self.board_size.height(), save=False, custom=True)
+                lambda v: self.set_context_board_dimension("width", v)
             )
             self._add_dimension_slider_action(
                 size_menu,
@@ -1273,35 +1605,30 @@ class SetButton(QtWidgets.QFrame):
                 self.board_size.height(),
                 SET_BUTTON_MIN_HEIGHT,
                 max(SET_BUTTON_MAX_HEIGHT, self.board_size.height()),
-                lambda v: self.set_board_size(self.board_size.width(), v, save=False, custom=True)
+                lambda v: self.set_context_board_dimension("height", v)
             )
         m.addSeparator()
-        m.addAction("Rename", self.do_rename)
+        rename_action = m.addAction("Rename", self.do_rename)
+        rename_action.setEnabled(not multiple_targets)
+        if multiple_targets:
+            rename_action.setToolTip("Rename one set at a time")
         m.addAction("Change Color", self.do_color)
         m.addSeparator()
-        m.addAction("Delete", self.do_delete)
-        m.exec_(self.mapToGlobal(pos))
+        m.addAction("Delete", self.do_context_delete)
+        execute_qt(m, self.mapToGlobal(pos))
 
     def paintEvent(self, event):
         super(SetButton, self).paintEvent(event)
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
 
-        if self.members_hidden:
-            zoom = self._board_zoom() if self.free_move_mode else 1.0
-            radius = max(1, min(18, int(round(6 * zoom))))
-            hatch_rect = QtCore.QRectF(self.rect().adjusted(2, 2, -2, -2))
-            clip_path = QtGui.QPainterPath()
-            clip_path.addRoundedRect(hatch_rect, radius, radius)
-            painter.setClipPath(clip_path)
-            hatch = QtGui.QColor(235, 238, 242, 88)
-            painter.setPen(QtGui.QPen(hatch, max(1.0, zoom)))
-            spacing = max(5, int(round(7 * zoom)))
-            for x in range(-self.height(), self.width() + self.height(), spacing):
-                painter.drawLine(x, self.height(), x + self.height(), 0)
-            painter.setClipping(False)
+        if self.free_move_mode:
+            self._paint_board_shape(painter)
+            self._paint_board_lock(painter)
+        elif self.members_hidden:
+            self._paint_hatch(painter, self._button_shape_path())
 
-        if self.free_move_mode and not (
+        if self.free_move_mode and not self.board_locked and not (
             hasattr(self, "resize_grip") and self.resize_grip.isVisible()
         ):
             tc = QtGui.QColor(text_color_for_bg(self.color))
@@ -1316,11 +1643,100 @@ class SetButton(QtWidgets.QFrame):
                     rect.bottom() - offset
                 )
         painter.end()
+
+    def _button_shape_path(self, rect=None):
+        if rect is None:
+            rect = self.rect()
+        rect = QtCore.QRectF(rect).adjusted(1, 1, -1, -1)
+        path = QtGui.QPainterPath()
+        if self.board_shape == "circle":
+            diameter = min(rect.width(), rect.height())
+            circle = QtCore.QRectF(
+                rect.center().x() - diameter / 2.0,
+                rect.center().y() - diameter / 2.0,
+                diameter,
+                diameter,
+            )
+            path.addEllipse(circle)
+        elif self.board_shape == "pill":
+            path.addRoundedRect(rect, rect.height() / 2.0, rect.height() / 2.0)
+        elif self.board_shape == "diamond":
+            polygon = QtGui.QPolygonF([
+                QtCore.QPointF(rect.center().x(), rect.top()),
+                QtCore.QPointF(rect.right(), rect.center().y()),
+                QtCore.QPointF(rect.center().x(), rect.bottom()),
+                QtCore.QPointF(rect.left(), rect.center().y()),
+            ])
+            path.addPolygon(polygon)
+            path.closeSubpath()
+        elif self.board_shape == "hexagon":
+            inset = min(rect.width() * 0.22, rect.height() * 0.48)
+            polygon = QtGui.QPolygonF([
+                QtCore.QPointF(rect.left() + inset, rect.top()),
+                QtCore.QPointF(rect.right() - inset, rect.top()),
+                QtCore.QPointF(rect.right(), rect.center().y()),
+                QtCore.QPointF(rect.right() - inset, rect.bottom()),
+                QtCore.QPointF(rect.left() + inset, rect.bottom()),
+                QtCore.QPointF(rect.left(), rect.center().y()),
+            ])
+            path.addPolygon(polygon)
+            path.closeSubpath()
+        else:
+            zoom = self._board_zoom() if self.free_move_mode else 1.0
+            radius = max(1, min(18, int(round(6 * zoom))))
+            path.addRoundedRect(rect, radius, radius)
+        return path
+
+    def _paint_hatch(self, painter, clip_path):
+        zoom = self._board_zoom() if self.free_move_mode else 1.0
+        painter.save()
+        painter.setClipPath(clip_path)
+        hatch = QtGui.QColor(235, 238, 242, 88)
+        painter.setPen(QtGui.QPen(hatch, max(1.0, zoom)))
+        spacing = max(5, int(round(7 * zoom)))
+        for x in range(-self.height(), self.width() + self.height(), spacing):
+            painter.drawLine(x, self.height(), x + self.height(), 0)
+        painter.restore()
+
+    def _paint_board_shape(self, painter):
+        background = "#555A60" if self.members_hidden else self.color
+        fill = QtGui.QColor(background)
+        if self.underMouse():
+            fill = fill.lighter(115)
+        path = self._button_shape_path()
+        border = QtGui.QColor("#78BFFF" if self.ui_selected or self.underMouse() else background)
+        painter.fillPath(path, fill)
+        painter.setPen(QtGui.QPen(border, 2))
+        painter.drawPath(path)
+        if self.members_hidden:
+            self._paint_hatch(painter, path)
+
+    def _paint_board_lock(self, painter):
+        if not self.board_locked:
+            return
+        zoom = self._board_zoom()
+        size = max(9, min(16, int(round(12 * zoom))))
+        x = max(5, int(round(7 * zoom)))
+        y = max(5, int(round(6 * zoom)))
+        color = QtGui.QColor(text_color_for_bg("#555A60" if self.members_hidden else self.color))
+        color.setAlpha(215)
+        painter.setPen(QtGui.QPen(color, max(1.0, zoom)))
+        painter.setBrush(QtCore.Qt.NoBrush)
+        painter.drawRoundedRect(
+            QtCore.QRectF(x, y + size * 0.42, size, size * 0.56),
+            max(1, size * 0.12),
+            max(1, size * 0.12),
+        )
+        painter.drawArc(
+            QtCore.QRectF(x + size * 0.2, y, size * 0.6, size * 0.8),
+            0,
+            180 * 16,
+        )
         
     def mousePressEvent(self, e):
-        if e.button() == QtCore.Qt.MiddleButton and self.free_move_mode:
-            parent = self.parent()
-            if hasattr(parent, "_start_board_pan") and parent._start_board_pan(e):
+        parent = self.parent()
+        if self.free_move_mode and hasattr(parent, "_start_board_pan"):
+            if parent._start_board_pan(e):
                 self.setCursor(QtCore.Qt.ClosedHandCursor)
                 return
         if e.button() == QtCore.Qt.LeftButton:
@@ -1338,6 +1754,16 @@ class SetButton(QtWidgets.QFrame):
             self._drag_start_global = e.globalPos()
             self._was_dragged = False
             if self.free_move_mode:
+                if self.board_locked:
+                    e.accept()
+                    return
+                modifiers = e.modifiers() if hasattr(e, "modifiers") else QtWidgets.QApplication.keyboardModifiers()
+                if hasattr(parent, "prepare_button_drag"):
+                    self._drag_group = parent.prepare_button_drag(self, modifiers)
+                    self._drag_group_start_positions = [
+                        (button, QtCore.QPoint(button.board_pos))
+                        for button in self._drag_group
+                    ]
                 self.setCursor(QtCore.Qt.ClosedHandCursor)
                 e.accept()
                 return
@@ -1363,19 +1789,22 @@ class SetButton(QtWidgets.QFrame):
 
         if self._drag_pos and e.buttons() == QtCore.Qt.LeftButton:
             if self.free_move_mode:
+                if self.board_locked:
+                    e.accept()
+                    return
                 if self._drag_start_global and (e.globalPos() - self._drag_start_global).manhattanLength() > 3:
                     self._was_dragged = True
                 if self._was_dragged and self.parent():
-                    delta = e.pos() - self._drag_pos
-                    new_pos = self.pos() + delta
                     parent = self.parent()
-                    if hasattr(parent, "visual_to_board_point"):
-                        logical_pos = parent.visual_to_board_point(new_pos)
-                        logical_pos.setX(max(8, logical_pos.x()))
-                        logical_pos.setY(max(8, logical_pos.y()))
-                        self.board_pos = QtCore.QPoint(logical_pos)
-                        self.move(parent.board_to_visual_point(logical_pos))
+                    if hasattr(parent, "move_button_group"):
+                        parent.move_button_group(
+                            self,
+                            self._drag_group_start_positions,
+                            e.globalPos() - self._drag_start_global,
+                        )
                     else:
+                        delta = e.pos() - self._drag_pos
+                        new_pos = self.pos() + delta
                         new_pos.setX(max(8, new_pos.x()))
                         new_pos.setY(max(8, new_pos.y()))
                         self.move(new_pos)
@@ -1389,15 +1818,17 @@ class SetButton(QtWidgets.QFrame):
                 self._start_drag()
                 self._drag_pos = None
         if self.free_move_mode and not (e.buttons() & QtCore.Qt.LeftButton):
-            self.setCursor(QtCore.Qt.SizeFDiagCursor if self._is_over_resize_handle(e.pos()) else QtCore.Qt.OpenHandCursor)
+            if self.board_locked:
+                self.setCursor(QtCore.Qt.PointingHandCursor)
+            else:
+                self.setCursor(QtCore.Qt.SizeFDiagCursor if self._is_over_resize_handle(e.pos()) else QtCore.Qt.OpenHandCursor)
         super(SetButton, self).mouseMoveEvent(e)
         
     def mouseReleaseEvent(self, e):
-        if e.button() == QtCore.Qt.MiddleButton:
-            parent = self.parent()
-            if hasattr(parent, "_end_board_pan") and parent._end_board_pan(e):
-                self.setCursor(QtCore.Qt.OpenHandCursor if self.free_move_mode else QtCore.Qt.PointingHandCursor)
-                return
+        parent = self.parent()
+        if hasattr(parent, "_end_board_pan") and parent._end_board_pan(e):
+            self.setCursor(QtCore.Qt.OpenHandCursor if self.free_move_mode else QtCore.Qt.PointingHandCursor)
+            return
 
         if self._resize_active and e.button() == QtCore.Qt.LeftButton:
             self._resize_active = False
@@ -1411,7 +1842,10 @@ class SetButton(QtWidgets.QFrame):
 
         if e.button() == QtCore.Qt.LeftButton and self._drag_pos:
             if self.free_move_mode:
-                self.setCursor(QtCore.Qt.OpenHandCursor)
+                self.setCursor(
+                    QtCore.Qt.PointingHandCursor
+                    if self.board_locked else QtCore.Qt.OpenHandCursor
+                )
                 if self._was_dragged:
                     parent = self.parent()
                     if hasattr(parent, "visual_to_board_point"):
@@ -1421,6 +1855,8 @@ class SetButton(QtWidgets.QFrame):
                     self.position_changed.emit(self)
                     self._drag_pos = None
                     self._drag_start_global = None
+                    self._drag_group = []
+                    self._drag_group_start_positions = []
                     self._was_dragged = False
                     e.accept()
                     return
@@ -1428,6 +1864,8 @@ class SetButton(QtWidgets.QFrame):
             self._dispatch_selection_action(mods)
         self._drag_pos = None
         self._drag_start_global = None
+        self._drag_group = []
+        self._drag_group_start_positions = []
         super(SetButton, self).mouseReleaseEvent(e)
 
     def wheelEvent(self, e):
@@ -1448,7 +1886,7 @@ class SetButton(QtWidgets.QFrame):
         drag.setMimeData(mime)
         drag.setPixmap(self.grab())
         drag.setHotSpot(QtCore.QPoint(self.width()//2, self.height()//2))
-        drag.exec_(QtCore.Qt.MoveAction)
+        execute_qt(drag, QtCore.Qt.MoveAction)
 
     def _dispatch_selection_action(self, modifiers):
         parent = self.parentWidget()
@@ -1678,14 +2116,14 @@ class SetButton(QtWidgets.QFrame):
             )
             swatch.clicked.connect(
                 lambda checked=False, value=color, popup=menu: (
-                    self._set_color(value), popup.close()
+                    self._set_context_color(value), popup.close()
                 )
             )
             grid.addWidget(swatch, index // 10, index % 10)
         action = QtWidgets.QWidgetAction(menu)
         action.setDefaultWidget(palette_widget)
         menu.addAction(action)
-        menu.exec_(QtGui.QCursor.pos())
+        execute_qt(menu, QtGui.QCursor.pos())
 
     def _set_color(self, color):
         color = _palette_color(color)
@@ -1714,7 +2152,9 @@ class SetButton(QtWidgets.QFrame):
             "member_bindings": self.member_bindings,
             "size_scale": self.size_scale,
             "board_size": {"w": int(self.board_size.width()), "h": int(self.board_size.height())},
-            "board_pos": {"x": int(self.board_pos.x()), "y": int(self.board_pos.y())}
+            "board_pos": {"x": int(self.board_pos.x()), "y": int(self.board_pos.y())},
+            "board_shape": self.board_shape,
+            "board_locked": self.board_locked,
         }
 
 
@@ -1738,6 +2178,8 @@ class FlowContainer(QtWidgets.QWidget):
         self.background_scale = 1.0
         self.background_opacity = 0.92
         self.board_zoom = 1.0
+        self.board_snap_enabled = False
+        self.board_snap_step = BOARD_SNAP_STEP
         self._background_pixmap = QtGui.QPixmap()
         self._selection_active = False
         self._selection_origin = QtCore.QPoint()
@@ -1838,11 +2280,102 @@ class FlowContainer(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def set_board_snap_enabled(self, enabled, save=True):
+        enabled = bool(enabled)
+        changed = self.board_snap_enabled != enabled
+        self.board_snap_enabled = enabled
+        if enabled:
+            self.snap_all_board_geometry(save=False)
+        elif changed:
+            self.reflow()
+        if save and changed:
+            self._auto_save()
+
+    def _snap_board_point(self, point):
+        point = QtCore.QPoint(point)
+        if not self.board_snap_enabled:
+            return QtCore.QPoint(max(8, point.x()), max(8, point.y()))
+        step = max(1, int(self.board_snap_step))
+        return QtCore.QPoint(
+            max(step, int(round(float(point.x()) / step)) * step),
+            max(step, int(round(float(point.y()) / step)) * step),
+        )
+
+    def _snap_board_dimension(self, value, minimum, maximum):
+        step = max(1, int(self.board_snap_step))
+        snapped_minimum = int((int(minimum) + step - 1) / step) * step
+        snapped_maximum = int(int(maximum) / step) * step
+        snapped = int(round(float(value) / step)) * step
+        return max(snapped_minimum, min(snapped_maximum, snapped))
+
+    def _snap_board_size(self, width, height):
+        if not self.board_snap_enabled:
+            return int(round(width)), int(round(height))
+        return (
+            self._snap_board_dimension(
+                width, SET_BUTTON_MIN_WIDTH, SET_BUTTON_MAX_WIDTH
+            ),
+            self._snap_board_dimension(
+                height, SET_BUTTON_MIN_HEIGHT, SET_BUTTON_MAX_HEIGHT
+            ),
+        )
+
+    def _snap_button_geometry(self, button, move_button=True):
+        """Normalize one button in logical Board coordinates and dimensions."""
+        if not self.board_snap_enabled or button not in self.buttons:
+            return False
+
+        changed = False
+        snapped_pos = self._snap_board_point(button.board_pos)
+        if snapped_pos != button.board_pos:
+            button.board_pos = QtCore.QPoint(snapped_pos)
+            changed = True
+
+        width, height = self._snap_board_size(
+            button.board_size.width(), button.board_size.height()
+        )
+        if button.board_shape == "circle":
+            width = height = max(width, height)
+            width, height = self._snap_board_size(width, height)
+        snapped_size = QtCore.QSize(width, height)
+        if snapped_size != button.board_size:
+            button.board_size = snapped_size
+            button._apply_button_size()
+            changed = True
+
+        if move_button and self.layout_mode == "board":
+            button.move(self.board_to_visual_point(button.board_pos))
+        return changed
+
+    def snap_all_board_geometry(self, save=True):
+        """Snap every placed Board button, including its width and height."""
+        if not self.board_snap_enabled:
+            return False
+        changed = False
+        for button in self.buttons:
+            if button.board_pos == QtCore.QPoint(0, 0):
+                continue
+            changed = self._snap_button_geometry(button) or changed
+        self.reflow()
+        if changed and save:
+            self._auto_save()
+        return changed
+
+    def _visual_to_board_delta(self, delta):
+        zoom = max(0.05, float(self.board_zoom or 1.0))
+        return QtCore.QPoint(
+            int(round(delta.x() / zoom)),
+            int(round(delta.y() / zoom)),
+        )
+
     def _start_board_pan(self, event):
         if self.layout_mode != "board":
             return False
         mods = event.modifiers() if hasattr(event, "modifiers") else QtWidgets.QApplication.keyboardModifiers()
-        if not (mods & QtCore.Qt.ControlModifier):
+        button = event.button() if hasattr(event, "button") else QtCore.Qt.NoButton
+        alt_drag = bool(mods & QtCore.Qt.AltModifier) and button == QtCore.Qt.LeftButton
+        legacy_pan = button == QtCore.Qt.MiddleButton and bool(mods & QtCore.Qt.ControlModifier)
+        if not (alt_drag or legacy_pan):
             return False
         scroll = self._scroll_area()
         if scroll is None:
@@ -1883,6 +2416,57 @@ class FlowContainer(QtWidgets.QWidget):
             int(round(point.x() / zoom)),
             int(round(point.y() / zoom))
         )
+
+    def prepare_button_drag(self, button, modifiers=QtCore.Qt.NoModifier):
+        if self.layout_mode != "board" or button not in self.buttons:
+            return []
+        if modifiers & (QtCore.Qt.ShiftModifier | QtCore.Qt.ControlModifier):
+            self.select_button(button, modifiers)
+        elif not button.ui_selected:
+            self.select_button(button, QtCore.Qt.NoModifier)
+        selected = self.selected_buttons()
+        return selected if button in selected else []
+
+    def move_button_group(self, source_button, start_positions, visual_delta):
+        if self.layout_mode != "board" or not start_positions:
+            return
+        start_map = {
+            button: QtCore.QPoint(position)
+            for button, position in start_positions
+            if (
+                button in self.buttons
+                and not button.filtered_out
+                and not getattr(button, "board_locked", False)
+            )
+        }
+        source_start = start_map.get(source_button)
+        if source_start is None:
+            return
+
+        logical_delta = self._visual_to_board_delta(visual_delta)
+        if self.board_snap_enabled:
+            # Snap every button independently. Snapping only the source button
+            # preserves off-grid offsets and leaves the Board visually uneven.
+            for button, start_pos in start_map.items():
+                board_pos = self._snap_board_point(start_pos + logical_delta)
+                button.board_pos = QtCore.QPoint(board_pos)
+                button.move(self.board_to_visual_point(board_pos))
+        else:
+            target_source = self._snap_board_point(source_start + logical_delta)
+            move_delta = target_source - source_start
+
+            min_x = min(position.x() + move_delta.x() for position in start_map.values())
+            min_y = min(position.y() + move_delta.y() for position in start_map.values())
+            if min_x < 8:
+                move_delta.setX(move_delta.x() + 8 - min_x)
+            if min_y < 8:
+                move_delta.setY(move_delta.y() + 8 - min_y)
+
+            for button, start_pos in start_map.items():
+                board_pos = start_pos + move_delta
+                button.board_pos = QtCore.QPoint(board_pos)
+                button.move(self.board_to_visual_point(board_pos))
+        self.update_board_bounds()
 
     def board_to_visual_point(self, point):
         zoom = max(0.05, float(self.board_zoom or 1.0))
@@ -2003,6 +2587,18 @@ class FlowContainer(QtWidgets.QWidget):
         menu = QtWidgets.QMenu(self)
         menu.setStyleSheet(self._menu_style())
         menu.aboutToHide.connect(self._auto_save)
+        if self.layout_mode == "board":
+            selected = self.selected_buttons()
+            mirror_action = menu.addAction("Mirror Selected Buttons")
+            mirror_action.setEnabled(bool(selected))
+            mirror_action.setToolTip(
+                "Create opposite-side copies around the visible Board center"
+            )
+            mirror_action.triggered.connect(self.mirror_selected_buttons)
+            snap_action = menu.addAction("Snap All Board Buttons")
+            snap_action.setEnabled(self.board_snap_enabled and bool(self.buttons))
+            snap_action.triggered.connect(self.snap_all_board_geometry)
+            menu.addSeparator()
         menu.addAction("Add Background", self.choose_background_image)
         if self.background_path:
             menu.addAction("Clear Background", self.clear_background_image)
@@ -2025,9 +2621,9 @@ class FlowContainer(QtWidgets.QWidget):
                 lambda v: self.set_background_opacity(v / 100.0, save=False),
                 self._auto_save
             )
-        menu.exec_(global_pos)
+        execute_qt(menu, global_pos)
         
-    def add_button(self, btn):
+    def add_button(self, btn, reflow=True, notify_colors=True):
         btn.setParent(self)
         btn.deleted.connect(self.remove_button)
         btn.position_changed.connect(self.on_button_position_changed)
@@ -2040,8 +2636,162 @@ class FlowContainer(QtWidgets.QWidget):
         if self.layout_mode == "board" and btn.board_pos == QtCore.QPoint(0, 0):
             btn.board_pos = self._next_board_position()
         btn.set_free_move_mode(self.layout_mode == "board")
+        if self.layout_mode == "board":
+            self._snap_button_geometry(btn)
+        if reflow:
+            self.reflow()
+        if notify_colors:
+            self.colors_changed.emit()
+
+    def _visible_board_axis_x(self):
+        """Return the logical x coordinate at the center of the visible Board."""
+        zoom = max(0.05, float(self.board_zoom or 1.0))
+        scroll = self._scroll_area()
+        if scroll is not None:
+            viewport = scroll.viewport()
+            return (scroll.horizontalScrollBar().value() + viewport.width() / 2.0) / zoom
+        return max(self.width(), 220) / (2.0 * zoom)
+
+    def _mirrored_member_bindings(self, button):
+        """Build saved bindings for the controls opposite a source set."""
+        try:
+            from AnimKey.buttons import selectOpposite
+        except ImportError:
+            import selectOpposite
+
+        source_bindings = list(button.member_bindings)
+        if not source_bindings:
+            source_bindings = [
+                make_member_binding(member)
+                for member in button._resolved_members_for_action()
+            ]
+
+        mirrored = []
+        missing = []
+        for binding in source_bindings:
+            source_member = resolve_static_binding(binding)
+            if not source_member:
+                source_node = binding.get("path") or ""
+                source_component = binding.get("component") or ""
+                if source_node:
+                    source_member = source_node + source_component
+            if not source_member:
+                source_member = _resolve_named_member(
+                    binding.get("member") or "",
+                    binding.get("namespace") or "",
+                )
+            source_node, component = split_member_component(source_member)
+            opposite_node = selectOpposite.find_opposite_name(source_node)
+            if not opposite_node:
+                missing.append(binding.get("member") or source_node)
+                continue
+            mirrored_binding = make_member_binding(opposite_node + component)
+            identity = binding_identity(mirrored_binding)
+            if not any(binding_identity(item) == identity for item in mirrored):
+                mirrored.append(mirrored_binding)
+        return mirrored, missing
+
+    def _mirrored_set_name(self, button):
+        try:
+            from AnimKey.buttons import selectOpposite
+        except ImportError:
+            import selectOpposite
+
+        candidate = selectOpposite.swap_side_name(button.set_name)
+        if candidate == button.set_name:
+            candidate = "{} Mirror".format(button.set_name)
+
+        existing_names = {item.set_name.lower() for item in self.buttons}
+        unique_name = candidate
+        number = 2
+        while unique_name.lower() in existing_names:
+            unique_name = "{} {}".format(candidate, number)
+            number += 1
+        return unique_name
+
+    def mirror_selected_buttons(self, source_buttons=None, axis_x=None):
+        """Duplicate selected Board sets on their opposite rig side.
+
+        Buttons are mirrored as rectangles, rather than points, so differing
+        button widths still reverse their left-to-right order correctly.
+        """
+        if self.layout_mode != "board":
+            cmds.warning("Switch to Board mode to mirror set buttons.")
+            return []
+
+        sources = list(source_buttons or self.selected_buttons())
+        sources = [
+            button for button in sources
+            if button in self.buttons and not button.filtered_out
+        ]
+        if not sources:
+            cmds.warning("Select one or more Board buttons first.")
+            return []
+
+        if axis_x is None:
+            axis_x = self._visible_board_axis_x()
+        axis_x = float(axis_x)
+        created = []
+        missing_members = []
+
+        for source in sources:
+            mirrored_bindings, missing = self._mirrored_member_bindings(source)
+            missing_members.extend(missing)
+            if not mirrored_bindings:
+                continue
+
+            mirrored_x = int(round(
+                (2.0 * axis_x) - source.board_pos.x() - source.board_size.width()
+            ))
+            mirrored_pos = self._snap_board_point(
+                QtCore.QPoint(mirrored_x, source.board_pos.y())
+            )
+            mirrored = SetButton(
+                self._mirrored_set_name(source),
+                [],
+                color=source.color,
+                get_namespace_func=source.get_namespace,
+                get_namespaces_func=source.get_namespaces,
+                namespace_dynamic_func=source.get_namespace_dynamic,
+                board_pos={"x": mirrored_pos.x(), "y": mirrored_pos.y()},
+                namespaces=list(source.namespaces),
+                size_scale=source.size_scale,
+                board_size={
+                    "w": source.board_size.width(),
+                    "h": source.board_size.height(),
+                },
+                namespace_mode=source.namespace_mode,
+                member_bindings=mirrored_bindings,
+                members_hidden=False,
+                board_shape=source.board_shape,
+                board_locked=source.board_locked,
+            )
+            self.add_button(mirrored, reflow=False, notify_colors=False)
+            created.append(mirrored)
+
+        if not created:
+            cmds.warning("No opposite controls were found for the selected sets.")
+            return []
+
         self.reflow()
+        self.select_buttons(created, QtCore.Qt.NoModifier)
         self.colors_changed.emit()
+        self._auto_save()
+        try:
+            cmds.inViewMessage(
+                msg="Mirrored {} set(s)".format(len(created)),
+                pos="midCenter",
+                fade=True,
+            )
+        except Exception:
+            pass
+        if missing_members:
+            cmds.warning(
+                "No opposite control found for {} member(s).".format(
+                    len(missing_members)
+                )
+            )
+        return created
 
     def available_colors(self):
         colors = []
@@ -2108,15 +2858,22 @@ class FlowContainer(QtWidgets.QWidget):
             self.select_buttons([button], modifiers)
         
     def remove_button(self, btn):
-        if btn in self.buttons:
-            was_selected = btn.ui_selected
-            self.buttons.remove(btn)
-            btn.hide()
-            btn.deleteLater()
-            self.reflow()
-            if was_selected:
-                self.selection_changed.emit()
-            self.on_button_color_changed(btn)
+        self.remove_buttons([btn])
+
+    def remove_buttons(self, buttons):
+        targets = [button for button in buttons or [] if button in self.buttons]
+        if not targets:
+            return 0
+        had_selection = any(button.ui_selected for button in targets)
+        for button in targets:
+            self.buttons.remove(button)
+            button.hide()
+            button.deleteLater()
+        self.reflow()
+        if had_selection:
+            self.selection_changed.emit()
+        self.on_button_color_changed(targets[0])
+        return len(targets)
             
     def clear_all(self):
         had_selection = bool(self.selected_buttons())
@@ -2140,6 +2897,7 @@ class FlowContainer(QtWidgets.QWidget):
     def set_layout_mode(self, mode, save=True):
         mode = "board" if mode == "board" else "ordered"
         if mode == self.layout_mode:
+            self.refresh_layout()
             return
         self.layout_mode = mode
         self.layout_mode_changed.emit(mode)
@@ -2148,14 +2906,12 @@ class FlowContainer(QtWidgets.QWidget):
         self.drop_index = -1
         if mode == "board":
             for btn in self.buttons:
-                if btn.board_pos == QtCore.QPoint(0, 0):
-                    btn.board_pos = self.visual_to_board_point(btn.pos())
                 btn.set_free_move_mode(True)
         else:
             for btn in self.buttons:
-                btn.board_pos = self.visual_to_board_point(btn.pos())
                 btn.set_free_move_mode(False)
         self.reflow()
+        self.updateGeometry()
         if save:
             self._auto_save()
 
@@ -2169,14 +2925,14 @@ class FlowContainer(QtWidgets.QWidget):
             if not btn.filtered_out and btn.board_pos != QtCore.QPoint(0, 0)
         ]
         if not placed:
-            return QtCore.QPoint(margin, margin)
+            return self._snap_board_point(QtCore.QPoint(margin, margin))
         last = placed[-1]
         x = last.board_pos.x() + last.board_size.width() + spacing
         y = last.board_pos.y()
         if x + max(80, last.board_size.width()) > max_width - margin:
             x = margin
             y = max(btn.board_pos.y() + btn.board_size.height() for btn in placed) + spacing
-        return QtCore.QPoint(x, y)
+        return self._snap_board_point(QtCore.QPoint(x, y))
 
     def update_board_bounds(self):
         if self.layout_mode != "board":
@@ -2203,42 +2959,56 @@ class FlowContainer(QtWidgets.QWidget):
         if self.width() != right or self.height() != bottom:
             self.resize(right, bottom)
 
+    def _set_ordered_bounds(self, minimum_height):
+        """Release Board's fixed canvas size when returning to the row layout."""
+        minimum_height = max(50, int(minimum_height))
+        self.setMinimumWidth(0)
+        self.setMinimumHeight(minimum_height)
+        self.updateGeometry()
+
     def on_button_position_changed(self, btn):
         if self.layout_mode != "board":
             return
-        btn.board_pos = self.visual_to_board_point(btn.pos())
+        btn.board_pos = self._snap_board_point(self.visual_to_board_point(btn.pos()))
+        btn.move(self.board_to_visual_point(btn.board_pos))
         self.update_board_bounds()
         self._auto_save()
         
     def reflow(self):
+        for btn in self.buttons:
+            btn.setVisible(not btn.filtered_out)
         visible_buttons = [btn for btn in self.buttons if not btn.filtered_out]
         if self.layout_mode == "board":
-            if not visible_buttons:
-                self.update_board_bounds()
-                return
-            for btn in visible_buttons:
+            for btn in self.buttons:
                 if btn.free_move_mode:
                     btn._apply_button_size()
                 else:
                     btn.set_free_move_mode(True)
+            if not visible_buttons:
+                self.update_board_bounds()
+                return
+            for btn in visible_buttons:
                 pos = QtCore.QPoint(btn.board_pos)
                 if pos == QtCore.QPoint(0, 0):
                     pos = self._next_board_position()
                     btn.board_pos = QtCore.QPoint(pos)
-                pos.setX(max(8, pos.x()))
-                pos.setY(max(8, pos.y()))
-                btn.board_pos = QtCore.QPoint(pos)
+                btn.board_pos = self._snap_board_point(pos)
+                self._snap_button_geometry(btn, move_button=False)
+                pos = QtCore.QPoint(btn.board_pos)
                 btn.move(self.board_to_visual_point(pos))
             self.update_board_bounds()
             return
 
         if not visible_buttons:
-            self.setMinimumWidth(0)
-            self.setMinimumHeight(50)
+            self._set_ordered_bounds(50)
             return
             
         margin = 8
         spacing = 8
+        for btn in self.buttons:
+            if btn.free_move_mode:
+                btn.set_free_move_mode(False)
+        self._set_ordered_bounds(50)
         x = margin
         y = margin
         row_height = 0
@@ -2258,8 +3028,13 @@ class FlowContainer(QtWidgets.QWidget):
             x += bw + spacing
             row_height = max(row_height, bh)
             
-        self.setMinimumWidth(0)
-        self.setMinimumHeight(y + row_height + margin)
+        self._set_ordered_bounds(y + row_height + margin)
+
+    def refresh_layout(self):
+        """Rebuild geometry after a page becomes visible in the tab stack."""
+        self.reflow()
+        self.updateGeometry()
+        self.update()
         
     def resizeEvent(self, e):
         super(FlowContainer, self).resizeEvent(e)
@@ -2302,7 +3077,7 @@ class FlowContainer(QtWidgets.QWidget):
             cmds.select(clear=True)
 
     def mousePressEvent(self, e):
-        if e.button() == QtCore.Qt.MiddleButton and self._start_board_pan(e):
+        if self._start_board_pan(e):
             return
         if self.layout_mode == "board" and e.button() == QtCore.Qt.LeftButton and self._button_at(e.pos()) is None:
             self._selection_active = True
@@ -2324,7 +3099,7 @@ class FlowContainer(QtWidgets.QWidget):
         super(FlowContainer, self).mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
-        if e.button() == QtCore.Qt.MiddleButton and self._end_board_pan(e):
+        if self._end_board_pan(e):
             return
         if self._selection_active and e.button() == QtCore.Qt.LeftButton:
             rect = QtCore.QRect(self._selection_rect)
@@ -2590,10 +3365,38 @@ class TabPage(QtWidgets.QWidget):
         self.board_mode_btn.setFixedHeight(28)
         self.board_mode_btn.setCheckable(True)
         self.board_mode_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self.board_mode_btn.setToolTip("Free board mode: drag sets anywhere")
+        self.board_mode_btn.setToolTip("Free board mode: drag sets anywhere. Alt + drag background to pan")
         self.board_mode_btn.setStyleSheet(mode_style + "QPushButton { border-top-right-radius: 6px; border-bottom-right-radius: 6px; }")
         self.board_mode_btn.clicked.connect(lambda: self.set_layout_mode("board"))
         ns_row.addWidget(self.board_mode_btn)
+
+        self.snap_check = QtWidgets.QCheckBox("SNAP")
+        self.snap_check.setCursor(QtCore.Qt.PointingHandCursor)
+        self.snap_check.setToolTip("Snap set positions to a 16 px board grid")
+        self.snap_check.setStyleSheet("""
+            QCheckBox {
+                color: #A0A7B4;
+                font-size: 10px;
+                font-weight: 600;
+                spacing: 5px;
+                padding-left: 3px;
+            }
+            QCheckBox::indicator {
+                width: 13px;
+                height: 13px;
+                border: 1px solid #555555;
+                border-radius: 3px;
+                background-color: #303438;
+            }
+            QCheckBox::indicator:hover { border-color: #78BFFF; }
+            QCheckBox::indicator:checked {
+                background-color: #3498DB;
+                border-color: #3498DB;
+            }
+        """)
+        self.snap_check.toggled.connect(self.set_board_snap_enabled)
+        self.snap_check.setVisible(False)
+        ns_row.addWidget(self.snap_check)
 
         self.color_filter_widget = QtWidgets.QWidget(self)
         self.color_filter_layout = QtWidgets.QHBoxLayout(self.color_filter_widget)
@@ -2652,13 +3455,13 @@ class TabPage(QtWidgets.QWidget):
 
     def eventFilter(self, obj, event):
         if self.container.layout_mode == "board":
-            if event.type() == QtCore.QEvent.MouseButtonPress and event.button() == QtCore.Qt.MiddleButton:
+            if event.type() == QtCore.QEvent.MouseButtonPress:
                 if self.container._start_board_pan(event):
                     return True
             if event.type() == QtCore.QEvent.MouseMove:
                 if self.container._update_board_pan(event):
                     return True
-            if event.type() == QtCore.QEvent.MouseButtonRelease and event.button() == QtCore.Qt.MiddleButton:
+            if event.type() == QtCore.QEvent.MouseButtonRelease:
                 if self.container._end_board_pan(event):
                     return True
         if event.type() == QtCore.QEvent.Wheel and self.container.layout_mode == "board":
@@ -2698,7 +3501,7 @@ class TabPage(QtWidgets.QWidget):
         self.namespace_lock_btn.setToolTip(
             "Locked: each set uses its saved rig, prop, or geometry"
             if locked else
-            "Unlocked: sets follow all namespaces in the current selection"
+            "Unlocked: sets follow the current Maya selection immediately"
         )
         self.ns_combo.setEnabled(not locked)
         self.namespace_lock_btn.blockSignals(False)
@@ -2834,14 +3637,10 @@ class TabPage(QtWidgets.QWidget):
 
     def get_target_namespaces(self):
         if self.namespace_dynamic:
-            clean = []
-            for ns in self._last_auto_namespaces or []:
-                ns = ns or ""
-                if ns not in clean:
-                    clean.append(ns)
-            if clean:
-                return clean
-        return [self.current_namespace or ""]
+            # Resolve immediately at click time. The timer below only keeps the
+            # combo label in sync; it must never decide which rig a set uses.
+            return get_namespaces_from_selection()
+        return []
         
     def set_namespace(self, ns):
         self._setting_namespace_programmatically = True
@@ -2869,6 +3668,9 @@ class TabPage(QtWidgets.QWidget):
         self.board_mode_btn.setChecked(mode == "board")
         self.row_mode_btn.blockSignals(False)
         self.board_mode_btn.blockSignals(False)
+        if hasattr(self, "snap_check"):
+            self.snap_check.setVisible(mode == "board")
+            self.snap_check.setEnabled(mode == "board")
         if hasattr(self, "scroll"):
             self.scroll.setWidgetResizable(mode != "board")
             self.scroll.setHorizontalScrollBarPolicy(
@@ -2880,6 +3682,20 @@ class TabPage(QtWidgets.QWidget):
         mode = "board" if mode == "board" else "ordered"
         self._sync_layout_mode_buttons(mode)
         self.container.set_layout_mode(mode, save=save)
+
+    def refresh_layout(self):
+        self._sync_layout_mode_buttons(self.container.layout_mode)
+        self.container.refresh_layout()
+        self._update_set_visibility_button()
+
+    def set_board_snap_enabled(self, enabled, save=True):
+        if not hasattr(self, "container"):
+            return
+        self.container.set_board_snap_enabled(enabled, save=save)
+        if hasattr(self, "snap_check") and self.snap_check.isChecked() != bool(enabled):
+            self.snap_check.blockSignals(True)
+            self.snap_check.setChecked(bool(enabled))
+            self.snap_check.blockSignals(False)
 
     def choose_background_image(self):
         self.container.choose_background_image()
@@ -2947,6 +3763,7 @@ class TabPage(QtWidgets.QWidget):
             "background_scale": self.container.background_scale,
             "background_opacity": self.container.background_opacity,
             "board_zoom": round(float(self.container.board_zoom), 4),
+            "board_snap": bool(self.container.board_snap_enabled),
             "sets": [b.get_data() for b in self.container.buttons]
         }
         
@@ -2959,6 +3776,7 @@ class TabPage(QtWidgets.QWidget):
         self.container.set_background_scale(data.get("background_scale", 1.0), save=False)
         self.container.set_background_opacity(data.get("background_opacity", 0.92), save=False)
         self.container.set_board_zoom(data.get("board_zoom", 1.0), save=False)
+        self.set_board_snap_enabled(data.get("board_snap", False), save=False)
         for s in data.get("sets", []):
             saved_member_namespaces = s.get("member_namespaces")
             saved_namespaces = s.get("namespaces", [])
@@ -2979,6 +3797,8 @@ class TabPage(QtWidgets.QWidget):
                 size_scale=s.get("size_scale", 1.0),
                 board_size=s.get("board_size"),
                 members_hidden=s.get("members_hidden"),
+                board_shape=s.get("board_shape", "rounded"),
+                board_locked=s.get("board_locked", False),
             )
             self.container.add_button(btn)
         self.container.reflow()
@@ -3060,7 +3880,7 @@ class TabButton(QtWidgets.QPushButton):
         close_act = menu.addAction("Close Tab")
         close_act.triggered.connect(lambda: self.close_clicked.emit(self.index))
             
-        menu.exec_(e.globalPos())
+        execute_qt(menu, e.globalPos())
 
 
 # ============================================================================
@@ -3165,6 +3985,14 @@ class TabBarWidget(QtWidgets.QWidget):
                 
         new_idx = min(idx, len(self.tab_buttons) - 1)
         self.set_current_index(new_idx)
+
+    def clear_tabs(self):
+        """Remove all tab widgets so imported data can rebuild the UI cleanly."""
+        for button in self.tab_buttons:
+            self.tabs_layout.removeWidget(button)
+            button.deleteLater()
+        self.tab_buttons = []
+        self.current_index = -1
         
     def set_tab_text(self, idx, text):
         if 0 <= idx < len(self.tab_buttons):
@@ -3226,12 +4054,7 @@ class SetManagerWindow(QtWidgets.QWidget):
             btn_top_y = btn_top_left.y()
             btn_bottom_y = btn_top_y + btn_rect.height()
 
-            screen = QtWidgets.QApplication.screenAt(btn_top_left) if hasattr(QtWidgets.QApplication, 'screenAt') else None
-            if screen:
-                screen_rect = screen.availableGeometry()
-            else:
-                desktop = QtWidgets.QApplication.desktop()
-                screen_rect = desktop.availableGeometry(self.anchor_button)
+            screen_rect = screen_available_geometry(self.anchor_button, btn_top_left)
 
             x_pos = btn_center_x - self.width() // 2
             if x_pos < screen_rect.left():
@@ -3421,6 +4244,10 @@ class SetManagerWindow(QtWidgets.QWidget):
             
     def on_tab_changed(self, idx):
         self.stack.setCurrentIndex(idx)
+        if 0 <= idx < len(self.pages):
+            page = self.pages[idx]
+            page.refresh_layout()
+            QtCore.QTimer.singleShot(0, page.refresh_layout)
         
     def current_page(self):
         idx = self.tab_bar.current_index
@@ -3453,7 +4280,7 @@ class SetManagerWindow(QtWidgets.QWidget):
         clear_act = menu.addAction("Clear Current Tab")
         clear_act.triggered.connect(self.clear_current)
         
-        menu.exec_(self.mapToGlobal(pos))
+        execute_qt(menu, self.mapToGlobal(pos))
         
     def set_sort(self, mode):
         self._sort_mode = mode
@@ -3488,6 +4315,10 @@ class SetManagerWindow(QtWidgets.QWidget):
         
     def save_data(self):
         """Save sets data to the scene's animkey_sets container"""
+        _save_to_scene(self.serialized_data())
+
+    def serialized_data(self):
+        """Return the complete current tab state without writing to Maya."""
         tabs = []
         for i, page in enumerate(self.pages):
             tabs.append({
@@ -3506,36 +4337,134 @@ class SetManagerWindow(QtWidgets.QWidget):
                 "height": self.height()
             }
         }
-        
-        _save_to_scene(data)
+        return data
+
+    def _clear_loaded_pages(self):
+        for page in self.pages:
+            try:
+                page._auto_ns_timer.stop()
+            except Exception:
+                pass
+            try:
+                page.container._zoom_save_timer.stop()
+            except Exception:
+                pass
+            self.stack.removeWidget(page)
+            page.deleteLater()
+        self.pages = []
+        self.tab_bar.clear_tabs()
+
+    def _refresh_loaded_pages(self):
+        for page in self.pages:
+            page.refresh_namespaces()
+            page.refresh_layout()
+        self.updateGeometry()
+        self.update()
+        try:
+            QtWidgets.QApplication.processEvents()
+        except Exception:
+            pass
+
+    def replace_data(self, data):
+        """Replace tabs from serialized data without closing the Qt window."""
+        if not isinstance(data, dict):
+            return False
+        tabs_data = [
+            tab for tab in data.get("tabs", [])
+            if isinstance(tab, dict) and isinstance(tab.get("data"), dict)
+        ]
+        if not tabs_data:
+            return False
+
+        self._clear_loaded_pages()
+        self._sort_mode = data.get("sort_mode", "Manual")
+
+        geometry = data.get("geometry", {})
+        if isinstance(geometry, dict) and geometry:
+            self.move(geometry.get("x", 100), geometry.get("y", 100))
+            self.resize(geometry.get("width", 360), geometry.get("height", 300))
+
+        for tab_info in tabs_data:
+            page = self.add_new_tab(tab_info.get("name", "Tab"))
+            page.load_data(tab_info["data"])
+            page.container.manual_mode = (self._sort_mode == "Manual")
+
+        try:
+            current = int(data.get("current_tab", 0))
+        except (TypeError, ValueError):
+            current = 0
+        current = max(0, min(current, self.tab_bar.count() - 1))
+        self.tab_bar.set_current_index(current)
+        self._refresh_loaded_pages()
+        QtCore.QTimer.singleShot(0, self._refresh_loaded_pages)
+        return True
+
+    def _unique_tab_name(self, name):
+        existing = {
+            self.tab_bar.tab_text(index).lower()
+            for index in range(self.tab_bar.count())
+        }
+        base_name = str(name or "Imported")
+        candidate = base_name
+        number = 2
+        while candidate.lower() in existing:
+            candidate = "{} {}".format(base_name, number)
+            number += 1
+        return candidate
+
+    def _has_only_default_empty_tab(self):
+        if len(self.pages) != 1 or self.tab_bar.count() != 1:
+            return False
+        page = self.pages[0]
+        return (
+            self.tab_bar.tab_text(0) == "Tab 1"
+            and not page.container.buttons
+            and not page.container.background_path
+        )
+
+    def append_data(self, data):
+        """Append imported tabs while retaining every current Selection Set."""
+        if not isinstance(data, dict):
+            return []
+        tabs_data = [
+            tab for tab in data.get("tabs", [])
+            if isinstance(tab, dict) and isinstance(tab.get("data"), dict)
+        ]
+        if not tabs_data:
+            return []
+
+        if self._has_only_default_empty_tab():
+            self._clear_loaded_pages()
+            self._sort_mode = data.get("sort_mode", "Manual")
+
+        added_pages = []
+        for tab_info in tabs_data:
+            page = self.add_new_tab(self._unique_tab_name(tab_info.get("name")))
+            page.load_data(tab_info["data"])
+            page.container.manual_mode = (self._sort_mode == "Manual")
+            added_pages.append(page)
+
+        try:
+            imported_current = int(data.get("current_tab", 0))
+        except (TypeError, ValueError):
+            imported_current = 0
+        imported_current = max(0, min(imported_current, len(added_pages) - 1))
+        target_index = self.pages.index(added_pages[imported_current])
+        self.tab_bar.set_current_index(target_index)
+        self._refresh_loaded_pages()
+        QtCore.QTimer.singleShot(0, self._refresh_loaded_pages)
+        return added_pages
             
     def load_data(self):
         """Load sets data from the scene's animkey_sets container"""
         data = _load_from_scene()
         if not data:
             return
-        
         try:
-            self._sort_mode = data.get("sort_mode", "Manual")
-            
-            # Restore geometry
-            geo = data.get("geometry", {})
-            if geo:
-                self.move(geo.get("x", 100), geo.get("y", 100))
-                self.resize(geo.get("width", 360), geo.get("height", 300))
-            
-            for tab_info in data.get("tabs", []):
-                name = tab_info.get("name", "Tab")
-                page = self.add_new_tab(name)
-                page.load_data(tab_info.get("data", {}))
-                page.container.manual_mode = (self._sort_mode == "Manual")
-                
-            current = data.get("current_tab", 0)
-            if 0 <= current < self.tab_bar.count():
-                self.tab_bar.set_current_index(current)
-                
-        except Exception as e:
-            print(f"Load error: {e}")
+            if not self.replace_data(data):
+                print("Load error: no valid tabs found")
+        except Exception as exc:
+            print("Load error: {}".format(exc))
             
     def closeEvent(self, event):
         global _win
@@ -3582,8 +4511,14 @@ def clear_all_sets(*args):
     """
     global _win
     
-    # Ensure window exists
-    if _win is None or not _win.isVisible():
+    # Ensure a usable window exists. A deleted Qt wrapper can otherwise leave
+    # imports pointing at a stale Selection Set manager after Clean Sets.
+    try:
+        window_visible = _win is not None and _win.isVisible()
+    except Exception:
+        _win = None
+        window_visible = False
+    if not window_visible:
         show()
     
     # Ask for confirmation
@@ -3650,17 +4585,156 @@ def export_sets(*args):
     }
     
     try:
-        with open(file_path, 'w') as f:
-            json.dump(export_data, f, indent=2)
+        atomic_write_json(file_path, export_data, indent=2, ensure_ascii=False)
         cmds.inViewMessage(msg=f"Exported to: {os.path.basename(file_path)}", pos='midCenter', fade=True)
     except Exception as e:
         cmds.warning(f"Export failed: {e}")
 
 
+def _normalize_import_data(data):
+    """Accept full exports plus practical single-tab and single-set JSON files."""
+    if not isinstance(data, dict):
+        raise ValueError("The JSON root must be an object.")
+
+    tabs_data = data.get("tabs")
+    if not isinstance(tabs_data, list) or not tabs_data:
+        if isinstance(data.get("sets"), list):
+            tabs_data = [{
+                "name": data.get("tab_name", data.get("name", "Imported")),
+                "data": data,
+            }]
+        elif "members" in data or "member_bindings" in data:
+            tabs_data = [{
+                "name": data.get("tab_name", "Imported"),
+                "data": {"sets": [data]},
+            }]
+        else:
+            raise ValueError("No sets or tabs were found in the JSON file.")
+
+    normalized_tabs = []
+    for index, tab_info in enumerate(tabs_data):
+        if not isinstance(tab_info, dict):
+            continue
+        tab_data = tab_info.get("data")
+        if not isinstance(tab_data, dict):
+            tab_data = tab_info if isinstance(tab_info.get("sets"), list) else None
+        if not isinstance(tab_data, dict):
+            continue
+
+        sets = tab_data.get("sets", [])
+        if not isinstance(sets, list):
+            continue
+        clean_data = dict(tab_data)
+        clean_data["sets"] = [item for item in sets if isinstance(item, dict)]
+        normalized_tabs.append({
+            "name": str(tab_info.get("name") or "Tab {}".format(index + 1)),
+            "data": clean_data,
+        })
+
+    if not normalized_tabs:
+        raise ValueError("No valid tab data was found in the JSON file.")
+
+    geometry = data.get("geometry", {})
+    if not isinstance(geometry, dict):
+        geometry = {}
+    return {
+        "sort_mode": data.get("sort_mode", "Manual"),
+        "current_tab": data.get("current_tab", 0),
+        "tabs": normalized_tabs,
+        "geometry": geometry,
+    }
+
+
+def _append_import_data(existing_data, imported_data):
+    """Merge imported tabs into scene data without losing the current tabs."""
+    existing_tabs = []
+    if isinstance(existing_data, dict):
+        for tab in existing_data.get("tabs", []):
+            if isinstance(tab, dict) and isinstance(tab.get("data"), dict):
+                existing_tabs.append(tab)
+
+    if len(existing_tabs) == 1:
+        default_tab = existing_tabs[0]
+        default_data = default_tab.get("data", {})
+        if (
+            default_tab.get("name") == "Tab 1"
+            and not default_data.get("sets")
+            and not default_data.get("background_image")
+        ):
+            existing_tabs = []
+
+    merged_tabs = list(existing_tabs) + list(imported_data.get("tabs", []))
+    if not merged_tabs:
+        merged_tabs = list(imported_data.get("tabs", []))
+
+    try:
+        imported_current = int(imported_data.get("current_tab", 0))
+    except (TypeError, ValueError):
+        imported_current = 0
+    imported_current = max(0, min(imported_current, len(imported_data["tabs"]) - 1))
+    geometry = existing_data.get("geometry", {}) if isinstance(existing_data, dict) else {}
+    if not isinstance(geometry, dict):
+        geometry = {}
+    return {
+        "sort_mode": (
+            existing_data.get("sort_mode", imported_data.get("sort_mode", "Manual"))
+            if isinstance(existing_data, dict) else imported_data.get("sort_mode", "Manual")
+        ),
+        "current_tab": len(existing_tabs) + imported_current,
+        "tabs": merged_tabs,
+        "geometry": geometry,
+    }
+
+
+def import_sets_data(data):
+    """Append parsed JSON as new tabs and refresh an open Set Manager in place."""
+    global _win
+    import_data = _normalize_import_data(data)
+
+    active_window = _win
+    try:
+        active_window.objectName()
+    except Exception:
+        active_window = None
+
+    if active_window is not None and hasattr(active_window, "append_data"):
+        try:
+            if not active_window.append_data(import_data):
+                raise RuntimeError("The Set Manager could not load the imported tabs.")
+            active_window.save_data()
+            active_window.show()
+            active_window.raise_()
+            active_window.activateWindow()
+            _win = active_window
+            return active_window
+        except Exception:
+            try:
+                if hasattr(active_window, "save_data"):
+                    active_window.save_data()
+                active_window._skip_save = True
+                active_window.close()
+                active_window.deleteLater()
+            except Exception:
+                pass
+    elif active_window is not None:
+        try:
+            if hasattr(active_window, "save_data"):
+                active_window.save_data()
+            active_window._skip_save = True
+            active_window.close()
+            active_window.deleteLater()
+        except Exception:
+            pass
+
+    _win = None
+    _save_to_scene(_append_import_data(_load_from_scene() or {}, import_data))
+    return show()
+
+
 def import_sets(*args):
     """
     Import selection sets from a JSON file.
-    Replaces all existing tabs with the imported ones.
+    Adds imported sets as new tabs without replacing existing ones.
     Opens a file dialog for the user to choose the file.
     """
     global _win
@@ -3689,47 +4763,17 @@ def import_sets(*args):
         cmds.warning(f"Import failed: {e}")
         return
     
-    tabs_data = data.get("tabs", [])
-    if not tabs_data:
-        cmds.warning("No tabs found in import file")
-        return
-    
-    # Build the import data structure
-    import_data = {
-        "sort_mode": data.get("sort_mode", "Manual"),
-        "current_tab": data.get("current_tab", 0),
-        "tabs": tabs_data,
-        "geometry": data.get("geometry", {"x": 100, "y": 100, "width": 360, "height": 300})
-    }
-    
-    # Close existing window WITHOUT triggering save
-    if _win is not None:
-        try:
-            _win._skip_save = True
-            _win.close()
-            _win.deleteLater()
-        except:
-            pass
-        _win = None
-    
-    # Create the container and write data AFTER closing old window
-    container = _create_sets_container()
-    
     try:
-        json_str = json.dumps(import_data)
-        cmds.setAttr(f"{container}.{SETS_DATA_ATTR}", json_str, type="string")
+        window = import_sets_data(data)
     except Exception as e:
-        cmds.warning(f"Failed to save imported data: {e}")
+        cmds.warning(f"Import failed: {e}")
         return
     
     # Count total sets for the message
-    total_sets = sum(len(t.get("data", {}).get("sets", [])) for t in tabs_data)
-    
-    # Open the window to show imported data
-    show()
+    total_sets = sum(len(page.container.buttons) for page in window.pages)
     
     cmds.inViewMessage(
-        msg=f"Imported {len(tabs_data)} tab(s), {total_sets} set(s)",
+        msg=f"Imported {len(window.pages)} tab(s), {total_sets} set(s)",
         pos='midCenter', fade=True, fadeStayTime=3000
     )
 

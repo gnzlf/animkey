@@ -13,12 +13,15 @@
 import maya.cmds as cmds
 import maya.api.OpenMaya as om
 from AnimKey.sliders.slider_utils import (
-    finalize_slider_value,
+    apply_worldspace_slider_values,
+    get_infinity_type,
     get_keyframes_for_attribute,
     get_object_frames_to_process,
     get_processing_context,
-    should_process_attribute,
-    slider_amount
+    should_process_attribute_at_frame,
+    slider_attribute_is_editable,
+    slider_amount,
+    blend_angle_degrees,
 )
 
 
@@ -65,7 +68,7 @@ def matrix_to_transform(matrix):
 
 
 def get_infinity_time(attr_full, frame):
-    """Get the time that would be used for infinity calculation."""
+    """Return the virtual outside time and infinity mode for a channel."""
     try:
         attr = attr_full.rsplit('.', 1)[-1]
         keyframes = get_keyframes_for_attribute(attr_full, attr, _processing_context)
@@ -75,65 +78,36 @@ def get_infinity_time(attr_full, frame):
         
         first_key = min(keyframes)
         last_key = max(keyframes)
-        anim_length = last_key - first_key
-        
-        if anim_length == 0:
+        if last_key == first_key:
             return first_key, 'constant'
         
         if frame < first_key:
-            infinity_type = cmds.setInfinity(attr_full, query=True, preInfinite=True)[0]
+            infinity_type = get_infinity_type(attr_full, pre=True, attr=attr)
             edge_key = first_key
-            time_offset = first_key - frame
             direction = -1
         elif frame > last_key:
-            infinity_type = cmds.setInfinity(attr_full, query=True, postInfinite=True)[0]
+            infinity_type = get_infinity_type(attr_full, pre=False, attr=attr)
             edge_key = last_key
-            time_offset = frame - last_key
             direction = 1
         else:
             if (frame - first_key) < (last_key - frame):
-                infinity_type = cmds.setInfinity(attr_full, query=True, preInfinite=True)[0]
+                infinity_type = get_infinity_type(attr_full, pre=True, attr=attr)
                 edge_key = first_key
-                time_offset = frame - first_key
                 direction = -1
             else:
-                infinity_type = cmds.setInfinity(attr_full, query=True, postInfinite=True)[0]
+                infinity_type = get_infinity_type(attr_full, pre=False, attr=attr)
                 edge_key = last_key
-                time_offset = last_key - frame
                 direction = 1
         
         if infinity_type == 'constant':
             return edge_key, infinity_type
-        elif infinity_type == 'linear':
-            return edge_key, infinity_type
-        elif infinity_type in ['cycle', 'cycleRelative']:
-            cycles = int(time_offset / anim_length)
-            remainder = time_offset % anim_length
-            
-            if direction == -1:
-                cycle_time = last_key - remainder
-            else:
-                cycle_time = first_key + remainder
-            
-            return cycle_time, infinity_type
-        elif infinity_type == 'oscillate':
-            cycles = int(time_offset / anim_length)
-            remainder = time_offset % anim_length
-            
-            if cycles % 2 == 0:
-                if direction == -1:
-                    cycle_time = first_key + remainder
-                else:
-                    cycle_time = last_key - remainder
-            else:
-                if direction == -1:
-                    cycle_time = last_key - remainder
-                else:
-                    cycle_time = first_key + remainder
-            
-            return cycle_time, infinity_type
-        
-        return edge_key, infinity_type
+
+        distance = abs(float(frame) - float(edge_key))
+        virtual_time = (
+            float(edge_key) - distance if direction == -1
+            else float(edge_key) + distance
+        )
+        return virtual_time, infinity_type
         
     except Exception:
         return None, None
@@ -144,7 +118,7 @@ def prepare_blend_data(objs=None, attrs=None):
     global _blend_infinity_ws_data_cache, _processing_context
     _blend_infinity_ws_data_cache = {}
     
-    _processing_context = get_processing_context()
+    _processing_context = get_processing_context(explicit_attributes=attrs is not None)
     selected_channels = _processing_context.get('selected_channels')
     
     objects = objs if objs else cmds.ls(selection=True)
@@ -183,25 +157,11 @@ def prepare_blend_data(objs=None, attrs=None):
         
         # Process each frame
         for frame in frames_to_process:
-            # Get infinity time from first animated attribute
-            infinity_time = None
-            for attr in transform_attrs:
-                attr_full = f'{obj}.{attr}'
-                if cmds.objExists(attr_full):
-                    inf_time, inf_type = get_infinity_time(attr_full, frame)
-                    if inf_time is not None:
-                        infinity_time = inf_time
-                        break
-            
-            if infinity_time is None:
-                continue
-            
-            # Get world space transforms
+            # Get current world-space transform once. Infinity is resolved per
+            # channel because different channels can have different key ranges
+            # and pre/post-infinity modes.
             current_matrix = get_world_matrix(obj, frame)
             current_transform = matrix_to_transform(current_matrix)
-            
-            infinity_matrix = get_world_matrix(obj, infinity_time)
-            infinity_transform = matrix_to_transform(infinity_matrix)
             
             current_attrs = attrs if attrs else transform_attrs
             
@@ -209,17 +169,46 @@ def prepare_blend_data(objs=None, attrs=None):
                 if attr not in transform_attrs:
                     continue
                 
-                if not should_process_attribute(obj, attr, selected_channels):
+                if not should_process_attribute_at_frame(
+                    obj, attr, frame, _processing_context, selected_channels
+                ):
                     continue
                 
                 attr_full = f'{obj}.{attr}'
                 
                 if not cmds.objExists(attr_full):
                     continue
+
+                infinity_time, infinity_type = get_infinity_time(attr_full, frame)
+                if infinity_time is None:
+                    continue
                 
                 try:
                     current_value = current_transform.get(attr, 0)
+                    infinity_transform = matrix_to_transform(
+                        get_world_matrix(obj, infinity_time)
+                    )
                     infinity_value = infinity_transform.get(attr, 0)
+
+                    if infinity_type == 'linear':
+                        # Maya's real pre/post evaluation is on the opposite
+                        # side of the edge. Reflect that world delta through
+                        # the edge to project the tangent toward this frame.
+                        attr_keys = get_keyframes_for_attribute(
+                            attr_full, attr, _processing_context
+                        )
+                        edge_time = (
+                            min(attr_keys)
+                            if abs(frame - min(attr_keys)) < abs(max(attr_keys) - frame)
+                            else max(attr_keys)
+                        )
+                        edge_value = matrix_to_transform(
+                            get_world_matrix(obj, edge_time)
+                        ).get(attr, 0)
+                        delta = edge_value - infinity_value
+                        if attr.startswith('rotate'):
+                            delta = (delta + 180.0) % 360.0 - 180.0
+                        infinity_value = edge_value + delta
                     
                     cache_key = f"{attr_full}@{frame}"
                     _blend_infinity_ws_data_cache[cache_key] = {
@@ -250,12 +239,9 @@ def execute(percentage):
         cmds.undoInfo(openChunk=True)
         _is_dragging = True
     
-    current_time = _processing_context.get('current_time', cmds.currentTime(query=True))
+    pending_updates = []
     
     for cache_key, cache in _blend_infinity_ws_data_cache.items():
-        if not cache.get("needsCalculation", False):
-            continue
-        
         attr_full = cache.get("attr_full")
         frame = cache.get("frame")
         
@@ -265,7 +251,7 @@ def execute(percentage):
         try:
             if not cmds.objExists(attr_full):
                 continue
-            if cmds.getAttr(attr_full, lock=True) or not cmds.getAttr(attr_full, settable=True):
+            if not slider_attribute_is_editable(attr_full):
                 continue
             
             current_value = cache.get("currentValue")
@@ -275,58 +261,25 @@ def execute(percentage):
                 continue
             
             blend_factor = slider_amount(percentage, signed=True)
-            difference = infinity_value - current_value
-            blended_value = current_value + (difference * blend_factor)
-            
-            # Apply value in world space
-            obj, attr = attr_full.split('.', 1)
-            
-            if attr.startswith('translate'):
-                axis = attr[-1].lower()
-                pos = list(cmds.xform(obj, query=True, translation=True, worldSpace=True))
-                axis_idx = {'x': 0, 'y': 1, 'z': 2}[axis]
-                pos[axis_idx] = blended_value
-                cmds.xform(obj, translation=pos, worldSpace=True)
-            elif attr.startswith('rotate'):
-                axis = attr[-1].lower()
-                rot = list(cmds.xform(obj, query=True, rotation=True, worldSpace=True))
-                axis_idx = {'x': 0, 'y': 1, 'z': 2}[axis]
-                rot[axis_idx] = blended_value
-                cmds.xform(obj, rotation=rot, worldSpace=True)
+            if attr_full.rsplit('.', 1)[-1].startswith('rotate'):
+                blended_value = blend_angle_degrees(
+                    current_value, infinity_value, blend_factor
+                )
             else:
-                cmds.setAttr(attr_full, blended_value)
+                difference = infinity_value - current_value
+                blended_value = current_value + (difference * blend_factor)
             
+            pending_updates.append((attr_full, frame, blended_value))
+
         except Exception:
             continue
+
+    apply_worldspace_slider_values(pending_updates)
 
 
 def reset():
     """Reset blend to infinity world space slider state."""
     global _blend_infinity_ws_data_cache, _is_dragging, _processing_context
-    
-    current_time = _processing_context.get('current_time', cmds.currentTime(query=True))
-    
-    if _blend_infinity_ws_data_cache:
-        for cache_key, cache_data in _blend_infinity_ws_data_cache.items():
-            try:
-                attr_full = cache_data.get("attr_full")
-                frame = cache_data.get("frame")
-                
-                if not attr_full:
-                    continue
-                
-                current_value = cmds.getAttr(attr_full)
-                
-                if isinstance(current_value, (list, tuple)):
-                    if len(current_value) == 1:
-                        current_value = current_value[0]
-                    else:
-                        continue
-                
-                finalize_slider_value(attr_full, frame, current_value, current_time)
-                
-            except Exception:
-                continue
     
     _blend_infinity_ws_data_cache = {}
     _processing_context = {}

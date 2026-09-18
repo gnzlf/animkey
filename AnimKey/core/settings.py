@@ -13,18 +13,17 @@ import sys
 import maya.cmds as cmds
 import maya.mel as mel
 
-try:
-    from PySide2 import QtWidgets, QtCore, QtGui
-    from PySide2.QtCore import Qt
-    from PySide2.QtGui import QColor, QFont, QKeySequence
-except ImportError:
-    from PySide6 import QtWidgets, QtCore, QtGui
-    from PySide6.QtCore import Qt
-    from PySide6.QtGui import QColor, QFont, QKeySequence
+from AnimKey.mods.maya_compat import QtCore, QtGui, QtWidgets
+
+Qt = QtCore.Qt
+QColor = QtGui.QColor
+QFont = QtGui.QFont
+QKeySequence = QtGui.QKeySequence
 
 from AnimKey.mods.themes import ThemeManager
 from AnimKey.mods import configMod as config
 from AnimKey.mods import uiMod as ui
+from AnimKey.mods.storage import atomic_write_json, backup_corrupt_file
 
 # Global state for picking mode
 ACTIVE_PICKER = None
@@ -238,7 +237,7 @@ DEFAULT_SHORTCUTS = {
     # Extra tool buttons
     "RBK": "",
     "GMB": "",
-    "COL": "",
+    "SWT": "",
     "BAK": "",
     "SETS": "",
     "ACR": "",
@@ -259,9 +258,10 @@ DEFAULT_SHORTCUTS = {
     
     # Mirror submenu
     "All Mirror": "",
+    "Mirror to Left": "",
+    "Mirror to Right": "",
     "Toggle Auto Mirror": "",
     "Snapshot Mirror Settings": "",
-    "Show Snapshot Info": "",
     "Delete Snapshot": "",
     "Add Mirror Invert Exception": "",
     "Add Mirror Keep Exception": "",
@@ -326,12 +326,15 @@ def load_shortcuts():
                 # Merge with defaults
                 shortcuts = DEFAULT_SHORTCUTS.copy()
                 shortcuts.update(saved_shortcuts)
+                if "SWT" not in saved_shortcuts and "COL" in saved_shortcuts:
+                    shortcuts["SWT"] = saved_shortcuts["COL"]
+                shortcuts.pop("COL", None)
                 legacy_trail_key = "T" + "RC"
                 if legacy_trail_key in shortcuts:
                     shortcuts["TRL"] = shortcuts.pop(legacy_trail_key)
                 return shortcuts
         except (json.JSONDecodeError, IOError):
-            pass
+            backup_corrupt_file(shortcuts_file)
     
     return DEFAULT_SHORTCUTS.copy()
 
@@ -344,8 +347,7 @@ def save_shortcuts(shortcuts):
         # Ensure directory exists
         os.makedirs(os.path.dirname(shortcuts_file), exist_ok=True)
         
-        with open(shortcuts_file, 'w') as f:
-            json.dump(shortcuts, f, indent=4)
+        atomic_write_json(shortcuts_file, shortcuts)
         return True
     except IOError as e:
         cmds.warning(f"AnimKey: Could not save shortcuts: {e}")
@@ -685,6 +687,7 @@ class SettingsWindow(QtWidgets.QWidget):
         self._create_general_tab()
         self._add_lazy_tab("Shortcuts", self._create_shortcuts_tab)
         self._add_lazy_tab("Workspace", self._create_workspace_tab)
+        self._add_lazy_tab("Update", self._create_update_tab)
         self._add_lazy_tab("Exit", self._create_exit_tab)
         self.tab_widget.currentChanged.connect(self._load_lazy_tab)
         
@@ -743,6 +746,7 @@ class SettingsWindow(QtWidgets.QWidget):
         """)
         btn_save.clicked.connect(self._save_and_close)
         button_layout.addWidget(btn_save)
+        self._settings_action_buttons = (btn_cancel, btn_save)
         
         main_layout.addWidget(button_bar)
         outer_layout.addWidget(self.container)
@@ -1147,7 +1151,7 @@ class SettingsWindow(QtWidgets.QWidget):
         group_extra = self._create_shortcut_group("Extra Tools", [
             ("RBK", "ReBlock"),
             ("GMB", "Gimbal Fixer"),
-            ("COL", "Collision Tool"),
+            ("SWT", "Switcher"),
             ("BAK", "Bake Animation"),
             ("SETS", "Selection Sets"),
             ("ACR", "Anim Crash"),
@@ -1180,9 +1184,10 @@ class SettingsWindow(QtWidgets.QWidget):
         # Group: Mirror Submenu
         group_mirror = self._create_shortcut_group("Mirror (Submenu)", [
             ("All Mirror", "All Mirror (Swap)"),
+            ("Mirror to Left", "Mirror to Left"),
+            ("Mirror to Right", "Mirror to Right"),
             ("Toggle Auto Mirror", "Toggle Auto Mirror"),
-            ("Snapshot Mirror Settings", "Snapshot Settings"),
-            ("Show Snapshot Info", "Show Snapshot Info"),
+            ("Snapshot Mirror Settings", "Snapshot"),
             ("Delete Snapshot", "Delete Snapshot"),
             ("Add Mirror Invert Exception", "Add Invert Exception"),
             ("Add Mirror Keep Exception", "Add Keep Exception"),
@@ -1434,7 +1439,7 @@ class SettingsWindow(QtWidgets.QWidget):
             "PLT": "Plateau",      "STP": "Step",         "FLT": "Flat",
             "LIN": "Linear",       "CLP": "Clamped",      "SPL": "Spline",     "AUT": "Auto",
             # Group 5 – Extra
-            "GMB": "Gimbal Fix",   "COL": "Collision",    "BAK": "Bake Anim",
+            "GMB": "Gimbal Fix",   "SWT": "Switcher",     "BAK": "Bake Anim",
             "RTM": "Retimer",      "BTNS": "Flash Btns",  "SETS": "Sel Sets",
             "ACL": "Anim Cleaner", "ACR": "Anim Crash",
         }
@@ -1797,6 +1802,15 @@ class SettingsWindow(QtWidgets.QWidget):
         if add_to_tabs:
             self.tab_widget.addTab(tab, "Exit")
         return tab
+
+    def _create_update_tab(self, add_to_tabs=True):
+        """Create the stable GitHub Releases update tab."""
+        from AnimKey.core.update_ui import UpdateTab
+
+        tab = UpdateTab()
+        if add_to_tabs:
+            self.tab_widget.addTab(tab, "Update")
+        return tab
     
     def _apply_theme(self):
         """Apply theme to the window.
@@ -1866,6 +1880,9 @@ class SettingsWindow(QtWidgets.QWidget):
 
     def closeEvent(self, event):
         """Clean up global reference when the window is closed."""
+        if getattr(self, "_update_install_in_progress", False):
+            event.ignore()
+            return
         global _settings_window
         self._clear_active_picker()
         _settings_window = None
@@ -2042,6 +2059,8 @@ cmds.inViewMessage(
     def _perform_uninstall(self, delete_user_data=False):
         """Actually perform the uninstall"""
         import stat
+        unload_entry_plugin = None
+
         def _on_rm_error(func, path, exc_info):
             try:
                 os.chmod(path, stat.S_IWRITE)
@@ -2051,11 +2070,13 @@ cmds.inViewMessage(
 
         try:
             from AnimKey.mods import uiMod
-            uiMod.cleanup_animkey_runtime(except_widget=self)
+            uiMod.cleanup_animkey_runtime(except_widget=self, full=True)
+            unload_entry_plugin = uiMod.unload_animkey_entry_plugin
         except Exception:
             pass
 
         self.close()
+        self.deleteLater()
         
         try:
             # 1. Close the toolbar
@@ -2159,12 +2180,13 @@ cmds.inViewMessage(
             
             # 8. Show success message
             cmds.inViewMessage(
-                amg="<span style='color:#a3be8c'>AnimKey has been uninstalled successfully.</span><br>"
-                    "<span style='color:#ebcb8b'>Restart Maya to complete the process.</span>",
+                amg="<span style='color:#a3be8c'>AnimKey has been uninstalled successfully.</span>",
                 pos='midCenter',
                 fade=True,
-                fadeStayTime=5000
+                fadeStayTime=3000
             )
+            if unload_entry_plugin is not None:
+                unload_entry_plugin()
             
         except Exception as e:
             cmds.warning(f"Error during uninstall: {e}")
@@ -2209,4 +2231,3 @@ def get_shortcut(action_name):
     """Get the shortcut for a specific action"""
     shortcuts = load_shortcuts()
     return shortcuts.get(action_name, "")
-

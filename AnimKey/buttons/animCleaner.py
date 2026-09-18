@@ -17,12 +17,10 @@ import traceback
 import math
 from functools import partial
 
-try:
-    from PySide2 import QtWidgets, QtCore, QtGui
-    from shiboken2 import wrapInstance
-except ImportError:
-    from PySide6 import QtWidgets, QtCore, QtGui
-    from shiboken6 import wrapInstance
+from AnimKey.mods.maya_compat import (
+    QtCore, QtGui, QtWidgets, wrap_instance as wrapInstance,
+)
+from AnimKey.core.animation_curve_transfer import selected_time_range
 
 
 WINDOW_OBJECT = "AnimKey_AnimCleaner"
@@ -44,6 +42,21 @@ def cast_to_time_tuple(time_value):
     if isinstance(time_value, (list, tuple)):
         return [(float(x),) for x in time_value]
     return (float(time_value),)
+
+
+def _selected_time_slider_range():
+    """Return the inclusive Time Slider selection, when one is active."""
+    try:
+        return selected_time_range()
+    except Exception:
+        return None
+
+
+def _time_in_range(time_value, time_range, tolerance=1e-6):
+    if not time_range:
+        return True
+    start, end = float(time_range[0]), float(time_range[1])
+    return start - tolerance <= float(time_value) <= end + tolerance
 
 
 def get_channel_from_anim_curve(curve_node_name, plugs=True):
@@ -164,6 +177,7 @@ class AnimationSelection(object):
         
         self._time_override = None
         self._use_selected_keys_time = False
+        self._selected_key_times_by_curve = {}
         self._curves_are_culled = False
 
         self.subframe_tolerance = 1e-5
@@ -175,6 +189,7 @@ class AnimationSelection(object):
         self._curves_are_culled = False
         self._time_override = None
         self._use_selected_keys_time = False
+        self._selected_key_times_by_curve = {}
 
     @property
     def curves(self):
@@ -349,6 +364,22 @@ class AnimationSelection(object):
         self._use_selected_keys_time = True
         return True
 
+    def selected_key_times_for_curve(self, curve_name):
+        """Return only the keys explicitly selected on one curve."""
+        if not self._use_selected_keys_time:
+            return []
+        if curve_name not in self._selected_key_times_by_curve:
+            try:
+                times = mc.keyframe(
+                    curve_name, query=True, selected=True, timeChange=True
+                ) or []
+            except RuntimeError:
+                times = []
+            self._selected_key_times_by_curve[curve_name] = sorted(
+                set(float(value) for value in times)
+            )
+        return list(self._selected_key_times_by_curve[curve_name])
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 #                           CLEANUP FUNCTIONS
@@ -377,57 +408,141 @@ def _get_animation_selection_object(ui_selection_index, anim_selection_instance=
     return selector
 
 
+def _get_automatic_animation_selection(ui_selection_index=1):
+    """Resolve Graph Editor keys first, then the requested object scope.
+
+    Key selection in Maya is global, so this also works when focus has moved
+    from the Graph Editor back to the cleaner window.  If the UI was left on
+    "Selected Keys" but there are no selected keys, fall back to selected
+    objects so a highlighted Time Slider range still works automatically.
+    """
+    selected_keys = AnimationSelection()
+    if selected_keys.set_scope_to_selected_keys_in_graph_editor():
+        return selected_keys
+
+    fallback_index = 1 if ui_selection_index == 6 else ui_selection_index
+    return _get_animation_selection_object(fallback_index)
+
+
+def _curve_key_data(curve_name):
+    """Return sorted ``(time, value)`` pairs for a curve."""
+    try:
+        key_times = mc.keyframe(
+            curve_name, query=True, timeChange=True
+        ) or []
+        key_values = mc.keyframe(
+            curve_name, query=True, valueChange=True
+        ) or []
+    except RuntimeError:
+        return []
+    if len(key_times) != len(key_values):
+        return []
+    return sorted(
+        (float(key_time), float(key_value))
+        for key_time, key_value in zip(key_times, key_values)
+    )
+
+
+def _time_matches(time_value, candidates, tolerance=1e-6):
+    return any(
+        abs(float(time_value) - float(candidate)) <= tolerance
+        for candidate in candidates
+    )
+
+
+def _time_is_targeted(anim_selector, curve_name, time_value, time_range):
+    """Whether a key may be changed by the current automatic scope."""
+    if anim_selector._use_selected_keys_time:
+        return _time_matches(
+            time_value,
+            anim_selector.selected_key_times_for_curve(curve_name),
+        )
+    return _time_in_range(time_value, time_range)
+
+
+def _operation_time_range(anim_selector):
+    """Graph keys take priority; otherwise use the Time Slider highlight."""
+    if anim_selector._use_selected_keys_time:
+        return None
+    return _selected_time_slider_range()
+
+
+def _operation_scope_label(anim_selector, time_range):
+    if anim_selector._use_selected_keys_time:
+        return "Graph Editor key selection"
+    if time_range:
+        return "selected timeline range"
+    return None
+
+
 def delete_static_channels(selection_option_idx=1):
     """Delete animation curves whose values don't change over time."""
     mc.undoInfo(openChunk=True, chunkName="Delete Static Channels")
     deleted_count = 0
+    selected_range = None
+    scope_label = None
     try:
-        anim_selector = _get_animation_selection_object(selection_option_idx)
+        anim_selector = _get_automatic_animation_selection(selection_option_idx)
         if not anim_selector:
             raise ValueError("Could not initialize animation scope.")
-
-        anim_selector._time_override = (':',)
+        selected_range = _operation_time_range(anim_selector)
+        scope_label = _operation_scope_label(anim_selector, selected_range)
         
         curves_to_check = anim_selector.curves
         if not curves_to_check:
             print("No valid curves to process for static channels.")
-            mc.undoInfo(closeChunk=True)
             return
 
-        all_key_values_per_curve = anim_selector.values_from_curves
-
-        if len(curves_to_check) != len(all_key_values_per_curve):
-             mc.warning(f"Mismatch in curves and values count. Skipping.")
-             mc.undoInfo(closeChunk=True)
-             return
-
         curves_identified_as_static = []
-        for i, curve_name in enumerate(curves_to_check):
-            key_values = all_key_values_per_curve[i]
-            
-            if not key_values:
+        for curve_name in curves_to_check:
+            targeted_keys = [
+                (key_time, key_value)
+                for key_time, key_value in _curve_key_data(curve_name)
+                if _time_is_targeted(
+                    anim_selector, curve_name, key_time, selected_range
+                )
+            ]
+            if not targeted_keys:
                 continue
-            if len(key_values) == 1:
-                curves_identified_as_static.append(curve_name)
-                continue
-
-            first_val = key_values[0]
+            first_val = targeted_keys[0][1]
             is_static = all(
-                abs(v - first_val) < anim_selector.value_comparison_tolerance for v in key_values[1:]
+                abs(key_value - first_val)
+                < anim_selector.value_comparison_tolerance
+                for _key_time, key_value in targeted_keys[1:]
             )
             if is_static:
-                curves_identified_as_static.append(curve_name)
+                curves_identified_as_static.append(
+                    (curve_name, [item[0] for item in targeted_keys])
+                )
 
         if curves_identified_as_static:
-            mc.delete(curves_identified_as_static)
-            deleted_count = len(curves_identified_as_static)
+            if scope_label:
+                # A local selection must never delete the entire curve or any
+                # unselected keys that still carry animation outside it.
+                for curve_name, key_times in curves_identified_as_static:
+                    mc.cutKey(
+                        curve_name,
+                        time=cast_to_time_tuple(key_times),
+                        clear=True,
+                    )
+                    deleted_count += len(key_times)
+            else:
+                mc.delete([item[0] for item in curves_identified_as_static])
+                deleted_count = len(curves_identified_as_static)
             
     except Exception as e:
         mc.warning(f"Error in 'Delete Static Channels': {e}")
         traceback.print_exc()
     finally:
         mc.undoInfo(closeChunk=True)
-        msg = f"Deleted {deleted_count} static channels." if deleted_count > 0 else "No static channels found."
+        if scope_label:
+            msg = (
+                f"Deleted {deleted_count} static key(s) in the {scope_label}."
+                if deleted_count > 0
+                else f"No static keys found in the {scope_label}."
+            )
+        else:
+            msg = f"Deleted {deleted_count} static channels." if deleted_count > 0 else "No static channels found."
         mc.inViewMessage(amg=f"<hl>{msg}</hl>", pos='midCenter', fade=True)
         print(msg)
 
@@ -436,34 +551,35 @@ def delete_redundant_keys(selection_option_idx=1):
     """Delete keys that are redundant (same value as previous and next key)."""
     mc.undoInfo(openChunk=True, chunkName="Delete Redundant Keys")
     total_keys_cut_count = 0
+    selected_range = None
+    scope_label = None
     try:
-        anim_selector = _get_animation_selection_object(selection_option_idx)
+        anim_selector = _get_automatic_animation_selection(selection_option_idx)
         if not anim_selector:
             raise ValueError("Could not initialize animation scope.")
+        selected_range = _operation_time_range(anim_selector)
+        scope_label = _operation_scope_label(anim_selector, selected_range)
 
         curves_to_process = anim_selector.curves
         if not curves_to_process:
             print("No valid curves to process for redundant keys.")
-            mc.undoInfo(closeChunk=True)
             return
 
         for curve_name in curves_to_process:
-            try:
-                 key_times = mc.keyframe(curve_name, query=True, timeChange=True)
-                 key_values = mc.keyframe(curve_name, query=True, valueChange=True)
-            except RuntimeError:
+            sorted_key_data = _curve_key_data(curve_name)
+            if len(sorted_key_data) < 3:
                 continue
-
-            if not key_times or not key_values or len(key_times) < 3 or len(key_times) != len(key_values):
-                continue
-
-            sorted_key_data = sorted(zip(key_times, key_values))
             
             redundant_key_times_to_cut = []
             for i in range(1, len(sorted_key_data) - 1):
                 _prev_time, prev_val = sorted_key_data[i-1]
                 curr_time, curr_val = sorted_key_data[i]
                 _next_time, next_val = sorted_key_data[i+1]
+
+                if not _time_is_targeted(
+                    anim_selector, curve_name, curr_time, selected_range
+                ):
+                    continue
 
                 if abs(curr_val - prev_val) < anim_selector.value_comparison_tolerance and \
                    abs(curr_val - next_val) < anim_selector.value_comparison_tolerance:
@@ -478,7 +594,14 @@ def delete_redundant_keys(selection_option_idx=1):
         traceback.print_exc()
     finally:
         mc.undoInfo(closeChunk=True)
-        msg = f"Deleted {total_keys_cut_count} redundant keys." if total_keys_cut_count > 0 else "No redundant keys found."
+        if scope_label:
+            msg = (
+                f"Deleted {total_keys_cut_count} redundant key(s) in the {scope_label}."
+                if total_keys_cut_count > 0
+                else f"No redundant keys found in the {scope_label}."
+            )
+        else:
+            msg = f"Deleted {total_keys_cut_count} redundant keys." if total_keys_cut_count > 0 else "No redundant keys found."
         mc.inViewMessage(amg=f"<hl>{msg}</hl>", pos='midCenter', fade=True)
         print(msg)
 
@@ -487,28 +610,29 @@ def delete_sub_frame_keys(selection_option_idx=1):
     """Delete keys that are not on integer frame numbers (sub-frames)."""
     mc.undoInfo(openChunk=True, chunkName="Delete Sub-Frame Keys")
     total_keys_cut_count = 0
+    selected_range = None
+    scope_label = None
     try:
-        anim_selector = _get_animation_selection_object(selection_option_idx)
+        anim_selector = _get_automatic_animation_selection(selection_option_idx)
         if not anim_selector:
             raise ValueError("Could not initialize animation scope.")
+        selected_range = _operation_time_range(anim_selector)
+        scope_label = _operation_scope_label(anim_selector, selected_range)
 
         curves_to_process = anim_selector.curves
         if not curves_to_process:
             print("No valid curves to process for sub-frame keys.")
-            mc.undoInfo(closeChunk=True)
             return
 
         for curve_name in curves_to_process:
-            try:
-                key_times = mc.keyframe(curve_name, query=True, timeChange=True)
-            except RuntimeError:
-                continue
-
-            if not key_times:
-                continue
-
             sub_frame_key_times_to_cut = [
-                t for t in key_times if abs(t - round(t)) > anim_selector.subframe_tolerance
+                key_time
+                for key_time, _key_value in _curve_key_data(curve_name)
+                if _time_is_targeted(
+                    anim_selector, curve_name, key_time, selected_range
+                )
+                and abs(key_time - round(key_time))
+                > anim_selector.subframe_tolerance
             ]
 
             if sub_frame_key_times_to_cut:
@@ -520,7 +644,14 @@ def delete_sub_frame_keys(selection_option_idx=1):
         traceback.print_exc()
     finally:
         mc.undoInfo(closeChunk=True)
-        msg = f"Deleted {total_keys_cut_count} sub-frame keys." if total_keys_cut_count > 0 else "No sub-frame keys found."
+        if scope_label:
+            msg = (
+                f"Deleted {total_keys_cut_count} sub-frame key(s) in the {scope_label}."
+                if total_keys_cut_count > 0
+                else f"No sub-frame keys found in the {scope_label}."
+            )
+        else:
+            msg = f"Deleted {total_keys_cut_count} sub-frame keys." if total_keys_cut_count > 0 else "No sub-frame keys found."
         mc.inViewMessage(amg=f"<hl>{msg}</hl>", pos='midCenter', fade=True)
         print(msg)
 
@@ -1034,6 +1165,12 @@ class AnimCleanerWindow(ContextPopupWindow):
             "Selected Channels (ChannelBox)",
             "Selected Keys (Graph Editor)"
         ])
+        self.scope_combo.setToolTip(
+            "Automatic range priority:\n"
+            "1. Selected keys in Graph Editor\n"
+            "2. Highlighted Time Slider range\n"
+            "3. Full animation in this scope"
+        )
         self.scope_combo.setStyleSheet("""
             QComboBox {
                 background-color: #4d4d4d;

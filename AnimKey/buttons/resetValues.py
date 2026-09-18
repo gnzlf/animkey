@@ -19,6 +19,8 @@ import os
 import json
 import time
 
+from AnimKey.mods.storage import atomic_write_json, read_json
+
 
 RESET_SCHEMA_KEY = "__animkey_schema__"
 RESET_SNAPSHOTS_KEY = "snapshots"
@@ -113,12 +115,11 @@ def _load_default_data(json_file_path):
     if not os.path.exists(json_file_path):
         return {}
 
-    try:
-        with open(json_file_path, 'r') as file:
-            return json.load(file)
-    except Exception as e:
-        cmds.warning("AnimKey: Could not read reset values snapshot: {}".format(str(e)))
-        return {}
+    data = read_json(json_file_path, default=None, backup_corrupt=True)
+    if isinstance(data, dict):
+        return data
+    cmds.warning("AnimKey: Could not read reset values snapshot; a corrupt backup was kept.")
+    return {}
 
 
 def _safe_key(text):
@@ -312,8 +313,7 @@ def _snapshot_attrs_for_object(obj, selected_channels=None):
 
 
 def _write_reset_data(json_file_path, data):
-    with open(json_file_path, 'w') as file:
-        json.dump(data, file, separators=(",", ":"))
+    atomic_write_json(json_file_path, data, indent=None)
 
 
 def _standard_default_for_attr(attr):
@@ -739,11 +739,7 @@ def save_default_values(*args):
     os.makedirs(os.path.dirname(json_file_path), exist_ok=True)
     
     # Read existing data from JSON file if it exists
-    if os.path.exists(json_file_path):
-        with open(json_file_path, 'r') as file:
-            data = json.load(file)
-    else:
-        data = {}
+    data = _load_default_data(json_file_path)
     data = _ensure_snapshot_container(data)
     
     selected_channels = get_selected_channels()
@@ -821,8 +817,7 @@ def restore_default_data(*args):
     
     # Check if file exists and empty its content
     if os.path.exists(json_file_path):
-        with open(json_file_path, 'w') as file:
-            json.dump({}, file)  # Write empty dictionary to file
+        _write_reset_data(json_file_path, {})
         
         cmds.warning("AnimKey: All default values cleared")
     else:
@@ -840,8 +835,7 @@ def remove_default_values_for_selected_object(*args):
     
     # Read existing data from JSON file if it exists
     if os.path.exists(json_file_path):
-        with open(json_file_path, 'r') as file:
-            data = json.load(file)
+        data = _load_default_data(json_file_path)
     else:
         cmds.warning("AnimKey: No saved data file found.")
         return
@@ -929,5 +923,3 @@ def get_info():
         "icon": "reset_values.svg",
         "shortcut": None,
     }
-
-

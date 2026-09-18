@@ -154,7 +154,7 @@ BUTTON_ICONS = {
     # Extra buttons
     "RBK": ICON_BTN_REBLOCK,
     "GMB": ICON_BTN_GIMBAL,
-    "COL": get_icon("animkey_btn_col_128.png"),  # Collision Tool
+    "SWT": get_icon("animkey_btn_col_128.png"),  # Switcher
     "BAK": ICON_BTN_BAKE,
     "RTM": ICON_BTN_RTM,
     "ACL": ICON_BTN_ACL,
@@ -234,4 +234,3 @@ class IconLoader:
     def exists(cls, icon_name):
         """Check if an icon file exists."""
         return os.path.exists(get_icon(icon_name))
-

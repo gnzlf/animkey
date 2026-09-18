@@ -13,13 +13,16 @@
 import maya.cmds as cmds
 import maya.api.OpenMaya as om
 from AnimKey.sliders.slider_utils import (
-    finalize_slider_value,
+    apply_worldspace_slider_values,
     get_keyframes_for_attribute,
     get_object_frames_to_process,
     get_previous_next_keyframes,
     get_processing_context,
-    should_process_attribute,
-    slider_amount
+    should_process_attribute_at_frame,
+    slider_attribute_is_editable,
+    slider_amount,
+    blend_angle_degrees,
+    average_angles_degrees,
 )
 
 
@@ -70,7 +73,7 @@ def prepare_blend_data(objs=None, attrs=None):
     global _blend_neighbors_ws_data_cache, _processing_context
     _blend_neighbors_ws_data_cache = {}
     
-    _processing_context = get_processing_context()
+    _processing_context = get_processing_context(explicit_attributes=attrs is not None)
     selected_channels = _processing_context.get('selected_channels')
     
     objects = objs if objs else cmds.ls(selection=True)
@@ -107,51 +110,58 @@ def prepare_blend_data(objs=None, attrs=None):
         if not frames_to_process:
             continue
         
-        # Process each frame
+        transform_cache = {}
+
+        def transform_at(frame_value):
+            numeric_frame = float(frame_value)
+            if numeric_frame not in transform_cache:
+                transform_cache[numeric_frame] = matrix_to_transform(
+                    get_world_matrix(obj, numeric_frame)
+                )
+            return transform_cache[numeric_frame]
+
+        # Process each selected frame. Neighbors are resolved per curve: the
+        # next tx key is not necessarily the next ty/rz key on the control.
         for frame in frames_to_process:
-            # Find previous and next keyframes
-            prev_frame, next_frame = get_previous_next_keyframes(all_keyframes, frame)
-            
-            if prev_frame is None and next_frame is None:
-                continue
-            
-            # Get world space transforms at neighbor frames
-            neighbor_transforms = []
-            
-            if prev_frame is not None:
-                prev_matrix = get_world_matrix(obj, prev_frame)
-                neighbor_transforms.append(matrix_to_transform(prev_matrix))
-            
-            if next_frame is not None:
-                next_matrix = get_world_matrix(obj, next_frame)
-                neighbor_transforms.append(matrix_to_transform(next_matrix))
-            
-            # Get current world space transform
-            current_matrix = get_world_matrix(obj, frame)
-            current_transform = matrix_to_transform(current_matrix)
-            
+            current_transform = transform_at(frame)
             current_attrs = attrs if attrs else transform_attrs
-            
+
             for attr in current_attrs:
                 if attr not in transform_attrs:
                     continue
                 
-                if not should_process_attribute(obj, attr, selected_channels):
+                if not should_process_attribute_at_frame(
+                    obj, attr, frame, _processing_context, selected_channels
+                ):
                     continue
                 
                 attr_full = f'{obj}.{attr}'
                 
                 if not cmds.objExists(attr_full):
                     continue
-                
+
                 try:
-                    current_value = current_transform.get(attr, 0)
-                    
-                    neighbor_values = [t.get(attr, 0) for t in neighbor_transforms]
-                    if not neighbor_values:
+                    attr_keyframes = get_keyframes_for_attribute(
+                        attr_full, attr, _processing_context
+                    )
+                    prev_frame, next_frame = get_previous_next_keyframes(
+                        attr_keyframes, frame
+                    )
+                    neighbor_transforms = []
+                    if prev_frame is not None:
+                        neighbor_transforms.append(transform_at(prev_frame))
+                    if next_frame is not None:
+                        neighbor_transforms.append(transform_at(next_frame))
+                    if not neighbor_transforms:
                         continue
-                    
-                    neighbor_average = sum(neighbor_values) / len(neighbor_values)
+
+                    current_value = current_transform.get(attr, 0)
+                    neighbor_values = [t.get(attr, 0) for t in neighbor_transforms]
+                    neighbor_average = (
+                        average_angles_degrees(neighbor_values)
+                        if attr.startswith('rotate')
+                        else sum(neighbor_values) / len(neighbor_values)
+                    )
                     
                     cache_key = f"{attr_full}@{frame}"
                     _blend_neighbors_ws_data_cache[cache_key] = {
@@ -182,12 +192,9 @@ def execute(percentage):
         cmds.undoInfo(openChunk=True)
         _is_dragging = True
     
-    current_time = _processing_context.get('current_time', cmds.currentTime(query=True))
+    pending_updates = []
     
     for cache_key, cache in _blend_neighbors_ws_data_cache.items():
-        if not cache.get("needsCalculation", False):
-            continue
-        
         attr_full = cache.get("attr_full")
         frame = cache.get("frame")
         
@@ -197,7 +204,7 @@ def execute(percentage):
         try:
             if not cmds.objExists(attr_full):
                 continue
-            if cmds.getAttr(attr_full, lock=True) or not cmds.getAttr(attr_full, settable=True):
+            if not slider_attribute_is_editable(attr_full):
                 continue
             
             current_value = cache.get("currentValue")
@@ -207,58 +214,25 @@ def execute(percentage):
                 continue
             
             blend_factor = slider_amount(percentage, signed=True)
-            difference = neighbor_value - current_value
-            blended_value = current_value + (difference * blend_factor)
-            
-            # Apply value in world space
-            obj, attr = attr_full.split('.', 1)
-            
-            if attr.startswith('translate'):
-                axis = attr[-1].lower()
-                pos = list(cmds.xform(obj, query=True, translation=True, worldSpace=True))
-                axis_idx = {'x': 0, 'y': 1, 'z': 2}[axis]
-                pos[axis_idx] = blended_value
-                cmds.xform(obj, translation=pos, worldSpace=True)
-            elif attr.startswith('rotate'):
-                axis = attr[-1].lower()
-                rot = list(cmds.xform(obj, query=True, rotation=True, worldSpace=True))
-                axis_idx = {'x': 0, 'y': 1, 'z': 2}[axis]
-                rot[axis_idx] = blended_value
-                cmds.xform(obj, rotation=rot, worldSpace=True)
+            if attr_full.rsplit('.', 1)[-1].startswith('rotate'):
+                blended_value = blend_angle_degrees(
+                    current_value, neighbor_value, blend_factor
+                )
             else:
-                cmds.setAttr(attr_full, blended_value)
+                difference = neighbor_value - current_value
+                blended_value = current_value + (difference * blend_factor)
             
+            pending_updates.append((attr_full, frame, blended_value))
+
         except Exception:
             continue
+
+    apply_worldspace_slider_values(pending_updates)
 
 
 def reset():
     """Reset blend to neighbors world space slider state."""
     global _blend_neighbors_ws_data_cache, _is_dragging, _processing_context
-    
-    current_time = _processing_context.get('current_time', cmds.currentTime(query=True))
-    
-    if _blend_neighbors_ws_data_cache:
-        for cache_key, cache_data in _blend_neighbors_ws_data_cache.items():
-            try:
-                attr_full = cache_data.get("attr_full")
-                frame = cache_data.get("frame")
-                
-                if not attr_full:
-                    continue
-                
-                current_value = cmds.getAttr(attr_full)
-                
-                if isinstance(current_value, (list, tuple)):
-                    if len(current_value) == 1:
-                        current_value = current_value[0]
-                    else:
-                        continue
-                
-                finalize_slider_value(attr_full, frame, current_value, current_time)
-                
-            except Exception:
-                continue
     
     _blend_neighbors_ws_data_cache = {}
     _processing_context = {}

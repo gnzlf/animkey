@@ -16,11 +16,14 @@ from AnimKey.sliders.slider_utils import (
     apply_slider_value,
     finalize_slider_value,
     get_frames_to_process,
+    get_infinity_type,
     get_keyframes_for_attribute,
     get_slider_value,
     get_value_at_time,
     get_processing_context,
+    get_selected_curve_for_attribute,
     should_process_attribute,
+    slider_attribute_is_editable,
     slider_amount
 )
 
@@ -40,6 +43,7 @@ def get_infinity_value(attr_full, frame):
         if not keyframes:
             return None
         
+        target_curve = get_selected_curve_for_attribute(attr_full, attr) or attr_full
         first_key = min(keyframes)
         last_key = max(keyframes)
         
@@ -48,22 +52,22 @@ def get_infinity_value(attr_full, frame):
             dist_to_last = last_key - frame
             
             if dist_to_first < dist_to_last:
-                infinity_type = cmds.setInfinity(attr_full, query=True, preInfinite=True)[0]
+                infinity_type = get_infinity_type(attr_full, pre=True, attr=attr)
                 edge_key = first_key
                 edge_value = get_value_at_time(attr_full, first_key)
                 direction = -1
             else:
-                infinity_type = cmds.setInfinity(attr_full, query=True, postInfinite=True)[0]
+                infinity_type = get_infinity_type(attr_full, pre=False, attr=attr)
                 edge_key = last_key
                 edge_value = get_value_at_time(attr_full, last_key)
                 direction = 1
         elif frame < first_key:
-            infinity_type = cmds.setInfinity(attr_full, query=True, preInfinite=True)[0]
+            infinity_type = get_infinity_type(attr_full, pre=True, attr=attr)
             edge_key = first_key
             edge_value = get_value_at_time(attr_full, first_key)
             direction = -1
         else:
-            infinity_type = cmds.setInfinity(attr_full, query=True, postInfinite=True)[0]
+            infinity_type = get_infinity_type(attr_full, pre=False, attr=attr)
             edge_key = last_key
             edge_value = get_value_at_time(attr_full, last_key)
             direction = 1
@@ -72,68 +76,25 @@ def get_infinity_value(attr_full, frame):
             return edge_value
         elif infinity_type == 'linear':
             if direction == 1:
-                tangent = cmds.keyTangent(attr_full, query=True, time=(edge_key,), outAngle=True)
+                tangent = cmds.keyTangent(target_curve, query=True, time=(edge_key,), outAngle=True)
             else:
-                tangent = cmds.keyTangent(attr_full, query=True, time=(edge_key,), inAngle=True)
+                tangent = cmds.keyTangent(target_curve, query=True, time=(edge_key,), inAngle=True)
             
             if tangent:
                 slope = math.tan(math.radians(tangent[0]))
                 time_diff = frame - edge_key
                 return edge_value + (slope * time_diff)
             return edge_value
-        elif infinity_type in ['cycle', 'cycleRelative']:
-            anim_length = last_key - first_key
-            if anim_length == 0:
-                return edge_value
-            
-            if frame < first_key:
-                time_offset = first_key - frame
-                cycles = int(time_offset / anim_length)
-                remainder = time_offset % anim_length
-                cycle_time = last_key - remainder
-            else:
-                time_offset = frame - last_key
-                cycles = int(time_offset / anim_length)
-                remainder = time_offset % anim_length
-                cycle_time = first_key + remainder
-            
-            cycle_value = get_value_at_time(attr_full, cycle_time)
-            
-            if infinity_type == 'cycleRelative':
-                first_value = get_value_at_time(attr_full, first_key)
-                last_value = get_value_at_time(attr_full, last_key)
-                cycle_offset = (last_value - first_value) * (cycles + 1)
-                if frame < first_key:
-                    return cycle_value - cycle_offset
-                else:
-                    return cycle_value + cycle_offset
-            
-            return cycle_value
-        elif infinity_type == 'oscillate':
-            anim_length = last_key - first_key
-            if anim_length == 0:
-                return edge_value
-            
-            if frame < first_key:
-                time_offset = first_key - frame
-            else:
-                time_offset = frame - last_key
-            
-            cycles = int(time_offset / anim_length)
-            remainder = time_offset % anim_length
-            
-            if cycles % 2 == 0:
-                if frame < first_key:
-                    cycle_time = first_key + remainder
-                else:
-                    cycle_time = last_key - remainder
-            else:
-                if frame < first_key:
-                    cycle_time = last_key - remainder
-                else:
-                    cycle_time = first_key + remainder
-            
-            return get_value_at_time(attr_full, cycle_time)
+        elif infinity_type in ('cycle', 'cycleRelative', 'oscillate'):
+            # Evaluate the real animCurve infinity at a virtual time outside
+            # the chosen edge.  This handles cycle offsets and oscillation at
+            # exact cycle boundaries without duplicating Maya's curve math.
+            distance = abs(float(frame) - float(edge_key))
+            virtual_time = (
+                float(edge_key) - distance if direction == -1
+                else float(edge_key) + distance
+            )
+            return get_value_at_time(attr_full, virtual_time)
         
         return edge_value
         
@@ -146,7 +107,7 @@ def prepare_blend_data(objs=None, attrs=None):
     global _blend_infinity_data_cache, _processing_context
     _blend_infinity_data_cache = {}
     
-    _processing_context = get_processing_context()
+    _processing_context = get_processing_context(explicit_attributes=attrs is not None)
     selected_channels = _processing_context.get('selected_channels')
     
     objects = objs if objs else cmds.ls(selection=True)
@@ -229,7 +190,7 @@ def execute(percentage):
         try:
             if not cmds.objExists(attr_full):
                 continue
-            if cmds.getAttr(attr_full, lock=True) or not cmds.getAttr(attr_full, settable=True):
+            if not slider_attribute_is_editable(attr_full):
                 continue
             
             current_value = cache.get("currentValue")

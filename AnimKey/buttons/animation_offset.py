@@ -14,12 +14,9 @@ import time
 import sys
 import math
 
-try:
-    from PySide2 import QtWidgets, QtCore, QtGui
-    from shiboken2 import wrapInstance
-except ImportError:
-    from PySide6 import QtWidgets, QtCore, QtGui
-    from shiboken6 import wrapInstance
+from AnimKey.mods.maya_compat import (
+    QtCore, QtGui, QtWidgets, wrap_instance as wrapInstance,
+)
 
 from AnimKey.core.animation_offset_session import (
     ANIMATION_OFFSET_ENGINE_REVISION,
@@ -2184,8 +2181,61 @@ def offset_animation_deferred(interval, generation):
                 adjust_offset_animation()
 
 
+def _graph_editor_is_active():
+    """Return whether a Graph Editor is currently visible or focused."""
+    try:
+        panels = cmds.getPanel(visiblePanels=True) or []
+    except Exception:
+        panels = []
+    try:
+        focused = cmds.getPanel(withFocus=True)
+    except Exception:
+        focused = None
+    if focused:
+        panels = list(panels) + [focused]
+    if any("graphEditor" in str(panel) for panel in panels):
+        return True
+
+    # The classic floating Graph Editor is not always returned by getPanel.
+    try:
+        return bool(
+            cmds.window("graphEditor1Window", exists=True)
+            and cmds.window("graphEditor1Window", query=True, visible=True)
+        )
+    except Exception:
+        return False
+
+
+def _selected_graph_editor_time_range():
+    """Return the inclusive span of selected Graph Editor keys, if meaningful."""
+    if not _graph_editor_is_active():
+        return None
+    try:
+        selected_times = cmds.keyframe(
+            query=True,
+            selected=True,
+            timeChange=True,
+        ) or []
+    except Exception:
+        try:
+            selected_times = cmds.keyframe(query=True, selected=True) or []
+        except Exception:
+            selected_times = []
+    if not selected_times:
+        return None
+    start = min(float(frame) for frame in selected_times)
+    end = max(float(frame) for frame in selected_times)
+    if abs(end - start) <= 0.001:
+        return None
+    return _normalize_inclusive_time_range((start, end))
+
+
 def _selected_offset_time_range():
-    """Return the inclusive Animation Offset range from Maya's time slider."""
+    """Return Graph Editor, time-slider, or playback range in that priority."""
+    graph_range = _selected_graph_editor_time_range()
+    if graph_range:
+        return graph_range
+
     try:
         aTimeSlider = mel.eval('$tmpVar=$gPlayBackSlider')
         time_range = cmds.timeControl(aTimeSlider, q=True, rangeArray=True)
