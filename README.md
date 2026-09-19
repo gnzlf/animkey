@@ -58,6 +58,11 @@ contains the verified AnimKey package. Draft releases and prereleases are never
 offered by the updater. AnimKey closes its tool windows and reloads the toolbar
 automatically after changing versions; Maya does not need to be restarted.
 
+The drag-and-drop installer uses `Documents/maya/AnimKey` on Windows. If a
+source checkout was loaded instead, Update locates the existing Maya installation
+and reloads that installed copy after upgrading or downgrading. The source
+checkout is kept untouched.
+
 ### AnimKey 1.1.1
 
 - Paste Animation and Paste Selected Animation now prepare destination channels
@@ -178,6 +183,12 @@ Apply modifications to selected curves:
 ---
 
 ## 📁 Project Structure
+
+Development tests and release utilities are kept in `.github/tests` and
+`.github/tools`. They are excluded from the installer ZIP and the Maya package.
+Run updater tests from the repository root with
+`python -m unittest discover -s .github/tests -p test_updater.py`, and build a
+release with `python .github/tools/build_release.py --version MAJOR.MINOR.PATCH`.
 
 ```
 AnimKey/

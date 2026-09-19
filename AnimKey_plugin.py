@@ -16,6 +16,16 @@ import maya.api.OpenMaya as om
 import maya.cmds as cmds
 
 
+def _prioritize_installation():
+    import os
+    import sys
+
+    maya_app_dir = cmds.internalVar(userAppDir=True)
+    destination = os.path.normcase(os.path.realpath(maya_app_dir))
+    sys.path[:] = [p for p in sys.path if os.path.normcase(os.path.realpath(p)) != destination]
+    sys.path.insert(0, maya_app_dir)
+
+
 def maya_useNewAPI():
     """Tell Maya to use the Python API 2.0"""
     pass
@@ -23,6 +33,7 @@ def maya_useNewAPI():
 
 # Plugin information
 PLUGIN_NAME = "AnimKey"
+_prioritize_installation()
 from AnimKey.version import __version__ as PLUGIN_VERSION
 PLUGIN_AUTHOR = "AnimKey"
 VENDOR = "AnimKey"
@@ -60,12 +71,7 @@ def uninitializePlugin(plugin):
 
 def _start_animkey():
     """Start AnimKey after Maya is fully loaded"""
-    import sys
-    
-    # Add AnimKey installation path to Python path
-    maya_app_dir = cmds.internalVar(userAppDir=True)
-    if maya_app_dir not in sys.path:
-        sys.path.insert(0, maya_app_dir)
+    _prioritize_installation()
     
     try:
         import AnimKey

@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 import zipfile
+from unittest import mock
 
 from AnimKey.core import updater
 
@@ -43,7 +44,78 @@ def make_release_archive(version):
     return output.getvalue()
 
 
+def make_installed_package(parent, version="1.0.0"):
+    root = os.path.join(parent, "AnimKey")
+    for name in updater.REQUIRED_PACKAGE_FILES:
+        target = os.path.join(root, name)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as stream:
+            stream.write('__version__ = "{}"\n'.format(version))
+    return root
+
+
 class UpdaterTests(unittest.TestCase):
+    def test_installed_package_is_preferred_to_external_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app_dir = os.path.join(directory, "maya")
+            installed = make_installed_package(app_dir)
+            checkout = make_installed_package(os.path.join(directory, "checkout"))
+            with mock.patch.object(updater, "package_root", return_value=checkout):
+                actual = updater.resolve_install_root((app_dir,))
+            self.assertEqual(actual, os.path.realpath(installed))
+
+    def test_loaded_scripts_install_is_not_redirected_to_another_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app_dir = os.path.join(directory, "maya")
+            make_installed_package(app_dir)
+            scripts_dir = os.path.join(app_dir, "2024", "scripts")
+            installed = make_installed_package(scripts_dir)
+            self.assertEqual(
+                updater.resolve_install_root((app_dir, scripts_dir), installed),
+                os.path.realpath(installed),
+            )
+
+    def test_missing_install_does_not_select_or_replace_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = make_installed_package(os.path.join(directory, "checkout"))
+            with self.assertRaisesRegex(updater.UpdateError, "Run AnimKey_Install.py"):
+                updater.resolve_install_root((os.path.join(directory, "maya"),), checkout)
+            self.assertTrue(os.path.isfile(os.path.join(checkout, "version.py")))
+
+    def test_incomplete_install_is_not_selected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_installed_package(directory)
+            os.remove(os.path.join(root, "core", "toolbar.py"))
+            with self.assertRaisesRegex(updater.UpdateError, "No complete AnimKey"):
+                updater.resolve_install_root((directory,), root)
+
+    def test_upgrade_and_downgrade_leave_checkout_and_preferences_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app_dir = os.path.join(directory, "maya")
+            installed = make_installed_package(app_dir)
+            checkout = make_installed_package(os.path.join(directory, "checkout"), "9.0.0")
+            preferences = os.path.join(app_dir, "AnimKey_user_data", "preferences.json")
+            os.makedirs(os.path.dirname(preferences))
+            with open(preferences, "w", encoding="utf-8") as stream:
+                stream.write('{"theme": "maya_classic"}')
+            for version in ("1.1.1", "1.0.0"):
+                archive_bytes = make_release_archive(version)
+                release = updater.ReleaseInfo(
+                    version=version, tag_name="v" + version, name="AnimKey " + version,
+                    published_at="", notes="", html_url="",
+                    download_url="https://example.test/package.zip",
+                    digest=hashlib.sha256(archive_bytes).hexdigest(),
+                )
+                selected = updater.resolve_install_root((app_dir,), checkout)
+                updater.install_release(
+                    release, install_root=selected, allowed_parents=(app_dir,),
+                    opener=fake_opener({release.download_url: archive_bytes}),
+                )
+                self.assertEqual(updater._version_from_payload(installed), version)
+                self.assertEqual(updater._version_from_payload(checkout), "9.0.0")
+                with open(preferences, encoding="utf-8") as stream:
+                    self.assertEqual(json.load(stream), {"theme": "maya_classic"})
+
     def test_parse_releases_filters_non_stable_and_sorts_versions(self):
         payload = [
             {

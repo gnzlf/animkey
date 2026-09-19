@@ -258,6 +258,31 @@ def _validate_install_root(install_root, allowed_parents):
     return install_root, resolved_parent
 
 
+def resolve_install_root(allowed_parents, active_root=None):
+    """Use the installed copy even when a checkout shadows it in sys.path.
+
+    Never replace an external source checkout. A fallback must already contain
+    a complete installed package in one of Maya's explicitly allowed folders.
+    """
+    active_root = active_root or package_root()
+    allowed_parents = tuple(path for path in allowed_parents if path)
+    candidates = [active_root] + [
+        os.path.join(parent, "AnimKey") for parent in allowed_parents
+    ]
+    for candidate in candidates:
+        try:
+            candidate, _parent = _validate_install_root(candidate, allowed_parents)
+        except UpdateError:
+            continue
+        if all(os.path.isfile(os.path.join(candidate, name)) for name in REQUIRED_PACKAGE_FILES):
+            return candidate
+    raise UpdateError(
+        "No complete AnimKey installation was found in Maya's application or scripts folder. "
+        "Run AnimKey_Install.py once, then try the update again. "
+        "Currently loaded from: {}".format(active_root)
+    )
+
+
 def _safe_remove_tree(path, allowed_parent):
     if (
         not path

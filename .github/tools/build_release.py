@@ -20,7 +20,7 @@ TOP_LEVEL_FILES = ("AnimKey_Install.py", "AnimKey_plugin.py", "README.md")
 
 
 def repository_root():
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def source_version(root):

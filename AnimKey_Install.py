@@ -98,6 +98,19 @@ def _remove_marked_startup(content):
         content = (content[:start].rstrip() + "\n" + content[end:].lstrip("\r\n"))
     return content
 
+
+def _prioritize_installation(maya_app_dir):
+    """Ensure a source checkout cannot shadow the copy just installed."""
+    destination = os.path.normcase(os.path.realpath(maya_app_dir))
+    sys.path[:] = [
+        path for path in sys.path
+        if os.path.normcase(os.path.realpath(path)) != destination
+    ]
+    sys.path.insert(0, maya_app_dir)
+    import importlib
+    importlib.invalidate_caches()
+
+
 def onMayaDroppedPythonFile(*args):
     """
     This function is automatically called when the file is dropped into Maya.
@@ -232,8 +245,7 @@ def install_animkey(launch=True):
         cmds.warning("AnimKey updated, but the old backup could not be removed: {}".format(e))
     
     # Add maya_app_dir to Python path (where AnimKey is now installed)
-    if maya_app_dir not in sys.path:
-        sys.path.insert(0, maya_app_dir)
+    _prioritize_installation(maya_app_dir)
     
     # Create userSetup.py entry if it doesn't exist
     user_setup_path = os.path.join(maya_scripts_dir, "userSetup.py")
@@ -242,12 +254,14 @@ def install_animkey(launch=True):
 def _animkey_deferred_startup():
     """Deferred startup to ensure Maya is fully loaded"""
     import sys
+    import os
     import maya.cmds as cmds
     
     # Add AnimKey installation path to Python path
     maya_app_dir = cmds.internalVar(userAppDir=True)
-    if maya_app_dir not in sys.path:
-        sys.path.insert(0, maya_app_dir)
+    destination = os.path.normcase(os.path.realpath(maya_app_dir))
+    sys.path[:] = [p for p in sys.path if os.path.normcase(os.path.realpath(p)) != destination]
+    sys.path.insert(0, maya_app_dir)
     
     try:
         import AnimKey

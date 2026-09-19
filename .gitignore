@@ -15,6 +15,7 @@ env/
 Thumbs.db
 
 # Temporary/log files
+dist/
 *.log
 *.tmp
 *.bak

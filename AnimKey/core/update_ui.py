@@ -12,12 +12,21 @@ from AnimKey.mods.maya_compat import QtCore, QtGui, QtWidgets
 from AnimKey.version import __version__
 
 
-def _reload_after_update():
+def _reload_after_update(install_root=None):
     """Load the freshly installed package in the current Maya session."""
     import importlib
     import sys
 
     try:
+        if install_root:
+            # The new release may be older and lack this updater fix. Select
+            # its import path here before importing any of the new modules.
+            install_parent = os.path.dirname(os.path.realpath(install_root))
+            sys.path[:] = [
+                path for path in sys.path
+                if os.path.normcase(os.path.realpath(path)) != os.path.normcase(install_parent)
+            ]
+            sys.path.insert(0, install_parent)
         importlib.invalidate_caches()
         for module_name in list(sys.modules.keys()):
             if module_name == "AnimKey" or module_name.startswith("AnimKey."):
@@ -83,6 +92,7 @@ class UpdateTab(QtWidgets.QWidget):
         self._install_buttons = []
         self._busy = False
         self._runtime_suspended = False
+        self._install_root = None
         self._build_ui()
         if config.get_setting("check_updates", True):
             QtCore.QTimer.singleShot(
@@ -324,6 +334,14 @@ class UpdateTab(QtWidgets.QWidget):
     def _confirm_install(self, release):
         if self._busy or not release.installable:
             return
+        maya_app_dir = cmds.internalVar(userAppDir=True)
+        maya_scripts_dir = cmds.internalVar(userScriptDir=True)
+        allowed_parents = (maya_app_dir, maya_scripts_dir, os.path.join(maya_app_dir, "scripts"))
+        try:
+            install_root = updater.resolve_install_root(allowed_parents)
+        except updater.UpdateError as exc:
+            self._on_task_failed(str(exc))
+            return
         relation = updater.compare_versions(release.version, self._installed_version)
         action = "upgrade" if relation > 0 else "downgrade" if relation < 0 else "reinstall"
         message = (
@@ -341,8 +359,7 @@ class UpdateTab(QtWidgets.QWidget):
         if result != QtWidgets.QMessageBox.Yes:
             return
 
-        maya_app_dir = cmds.internalVar(userAppDir=True)
-        maya_scripts_dir = cmds.internalVar(userScriptDir=True)
+        self._install_root = install_root
         plugin_destination = os.path.join(maya_app_dir, "plug-ins", "AnimKey_plugin.py")
         settings_window = self.window()
         try:
@@ -366,8 +383,8 @@ class UpdateTab(QtWidgets.QWidget):
             self._on_install_complete,
             self._on_task_failed,
             release,
-            install_root=updater.package_root(),
-            allowed_parents=(maya_app_dir, maya_scripts_dir),
+            install_root=install_root,
+            allowed_parents=allowed_parents,
             plugin_destination=plugin_destination,
         )
 
@@ -409,7 +426,8 @@ class UpdateTab(QtWidgets.QWidget):
             settings_window.close()
             settings_window.deleteLater()
 
-        cmds.evalDeferred(_reload_after_update)
+        install_root = self._install_root
+        cmds.evalDeferred(lambda: _reload_after_update(install_root))
 
     def _on_silent_check_failed(self, message):
         self._set_busy(False, "Updates unavailable: {}".format(message))
