@@ -998,31 +998,37 @@ class DrawingCanvas(QWidget):
             self._end_stroke()
             event.accept()
 
-    def _uniform_transform(self):
-        """Devuelve (scale, offset_x, offset_y, ref_w, ref_h) para escalado uniforme."""
-        rw = float(self.data.canvas_width or self.width())
-        rh = float(self.data.canvas_height or self.height())
-        cw, ch = float(self.width()), float(self.height())
+    def _uniform_transform(self, target_width=None, target_height=None):
+        """Map the reference drawing through the camera's viewport film fit.
+
+        Resizing a Maya panel changes its field of view, not the proportions
+        of the scene. Normalizing each axis to the new panel stretched the
+        drawing. Use the two camera frusta to preserve its shape and framing.
+        """
+        rw = max(1.0, float(self.data.canvas_width or self.width()))
+        rh = max(1.0, float(self.data.canvas_height or self.height()))
+        cw = max(1.0, float(target_width if target_width is not None else self.width()))
+        ch = max(1.0, float(target_height if target_height is not None else self.height()))
+        reference = self._view_frustum(False, rw, rh)
+        current = self._view_frustum(False, cw, ch)
+        if reference and current:
+            left_0, right_0, bottom_0, top_0 = reference
+            left_1, right_1, bottom_1, top_1 = current
+            span_x, span_y = right_1 - left_1, top_1 - bottom_1
+            if span_x > 1e-8 and span_y > 1e-8:
+                s = (cw / rw) * (right_0 - left_0) / span_x
+                ox = cw * (left_0 - left_1) / span_x
+                oy = ch * (top_1 - top_0) / span_y
+                return s, ox, oy, rw, rh
+        # Standalone canvas / unavailable camera: fit without stretching.
         s = min(cw / max(1, rw), ch / max(1, rh))
         ox = (cw - rw * s) / 2.0
         oy = (ch - rh * s) / 2.0
         return s, ox, oy, rw, rh
 
     def _viewport_brush_scale(self, target_width=None, target_height=None):
-        """Return an isotropic scale while points follow both viewport axes.
-
-        Stroke points are normalized to the complete viewport, not to a
-        letterboxed reference rectangle.  Brush width still needs one value,
-        so the geometric mean provides a stable proportional response when
-        only one viewport dimension changes.
-        """
-        rw = float(self.data.canvas_width or self.width() or 1.0)
-        rh = float(self.data.canvas_height or self.height() or 1.0)
-        cw = float(target_width if target_width is not None else self.width())
-        ch = float(target_height if target_height is not None else self.height())
-        sx = cw / max(1.0, rw)
-        sy = ch / max(1.0, rh)
-        return max(0.001, math.sqrt(abs(sx * sy)))
+        """Scale line thickness by the same factor as the drawing."""
+        return max(0.001, self._uniform_transform(target_width, target_height)[0])
 
     def _camera_shape_from_panel(self):
         panel = getattr(self, "model_panel", None) or get_active_model_panel()
@@ -1140,7 +1146,7 @@ class DrawingCanvas(QWidget):
         except Exception:
             return None
 
-    def _view_frustum(self, apply_pan_zoom):
+    def _view_frustum(self, apply_pan_zoom, target_width=None, target_height=None):
         camera_fn = self._camera_fn()
         if camera_fn is None:
             return None
@@ -1156,8 +1162,10 @@ class DrawingCanvas(QWidget):
         top_util, top_ptr = _double_ptr()
         _keep_alive = (left_util, right_util, bottom_util, top_util)
 
-        view = self._m3d_view()
-        view_w, view_h = self._api_view_size(view)
+        if target_width is not None and target_height is not None:
+            view_w, view_h = float(target_width), float(target_height)
+        else:
+            view_w, view_h = self._api_view_size(self._m3d_view())
         aspect = view_w / max(1.0, view_h)
 
         try:
@@ -1229,6 +1237,10 @@ class DrawingCanvas(QWidget):
             round(float(state["vpan"]), 6),
             round(float(state["hfa"]), 6),
             round(float(state["vfa"]), 6),
+            # Film fit, gate/overscan and viewport aspect can change even
+            # when the camera's pan/zoom attributes have not changed.
+            self._view_frustum(False, self.width(), self.height()),
+            self._view_frustum(False, self.data.canvas_width, self.data.canvas_height),
         )
 
     def _view_panzoom_transform(self, target_width=None, target_height=None):
@@ -1237,8 +1249,10 @@ class DrawingCanvas(QWidget):
         if not state["enabled"]:
             return 1.0, 1.0, 0.0, 0.0
 
-        base_frustum = self._view_frustum(False)
-        panzoom_frustum = self._view_frustum(True)
+        width = target_width if target_width is not None else self.width()
+        height = target_height if target_height is not None else self.height()
+        base_frustum = self._view_frustum(False, width, height)
+        panzoom_frustum = self._view_frustum(True, width, height)
         if base_frustum and panzoom_frustum:
             left_0, right_0, bottom_0, top_0 = base_frustum
             left_1, right_1, bottom_1, top_1 = panzoom_frustum
@@ -1326,19 +1340,19 @@ class DrawingCanvas(QWidget):
 
     def _to_normalized(self, px, py, view_transform=None,
                        uniform_transform=None):
-        """Pixel del viewport → coordenadas normalizadas de pantalla."""
+        """Convert a viewport pixel into the fixed reference drawing."""
         px, py = self._remove_view_panzoom(px, py, view_transform)
-        width = max(1.0, float(self.width()))
-        height = max(1.0, float(self.height()))
-        nx = px / width
-        ny = py / height
+        scale, ox, oy, rw, rh = uniform_transform or self._uniform_transform()
+        nx = (px - ox) / max(1e-8, rw * scale)
+        ny = (py - oy) / max(1e-8, rh * scale)
         return nx, ny
 
     def _to_pixel(self, nx, ny, view_transform=None,
                   uniform_transform=None):
-        """Coordenadas normalizadas de pantalla → pixel del viewport."""
-        px = nx * max(1.0, float(self.width()))
-        py = ny * max(1.0, float(self.height()))
+        """Project reference drawing coordinates into the current viewport."""
+        scale, ox, oy, rw, rh = uniform_transform or self._uniform_transform()
+        px = nx * rw * scale + ox
+        py = ny * rh * scale + oy
         return self._apply_view_panzoom(px, py, view_transform)
 
     def _point_has_world(self, point):
@@ -1364,10 +1378,10 @@ class DrawingCanvas(QWidget):
             return start[5], start[6]
         return self._to_pixel(start[0], start[1])
 
-    def _stroke_smoothed_path(self, stroke):
+    def _stroke_smoothed_path(self, stroke, uniform_transform=None, view_transform=None):
         if not stroke:
             return []
-        _s, _ox, _oy, rw, rh = self._uniform_transform()
+        rw, rh = self.data.canvas_width, self.data.canvas_height
         view_token = self._last_view_token
         if view_token is None:
             view_token = self._current_view_token()
@@ -1375,8 +1389,10 @@ class DrawingCanvas(QWidget):
         if stroke.smoothed_path and stroke._cache_size == cache_key:
             return stroke.smoothed_path
         raw = []
+        uniform_transform = uniform_transform or self._uniform_transform()
+        view_transform = view_transform or self._view_panzoom_transform()
         for point in stroke.points:
-            px, py = self._point_to_pixel(point)
+            px, py = self._point_to_pixel(point, view_transform, uniform_transform)
             raw.append((px, py, point.pressure))
         # Six samples per input span are enough after tablet-point filtering.
         # The old value (14) multiplied the amount of geometry rendered during
@@ -2184,7 +2200,7 @@ class DrawingCanvas(QWidget):
             self.data.canvas_width = self.width()
             self.data.canvas_height = self.height()
         self._drawing_uniform_transform = self._uniform_transform()
-        self._drawing_pixel_scale = self._viewport_brush_scale()
+        self._drawing_pixel_scale = self._drawing_uniform_transform[0]
         nx, ny = self._to_normalized(
             pos.x(), pos.y(), self._drawing_view_transform,
             self._drawing_uniform_transform,
@@ -2379,14 +2395,16 @@ class DrawingCanvas(QWidget):
 
         painter = QPainter(target)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        base_scale = self._viewport_brush_scale()
-        current_zoom = self._current_panzoom_zoom()
+        uniform_transform = self._uniform_transform()
+        view_transform = self._view_panzoom_transform()
+        base_scale = uniform_transform[0]
+        current_zoom = max(0.001, math.sqrt(abs(view_transform[0] * view_transform[1])))
 
         for stroke in frame_data.strokes:
             s_uniform = base_scale * (
                 current_zoom / max(0.001, float(stroke.draw_zoom or 1.0))
             )
-            seg = self._stroke_smoothed_path(stroke)
+            seg = self._stroke_smoothed_path(stroke, uniform_transform, view_transform)
             self._paint_saved_stroke(
                 painter, stroke, seg, s_uniform, global_opacity=opacity
             )
@@ -2566,6 +2584,8 @@ class DrawingCanvas(QWidget):
         painter = QPainter(img)
         painter.setRenderHint(QPainter.Antialiasing, True)
         zoom_x, zoom_y, offset_x, offset_y = self._view_panzoom_transform(target_w, target_h)
+        uniform_transform = self._uniform_transform(target_w, target_h)
+        view_transform = (zoom_x, zoom_y, offset_x, offset_y)
         current_zoom = max(
             0.001, math.sqrt(abs(float(zoom_x) * float(zoom_y)))
         )
@@ -2573,11 +2593,10 @@ class DrawingCanvas(QWidget):
         for stroke in fd.strokes:
             raw = []
             for p in stroke.points:
-                px = p.x * target_w
-                py = p.y * target_h
-                raw.append((px * zoom_x + offset_x, py * zoom_y + offset_y, p.pressure))
+                px, py = self._point_to_pixel(p, view_transform, uniform_transform)
+                raw.append((px, py, p.pressure))
             seg = self.spline.smooth_path(raw, num_interp=6)
-            stroke_scale = self._viewport_brush_scale(target_w, target_h) * (
+            stroke_scale = uniform_transform[0] * (
                 current_zoom / max(0.001, float(stroke.draw_zoom or 1.0))
             )
             self._paint_saved_stroke(painter, stroke, seg, stroke_scale, global_opacity=1.0)
@@ -3269,21 +3288,21 @@ def get_maya_main_window():
     main_window_ptr = omui.MQtUtil.mainWindow()
     return wrapInstance(int(main_window_ptr), QtWidgets.QMainWindow)
 
-def get_active_model_panel():
+def get_active_model_panel(preferred=None):
     panel = cmds.getPanel(withFocus=True)
-    if panel and "modelPanel" in panel:
-        return panel
     panels = cmds.getPanel(type="modelPanel") or []
-    for candidate in panels:
-        try:
-            if cmds.modelPanel(candidate, exists=True):
-                return candidate
-        except Exception:
-            continue
-    return panels[0] if panels else None
+    visible = cmds.getPanel(visiblePanels=True) or []
+    visible_models = [candidate for candidate in panels if candidate in visible]
+    if panel in visible_models:
+        return panel
+    if preferred in visible_models:
+        return preferred
+    if visible_models:
+        return visible_models[0]
+    return preferred if preferred in panels else (panels[0] if panels else None)
 
-def get_active_model_panel_widget():
-    panel = get_active_model_panel()
+def get_active_model_panel_widget(panel=None):
+    panel = panel or get_active_model_panel()
     if not panel:
         return None
 
@@ -3314,7 +3333,7 @@ class SketchboardWindow(QWidget):
         vp_widget = None
         self.model_panel = get_active_model_panel() if overlay else None
         if overlay:
-            vp_widget = get_active_model_panel_widget()
+            vp_widget = get_active_model_panel_widget(self.model_panel)
             
         maya_main = get_maya_main_window()
         super(SketchboardWindow, self).__init__(parent=maya_main, f=Qt.Window)
@@ -3475,33 +3494,16 @@ class SketchboardWindow(QWidget):
         if hasattr(self, "canvas") and self.canvas.drawing:
             return
 
-        # Actualización dinámica del target en caso de que Maya rearme sus docks
-        if not self.panel_locked:
-            try:
-                new_panel = get_active_model_panel()
-                new_vp = get_active_model_panel_widget()
-                
-                # Limpiar safely si el viejo objeto de C++ fue destruido por Maya
-                if self.viewport_parent:
-                    try:
-                        self.viewport_parent.objectName()
-                    except RuntimeError:
-                        self.viewport_parent = None
-
-                if new_vp and new_vp != self.viewport_parent:
-                    self.viewport_parent = new_vp
-                    self.model_panel = new_panel
-                    if hasattr(self, "canvas"):
-                        self.canvas.model_panel = new_panel
-            except Exception:
-                pass
-        else:
-            # Aunque esté lockeado, verificar que el widget siga vivo
-            if self.viewport_parent:
-                try:
-                    self.viewport_parent.objectName()
-                except RuntimeError:
-                    self.viewport_parent = None
+        # Space/layout changes may replace the viewport widget even when the
+        # logical panel stays locked. Reacquire that panel's drawing surface.
+        try:
+            panel = self.model_panel if self.panel_locked else get_active_model_panel(self.model_panel)
+            self.viewport_parent = get_active_model_panel_widget(panel) if panel else None
+            if panel:
+                self.model_panel = panel
+                self.canvas.model_panel = panel
+        except (RuntimeError, TypeError):
+            self.viewport_parent = None
 
         if not self.viewport_parent:
             if self.isVisible(): self.hide()
@@ -4161,7 +4163,7 @@ class SketchboardWindow(QWidget):
             self.status_bar.setText("❌ Could not read Maya playback range.")
             return
 
-        viewport_widget = get_active_model_panel_widget()
+        viewport_widget = get_active_model_panel_widget(self.model_panel)
         if viewport_widget is None:
             self.status_bar.setText("No active Maya viewport found.")
             return
@@ -4199,13 +4201,13 @@ class SketchboardWindow(QWidget):
                 try:
                     viewport_pixmap = viewport_widget.grab()
                 except RuntimeError:
-                    viewport_widget = get_active_model_panel_widget()
+                    viewport_widget = get_active_model_panel_widget(self.model_panel)
                     if viewport_widget is None:
                         raise RuntimeError("The active Maya viewport was closed during export.")
                     viewport_pixmap = viewport_widget.grab()
 
                 if viewport_pixmap.isNull():
-                    viewport_widget = get_active_model_panel_widget()
+                    viewport_widget = get_active_model_panel_widget(self.model_panel)
                     if viewport_widget is not None:
                         viewport_pixmap = viewport_widget.grab()
                 if viewport_pixmap.isNull():
