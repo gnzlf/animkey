@@ -112,6 +112,10 @@ def _is_animkey_tool_window(widget):
         object_name = str(widget.objectName() or "")
     except Exception:
         object_name = ""
+    # Maya includes the selected node in its main-window title.  Selecting an
+    # ANIMKEY_RT_* curve must never make the Maya window eligible for cleanup.
+    if object_name in ("MayaWindow", "MayaAppHomeWindow"):
+        return False
     if object_name in ANIMKEY_SINGLE_POPUP_OBJECTS or object_name.startswith("AnimKey"):
         return True
 
@@ -121,11 +125,7 @@ def _is_animkey_tool_window(widget):
         class_module = ""
     if class_module == "AnimKey" or class_module.startswith("AnimKey."):
         return True
-
-    try:
-        return "animkey" in str(widget.windowTitle() or "").lower()
-    except Exception:
-        return False
+    return False
 
 
 def close_animkey_tool_windows(

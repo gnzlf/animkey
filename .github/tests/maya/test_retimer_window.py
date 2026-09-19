@@ -15,6 +15,7 @@ except RuntimeError:
     pass
 
 from AnimKey.buttons import retimer
+from AnimKey.mods import uiMod
 
 
 class RetimerWindowTests(unittest.TestCase):
@@ -55,6 +56,25 @@ class RetimerWindowTests(unittest.TestCase):
                 self.app.processEvents()
                 self.assertIsNone(retimer._retimer_window)
             delete_ui.assert_not_called()
+
+    def test_retimer_curve_in_maya_title_does_not_classify_maya_as_animkey(self):
+        maya_window = QtWidgets.QWidget()
+        maya_window.setObjectName("MayaWindow")
+        maya_window.setWindowTitle(
+            "untitled - Autodesk MAYA 2024 --- ANIMKEY_RT_main_timeWarpCurve"
+        )
+        self.addCleanup(maya_window.deleteLater)
+        self.assertFalse(uiMod._is_animkey_tool_window(maya_window))
+
+        unnamed_maya_window = QtWidgets.QWidget()
+        unnamed_maya_window.setWindowTitle(maya_window.windowTitle())
+        self.addCleanup(unnamed_maya_window.deleteLater)
+        self.assertFalse(uiMod._is_animkey_tool_window(unnamed_maya_window))
+
+        animkey_window = QtWidgets.QWidget()
+        animkey_window.setObjectName("AnimKey_Retimer")
+        self.addCleanup(animkey_window.deleteLater)
+        self.assertTrue(uiMod._is_animkey_tool_window(animkey_window))
 
     def test_close_cancels_pending_refresh_and_animation(self):
         with mock.patch.object(retimer.Retimer, "find_all") as find_all:
