@@ -345,8 +345,9 @@ class Retimer(object):
 
         _parent_under_retimer_container(self.curve)
 
+        existing_time_curve = self._time_curve_node()
         time_curve = self._ensure_time_curve(start, end)
-        if time_curve:
+        if time_curve and not existing_time_curve:
             cmds.keyTangent(time_curve, inTangentType="linear", outTangentType="linear")
 
     def _time_curve_node(self, rename=False):
@@ -1160,6 +1161,7 @@ class RetimerWindow(ContextPopupWindow):
         self.setObjectName(WINDOW_OBJECT)
         self.setWindowTitle('Retimer')
         self.setFixedSize(380, 660)
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
         
         # Frameless window
         
@@ -1167,6 +1169,14 @@ class RetimerWindow(ContextPopupWindow):
         
         self._base_opacity = 0.5
         self._hover_opacity = 1.0
+        self._opacity_animation = QtCore.QPropertyAnimation(self, b"windowOpacity", self)
+        self._opacity_animation.setDuration(150)
+
+        # Keep the delayed Maya scene query owned by this widget. A pending
+        # callback must never run after a close/delete during rapid reopening.
+        self._refresh_timer = QtCore.QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self._refresh)
         
         self.rt = None
         
@@ -1174,7 +1184,7 @@ class RetimerWindow(ContextPopupWindow):
         self.position_window()
         
         # Initial load
-        QtCore.QTimer.singleShot(100, self._refresh)
+        self._refresh_timer.start(100)
         
         # Start with base opacity
         self.setWindowOpacity(self._base_opacity)
@@ -1667,7 +1677,8 @@ class RetimerWindow(ContextPopupWindow):
     def _load(self, name):
         """Load a retimer by name"""
         self.rt = Retimer(name)
-        self.rt.create_curve()
+        if not cmds.objExists(self.rt.curve):
+            self.rt.create_curve()
         _set_active_retimer_name(name)
         self._update_ui()
     
@@ -1879,16 +1890,27 @@ class RetimerWindow(ContextPopupWindow):
         self._animate(self._base_opacity)
         
     def _animate(self, val):
-        anim = QtCore.QPropertyAnimation(self, b"windowOpacity")
-        anim.setDuration(150)
-        anim.setEndValue(val)
-        anim.start(QtCore.QPropertyAnimation.DeleteWhenStopped)
-        self._anim = anim
+        self._opacity_animation.stop()
+        self._opacity_animation.setStartValue(self.windowOpacity())
+        self._opacity_animation.setEndValue(val)
+        self._opacity_animation.start()
+
+    def showEvent(self, event):
+        super(RetimerWindow, self).showEvent(event)
+        if self.rt is None and not self._refresh_timer.isActive():
+            self._refresh_timer.start(100)
+
+    def hideEvent(self, event):
+        self._refresh_timer.stop()
+        super(RetimerWindow, self).hideEvent(event)
     
     def closeEvent(self, event):
         """Clean up when window closes"""
         global _retimer_window
-        _retimer_window = None
+        self._refresh_timer.stop()
+        self._opacity_animation.stop()
+        if _retimer_window is self:
+            _retimer_window = None
         super(RetimerWindow, self).closeEvent(event)
 
 
@@ -1908,9 +1930,6 @@ def show(anchor_button=None):
             _retimer_window = existing
             return _retimer_window
         _retimer_window = None
-    
-    if cmds.window(WINDOW_OBJECT, exists=True):
-        cmds.deleteUI(WINDOW_OBJECT)
     
     _retimer_window = RetimerWindow(anchor_button=anchor_button, parent=get_maya_main_window())
     _retimer_window.show()
