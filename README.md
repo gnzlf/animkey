@@ -63,6 +63,13 @@ source checkout was loaded instead, Update locates the existing Maya installatio
 and reloads that installed copy after upgrading or downgrading. The source
 checkout is kept untouched.
 
+### AnimKey 1.1.2
+
+- Draw now keeps sketch strokes aligned when Maya viewports are resized,
+  docked side by side, or maximized with the spacebar.
+- The Draw renderer uses the active camera framing consistently for painting,
+  preview, pan/zoom, and export so strokes no longer stretch with panel changes.
+
 ### AnimKey 1.1.1
 
 - Paste Animation and Paste Selected Animation now prepare destination channels
@@ -91,12 +98,14 @@ variable that has read access to the repository.
 
 1. Set `__version__` in `AnimKey/version.py` using `MAJOR.MINOR.PATCH`.
 2. Commit and push the version you want to publish.
-3. In GitHub, open **Actions → Publish stable AnimKey release → Run workflow**.
-4. Enter the exact version and optional release notes.
+3. Either push a matching `vMAJOR.MINOR.PATCH` tag, or in GitHub open
+   **Actions → Publish stable AnimKey release → Run workflow**.
+4. If running the workflow manually, enter the exact version and optional
+   release notes.
 
-The workflow creates the version tag, a normal (non-prerelease) GitHub Release,
-the updater ZIP, and its SHA-256 checksum. Publishing that release is the single
-action that makes the version visible and installable in AnimKey.
+The workflow creates a normal (non-prerelease) GitHub Release, the updater ZIP,
+and its SHA-256 checksum. Publishing that release is the single action that
+makes the version visible and installable in AnimKey.
 
 ---
 

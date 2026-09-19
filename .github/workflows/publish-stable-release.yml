@@ -11,6 +11,9 @@ on:
         description: "Optional release notes (leave empty to generate them from commits)"
         required: false
         type: string
+  push:
+    tags:
+      - "v*.*.*"
 
 permissions:
   contents: write
@@ -24,11 +27,33 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE_VERSION: ${{ inputs.version }}
-      RELEASE_NOTES: ${{ inputs.release_notes }}
     steps:
       - name: Check out selected commit
         uses: actions/checkout@v7
+
+      - name: Resolve release inputs
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            release_notes=""
+          else
+            version="$INPUT_VERSION"
+            release_notes="$INPUT_RELEASE_NOTES"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Version must use MAJOR.MINOR.PATCH, got: $version" >&2
+            exit 1
+          fi
+          {
+            echo "RELEASE_VERSION=$version"
+            echo "RELEASE_NOTES<<EOF"
+            printf '%s\n' "$release_notes"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
 
       - name: Build updater package and checksum
         run: python3 .github/tools/build_release.py --version "$RELEASE_VERSION" --output dist
