@@ -34,6 +34,7 @@ from AnimKey.mods import styleMod as style
 from AnimKey.mods import configMod as config
 from AnimKey.mods import uiMod as ui
 from AnimKey.core.executionGuard import animkey_execution
+from AnimKey.sliders.graph_editor_view import GraphEditorViewSync
 
 
 def _qt_object_is_alive(obj):
@@ -1213,6 +1214,7 @@ class AnimKeyToolbar:
         self._tween_is_dragging = False
         self._curve_is_dragging = False
         self._original_keyframes = {}
+        self._slider_graph_view_sync = GraphEditorViewSync()
         
         # Button widget registry — populated by _create_tool_buttons()
         # Maps button key (e.g. "ISO", "PLT") -> QPushButton instance
@@ -3616,9 +3618,12 @@ class AnimKeyToolbar:
                 push_pull_execute(value)
         except Exception as e:
             print(f"Error in slider: {e}")
+        else:
+            self._slider_graph_view_sync.refresh()
     
     def _on_tween_press(self):
         """Handle tween slider press - prepare data cache before any changes"""
+        self._slider_graph_view_sync.begin()
         # Store the current value as original before user starts dragging
         self._tween_slider_original_value = self.tween_slider.value()
         
@@ -3736,9 +3741,11 @@ class AnimKeyToolbar:
             print(f"Error in slider release: {e}")
         finally:
             self._sync_animation_offset_after_slider(force=True)
+            self._slider_graph_view_sync.end()
     
     def _on_curve_press(self):
         """Handle curve slider press - prepare curve data"""
+        self._slider_graph_view_sync.begin()
         mode = self._current_curve_mode
         
         from AnimKey.sliders.curve_smooth import prepare_curve_data as prep_smooth
@@ -3792,6 +3799,7 @@ class AnimKeyToolbar:
             exe_ease(value)
         elif mode == "Noise":
             exe_noise(value)
+        self._slider_graph_view_sync.refresh()
     
     def _on_curve_release_new(self, final_value):
         """Handle curve slider release (slider auto-returns to origin)"""
@@ -3805,24 +3813,25 @@ class AnimKeyToolbar:
         from AnimKey.sliders.curve_ease_in_out import reset as res_ease
         from AnimKey.sliders.curve_noise import reset as res_noise
         
-        # First execute with final value
-        self._on_curve_change(final_value)
-        
-        # Then reset to save changes
-        if mode in ("Smooth", "Smooth/Rough"):
-            res_smooth()
-        elif mode == "Wave":
-            res_wave()
-        elif mode == "Scale":
-            res_scale()
-        elif mode == "Linear":
-            res_linear()
-        elif mode == "Flat":
-            res_flat()
-        elif mode == "Ease In/Out":
-            res_ease()
-        elif mode == "Noise":
-            res_noise()
+        try:
+            # First execute with final value, then save the keys.
+            self._on_curve_change(final_value)
+            if mode in ("Smooth", "Smooth/Rough"):
+                res_smooth()
+            elif mode == "Wave":
+                res_wave()
+            elif mode == "Scale":
+                res_scale()
+            elif mode == "Linear":
+                res_linear()
+            elif mode == "Flat":
+                res_flat()
+            elif mode == "Ease In/Out":
+                res_ease()
+            elif mode == "Noise":
+                res_noise()
+        finally:
+            self._slider_graph_view_sync.end()
     
     def _on_curve_mode_change_new(self, mode):
         """Handle curve mode change from new dropdown"""
@@ -3859,6 +3868,7 @@ class AnimKeyToolbar:
     
     def _on_mirror_blend_press(self):
         """Handle mirror blend slider press - prepare mirror blend data"""
+        self._slider_graph_view_sync.begin()
         from AnimKey.sliders.mirror_blend import prepare_mirror_blend_data
         prepare_mirror_blend_data()
     
@@ -3869,6 +3879,8 @@ class AnimKeyToolbar:
             execute(value)
         except Exception as e:
             print(f"Error in mirror blend slider: {e}")
+        else:
+            self._slider_graph_view_sync.refresh()
     
     def _on_mirror_blend_release(self, final_value):
         """Handle mirror blend slider release - apply final value, create keyframes, reset slider"""
@@ -3880,6 +3892,8 @@ class AnimKeyToolbar:
             reset()
         except Exception as e:
             print(f"Error in mirror blend release: {e}")
+        finally:
+            self._slider_graph_view_sync.end()
     
     def _open_settings(self):
         """Open the settings window"""
