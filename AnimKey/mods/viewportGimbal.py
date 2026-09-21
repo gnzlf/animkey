@@ -8,7 +8,7 @@ import maya.cmds as cmds
 import maya.OpenMayaUI as mui
 
 from AnimKey.mods.maya_compat import (
-    QtCore, QtWidgets, wrap_instance as wrapInstance,
+    QtCore, QtGui, QtWidgets, wrap_instance as wrapInstance,
 )
 
 from AnimKey.mods import configMod
@@ -131,29 +131,49 @@ class ViewportGimbalOverlay(QtWidgets.QFrame):
         if hasattr(QtCore.Qt, "WA_ShowWithoutActivating"):
             self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
         self._updating = False
-        self.setFixedSize(190, 58)
+        self.setFixedSize(226, 72)
         self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
         self.setMouseTracking(True)
         self._build_ui()
 
+    def paintEvent(self, event):
+        # A translucent tool window does not reliably paint a QSS background
+        # in every Maya/Qt configuration. Draw the card explicitly.
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        panel = self.rect().adjusted(1, 1, -2, -2)
+        painter.setBrush(QtGui.QColor(30, 30, 35, 239))
+        painter.setPen(QtGui.QPen(QtGui.QColor(80, 80, 92), 1))
+        painter.drawRoundedRect(panel, 9, 9)
+        painter.setPen(QtGui.QPen(QtGui.QColor(0, 200, 255, 135), 1))
+        painter.drawLine(13, 1, 56, 1)
+
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(10, 7, 10, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(11, 7, 11, 8)
+        layout.setSpacing(3)
 
         header = QtWidgets.QHBoxLayout()
-        header.setSpacing(6)
+        header.setSpacing(5)
 
-        title = QtWidgets.QLabel("VIEW ROLL")
+        accent_dot = QtWidgets.QLabel("●")
+        accent_dot.setObjectName("RollAccentDot")
+        header.addWidget(accent_dot)
+
+        title = QtWidgets.QLabel("ROLL GIMBAL")
+        title.setObjectName("RollTitle")
         title.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         header.addWidget(title)
         header.addStretch()
 
-        self.value_label = QtWidgets.QLabel("0 deg")
+        self.value_label = QtWidgets.QLabel("0°")
+        self.value_label.setObjectName("RollValue")
         self.value_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         header.addWidget(self.value_label)
         layout.addLayout(header)
 
+        slider_row = QtWidgets.QHBoxLayout()
+        slider_row.setSpacing(6)
         self.slider = RollSlider()
         self.slider.setRange(-180, 180)
         self.slider.setValue(0)
@@ -163,36 +183,53 @@ class ViewportGimbalOverlay(QtWidgets.QFrame):
         self.slider.sliderPressed.connect(self.controller.begin_adjustment)
         self.slider.sliderReleased.connect(self.controller.end_adjustment)
         self.slider.valueChanged.connect(self._on_slider_changed)
-        layout.addWidget(self.slider)
+        slider_row.addWidget(self.slider, 1)
+
+        reset_button = QtWidgets.QPushButton("↺")
+        reset_button.setObjectName("RollReset")
+        reset_button.setFixedSize(22, 22)
+        reset_button.setFocusPolicy(QtCore.Qt.NoFocus)
+        reset_button.setToolTip("Reset viewport roll to 0°")
+        reset_button.clicked.connect(self.controller.reset_current)
+        slider_row.addWidget(reset_button)
+        layout.addLayout(slider_row)
         self.setStyleSheet("""
             QFrame#AnimKeyViewportGimbal {
-                background-color: rgba(30, 30, 30, 220);
-                border: 1px solid rgba(70, 70, 70, 210);
-                border-radius: 8px;
+                background-color: rgba(30, 30, 35, 239);
+                border: 1px solid #50505c;
+                border-top: 1px solid #22758b;
+                border-radius: 9px;
             }
             QLabel {
-                color: #F5F5F7;
                 background: transparent;
                 border: none;
+            }
+            QLabel#RollAccentDot { color: #00c8ff; font-size: 10px; }
+            QLabel#RollTitle {
+                color: #c8c8d2;
                 font-size: 9px;
                 font-weight: 700;
-                letter-spacing: 0px;
+            }
+            QLabel#RollValue {
+                color: #00c8ff;
+                font-size: 10px;
+                font-weight: 700;
             }
             QSlider {
                 background: transparent;
-                min-height: 18px;
+                min-height: 22px;
             }
             QSlider::groove:horizontal {
                 height: 4px;
-                background: #444444;
+                background: #2d2d37;
                 border-radius: 2px;
             }
             QSlider::sub-page:horizontal {
-                background: #3498DB;
+                background: #00b8e8;
                 border-radius: 2px;
             }
             QSlider::add-page:horizontal {
-                background: #444444;
+                background: #2d2d37;
                 border-radius: 2px;
             }
             QSlider::handle:horizontal {
@@ -200,12 +237,26 @@ class ViewportGimbalOverlay(QtWidgets.QFrame):
                 height: 14px;
                 margin: -5px 0px;
                 border-radius: 7px;
-                background: #F5F5F7;
-                border: 1px solid #B8C0CC;
+                background: #55555f;
+                border: 1px solid #6e6e78;
             }
             QSlider::handle:horizontal:hover {
-                background: #FFFFFF;
-                border-color: #3498DB;
+                background: #70707e;
+                border-color: #00c8ff;
+            }
+            QPushButton#RollReset {
+                color: #c8c8d2;
+                background: #35353f;
+                border: 1px solid #555560;
+                border-radius: 5px;
+                font-size: 15px;
+                font-weight: bold;
+                padding: 0px;
+            }
+            QPushButton#RollReset:hover {
+                color: #00c8ff;
+                border-color: #00c8ff;
+                background: #3a434b;
             }
             QToolTip {
                 color: #F5F5F7;
@@ -216,7 +267,7 @@ class ViewportGimbalOverlay(QtWidgets.QFrame):
         """)
 
     def _on_slider_changed(self, value):
-        self.value_label.setText(f"{int(value)} deg")
+        self.value_label.setText(f"{int(value)}°")
         if self._updating:
             return
         self.controller.set_current_roll(float(value))
@@ -227,7 +278,7 @@ class ViewportGimbalOverlay(QtWidgets.QFrame):
         self._updating = True
         try:
             self.slider.setValue(int(round(value)))
-            self.value_label.setText(f"{int(round(value))} deg")
+            self.value_label.setText(f"{int(round(value))}°")
         finally:
             self._updating = False
 

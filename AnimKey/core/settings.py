@@ -886,7 +886,7 @@ class SettingsWindow(QtWidgets.QWidget):
             "Channel Box Multi Selection Helper"
         )
         self.channel_box_multi_selection_checkbox.setToolTip(
-            "Shows editable Channel Box attributes for all selected objects instead of only the last selected object."
+            "Shows channels shared by all selected objects, so edits remain safe across the selection."
         )
         self.channel_box_multi_selection_checkbox.setChecked(
             bool(config.get_setting("channel_box_multi_selection_helper", False))

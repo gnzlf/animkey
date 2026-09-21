@@ -13,6 +13,9 @@ from AnimKey.mods import configMod as config
 
 SETTING_KEY = "timeline_channel_box_key_filter"
 CHANNEL_BOX_NAME = "mainChannelBox"
+_active = False
+_original_show_keys = None
+_original_show_keys_combined = None
 
 
 def _get_time_slider():
@@ -21,6 +24,13 @@ def _get_time_slider():
         return mel.eval("$tmpVar=$gPlayBackSlider")
     except Exception:
         return None
+
+
+def _get_channel_box():
+    try:
+        return mel.eval('global string $gChannelBoxName; $temp=$gChannelBoxName;') or CHANNEL_BOX_NAME
+    except Exception:
+        return CHANNEL_BOX_NAME
 
 
 def is_enabled():
@@ -46,6 +56,7 @@ def apply(enabled=None):
     Disabled:
         Restore Maya's regular active-object key ticks.
     """
+    global _active, _original_show_keys, _original_show_keys_combined
     if enabled is None:
         enabled = is_enabled()
 
@@ -55,23 +66,40 @@ def apply(enabled=None):
 
     try:
         if enabled:
+            if not _active:
+                current = cmds.timeControl(time_slider, query=True, showKeys=True)
+                combined = cmds.timeControl(
+                    time_slider, query=True, showKeysCombined=True
+                )
+                # A previous AnimKey version may have left its mode active
+                # when this module was reloaded. Recover Maya's default.
+                if current == _get_channel_box() and combined:
+                    current, combined = "active", False
+                _original_show_keys = current or "active"
+                _original_show_keys_combined = bool(combined)
             cmds.timeControl(
                 time_slider,
                 edit=True,
-                showKeys=CHANNEL_BOX_NAME,
+                showKeys=_get_channel_box(),
                 showKeysCombined=True,
                 forceRefresh=True,
             )
+            _active = True
         else:
             cmds.timeControl(
                 time_slider,
                 edit=True,
-                showKeys="active",
-                showKeysCombined=False,
+                showKeys=_original_show_keys or "active",
+                showKeysCombined=(
+                    _original_show_keys_combined
+                    if _original_show_keys_combined is not None else False
+                ),
                 forceRefresh=True,
             )
+            _active = False
+            _original_show_keys = None
+            _original_show_keys_combined = None
         return True
     except Exception as exc:
         cmds.warning("AnimKey: Could not apply Timeline Channel Box key filter: {0}".format(exc))
         return False
-
