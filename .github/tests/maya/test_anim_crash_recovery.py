@@ -5,14 +5,14 @@ import tempfile
 import time
 import unittest
 
-from PySide2 import QtCore
-
 import maya.standalone
 
 try:
     maya.standalone.initialize(name="python")
 except RuntimeError:
     pass
+
+from AnimKey.mods.maya_compat import QtCore
 
 _APP = QtCore.QCoreApplication.instance() or QtCore.QCoreApplication([])
 
@@ -29,15 +29,24 @@ class AnimCrashRecoveryTests(unittest.TestCase):
         self.original_scene_folder = animCrash.get_scene_folder
         self.original_idle_delay = animCrash.Config.IDLE_DELAY
         self.original_save_interval = animCrash.Config.SAVE_INTERVAL
+        self.original_scene_snapshot_interval = (
+            animCrash.Config.__dict__["scene_snapshot_interval"]
+        )
         animCrash.get_scene_folder = lambda: self.folder
         animCrash.Config.IDLE_DELAY = 0.0
         animCrash.Config.SAVE_INTERVAL = 0.0
+        animCrash.Config.scene_snapshot_interval = classmethod(
+            lambda cls: 0.0
+        )
 
     def tearDown(self):
         animCrash.RecoverySystem.stop()
         animCrash.get_scene_folder = self.original_scene_folder
         animCrash.Config.IDLE_DELAY = self.original_idle_delay
         animCrash.Config.SAVE_INTERVAL = self.original_save_interval
+        animCrash.Config.scene_snapshot_interval = (
+            self.original_scene_snapshot_interval
+        )
         shutil.rmtree(self.folder, ignore_errors=True)
 
     def _wait_for_checkpoint(self, timeout=8.0):
@@ -97,6 +106,76 @@ class AnimCrashRecoveryTests(unittest.TestCase):
             _APP.processEvents()
             maya_utils.processIdleEvents()
         self.assertEqual(initial_files, sorted(os.listdir(self.folder)))
+
+    def test_scene_snapshot_saves_complete_scene_without_renaming_it(self):
+        scene_path = os.path.join(self.folder, "source_scene.ma")
+        node = cmds.createNode("transform", name="FullSceneSnapshotProbe")
+        cmds.setAttr(node + ".translateX", 7.25)
+        cmds.file(rename=scene_path)
+        cmds.file(save=True, type="mayaAscii", force=True)
+
+        cmds.setAttr(node + ".rotateY", -31.5)
+        active_scene = cmds.file(query=True, sn=True)
+        active_modified = cmds.file(query=True, modified=True)
+        animCrash.RecoverySystem.start()
+        recovery_serial = animCrash.RecoverySystem._change_serial
+
+        snapshot_path = animCrash.save_scene_snapshot(
+            auto=False, desc="Test complete scene"
+        )
+
+        self.assertIsNotNone(snapshot_path)
+        self.assertTrue(snapshot_path.endswith("_manual_scene.mb"))
+        self.assertTrue(os.path.exists(snapshot_path))
+        self.assertTrue(os.path.exists(snapshot_path + ".meta"))
+        self.assertEqual(cmds.file(query=True, sn=True), active_scene)
+        self.assertEqual(cmds.file(query=True, modified=True), active_modified)
+        self.assertEqual(
+            animCrash.RecoverySystem._change_serial, recovery_serial
+        )
+
+        snapshots = animCrash.get_checkpoints(self.folder)
+        saved_snapshot = next(
+            item for item in snapshots if item["path"] == snapshot_path
+        )
+        self.assertEqual(saved_snapshot["kind"], "scene_snapshot")
+        self.assertEqual(saved_snapshot["type"], "SCENE MANUAL")
+
+        cmds.file(new=True, force=True)
+        cmds.file(snapshot_path, open=True, force=True)
+        self.assertTrue(cmds.objExists(node))
+        self.assertAlmostEqual(
+            cmds.getAttr(node + ".translateX"), 7.25, places=5
+        )
+        self.assertAlmostEqual(
+            cmds.getAttr(node + ".rotateY"), -31.5, places=5
+        )
+
+    def test_auto_scene_snapshot_uses_its_own_interval_after_idle(self):
+        calls = []
+        original_save = animCrash.save_scene_snapshot
+        original_interval = animCrash.Config.__dict__["scene_snapshot_interval"]
+        animCrash.save_scene_snapshot = lambda **kwargs: calls.append(kwargs) or "scene.mb"
+        animCrash.Config.scene_snapshot_interval = classmethod(
+            lambda cls: 60.0
+        )
+        try:
+            animCrash.RecoverySystem._active = True
+            animCrash.RecoverySystem._dirty = False
+            animCrash.RecoverySystem._scene_snapshot_dirty = True
+            animCrash.RecoverySystem._last_change_time = time.monotonic() - 10.0
+            animCrash.RecoverySystem._last_scene_snapshot_time = time.monotonic()
+
+            animCrash.RecoverySystem._tick()
+            self.assertEqual(calls, [])
+
+            animCrash.RecoverySystem._last_scene_snapshot_time -= 61.0
+            animCrash.RecoverySystem._tick()
+            self.assertEqual(calls, [{"auto": True}])
+            self.assertFalse(animCrash.RecoverySystem._scene_snapshot_dirty)
+        finally:
+            animCrash.save_scene_snapshot = original_save
+            animCrash.Config.scene_snapshot_interval = original_interval
 
     def test_v088_capture_keeps_base_and_animation_layer_keys(self):
         node = cmds.createNode("transform", name="LayerProbe")

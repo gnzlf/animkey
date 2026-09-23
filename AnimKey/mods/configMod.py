@@ -72,6 +72,9 @@ DEFAULT_CONFIG = {
     "tumble_around_selection_enabled": False,
     # Recovery is opt-out: it starts with AnimKey unless the animator turns it off.
     "crash_recovery_enabled": True,
+    # Full-scene copies are intentionally less frequent than the lightweight
+    # animation checkpoints.  Zero disables the automatic .mb copies.
+    "crash_recovery_scene_snapshot_minutes": 10,
     
     # Window Settings
     "window_opacity": 1.0,

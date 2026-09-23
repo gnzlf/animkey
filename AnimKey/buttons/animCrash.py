@@ -56,19 +56,55 @@ class Config:
             os.makedirs(folder)
         return folder
     
-    # A checkpoint of a production shot can contain hundreds of thousands of
-    # keys.  Wait for a real pause in the animator's work and keep enough time
-    # between full snapshots that recovery never becomes a background loop.
+    # Animation JSON checkpoints remain frequent because they are captured in
+    # small chunks.  Complete scene snapshots are binary .mb copies and are
+    # intentionally much less frequent.
     SAVE_INTERVAL = 120
     IDLE_DELAY = 8.0
     TIMER_INTERVAL_MS = 2000
     MAX_DAYS = 7
     MAX_CHECKPOINTS = 80
+    MAX_SCENE_SNAPSHOTS = 12
+
+    @classmethod
+    def scene_snapshot_minutes(cls):
+        try:
+            from AnimKey.mods import configMod
+            minutes = int(
+                configMod.get_config().get(
+                    "crash_recovery_scene_snapshot_minutes", 10
+                )
+            )
+        except Exception:
+            minutes = 10
+        return max(0, min(minutes, 120))
+
+    @classmethod
+    def scene_snapshot_interval(cls):
+        return float(cls.scene_snapshot_minutes() * 60)
+
+    @classmethod
+    def set_scene_snapshot_minutes(cls, minutes):
+        try:
+            minutes = max(0, min(int(minutes), 120))
+        except (TypeError, ValueError):
+            minutes = 10
+        try:
+            from AnimKey.mods import configMod
+            configMod.get_config().set(
+                "crash_recovery_scene_snapshot_minutes", minutes
+            )
+        except Exception:
+            pass
+        if RecoverySystem.is_active():
+            RecoverySystem._schedule_tick(Config.IDLE_DELAY)
+        return minutes
 
 
 _async_checkpoint_capture = None
 _async_checkpoint_pending = None
 _async_checkpoint_write_in_progress = False
+_scene_snapshot_in_progress = False
 
 
 # ==============================================================================
@@ -84,6 +120,9 @@ class RecoverySystem:
     _last_change_time = 0.0
     _last_checkpoint_time = 0.0
     _last_checkpoint_path = None
+    _scene_snapshot_dirty = False
+    _last_scene_snapshot_time = 0.0
+    _last_scene_snapshot_path = None
     _change_serial = 0
 
     @classmethod
@@ -118,7 +157,11 @@ class RecoverySystem:
         cls._active = True
         invalidate_animated_objects_cache()
         cls._dirty = True
+        cls._scene_snapshot_dirty = True
         cls._last_change_time = time.monotonic()
+        # Do not serialize a just-opened production scene immediately.  The
+        # first full backup is eligible after the selected interval instead.
+        cls._last_scene_snapshot_time = cls._last_change_time
         cls._change_serial += 1
         
         try:
@@ -236,22 +279,14 @@ class RecoverySystem:
         if (
             _async_checkpoint_capture is not None
             or _async_checkpoint_write_in_progress
+            or _scene_snapshot_in_progress
         ):
             cls._schedule_tick(Config.TIMER_INTERVAL_MS / 1000.0)
             return
-        try:
-            if cmds.play(query=True, state=True):
-                cls._schedule_tick(Config.TIMER_INTERVAL_MS / 1000.0)
-                return
-        except Exception:
-            pass
-        try:
-            if QtWidgets.QApplication.mouseButtons() != QT_NO_BUTTON:
-                cls._schedule_tick(Config.TIMER_INTERVAL_MS / 1000.0)
-                return
-        except Exception:
-            pass
-        if not cls._dirty:
+        if not cls._is_idle_for_backup():
+            cls._schedule_tick(Config.TIMER_INTERVAL_MS / 1000.0)
+            return
+        if not cls._dirty and not cls._scene_snapshot_dirty:
             return
         now = time.monotonic()
         idle_remaining = (
@@ -260,7 +295,7 @@ class RecoverySystem:
         if idle_remaining > 0.0:
             cls._schedule_tick(idle_remaining)
             return
-        if cls._last_checkpoint_time:
+        if cls._dirty and cls._last_checkpoint_time:
             interval_remaining = (
                 float(Config.SAVE_INTERVAL) -
                 (now - cls._last_checkpoint_time)
@@ -268,11 +303,61 @@ class RecoverySystem:
             if interval_remaining > 0.0:
                 cls._schedule_tick(interval_remaining)
                 return
-        request_checkpoint(auto=True)
+        if cls._dirty:
+            request_checkpoint(auto=True)
+            return
+        cls._save_scene_snapshot_if_due(now)
+
+    @classmethod
+    def _is_idle_for_backup(cls):
+        """Return True only when a main-thread scene write is safe to begin."""
+        try:
+            if cmds.play(query=True, state=True):
+                return False
+        except Exception:
+            pass
+        try:
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                if app.mouseButtons() != QT_NO_BUTTON:
+                    return False
+                if app.activeModalWidget() is not None:
+                    return False
+        except Exception:
+            pass
+        return True
+
+    @classmethod
+    def _save_scene_snapshot_if_due(cls, now=None):
+        if not cls._scene_snapshot_dirty:
+            return None
+        interval = Config.scene_snapshot_interval()
+        if interval <= 0.0:
+            return None
+        if now is None:
+            now = time.monotonic()
+        remaining = interval - (now - cls._last_scene_snapshot_time)
+        if remaining > 0.0:
+            cls._schedule_tick(remaining)
+            return None
+
+        snapshot_serial = cls._change_serial
+        filepath = save_scene_snapshot(auto=True)
+        if filepath:
+            cls._last_scene_snapshot_time = time.monotonic()
+            cls._last_scene_snapshot_path = filepath
+            if snapshot_serial == cls._change_serial:
+                cls._scene_snapshot_dirty = False
+            else:
+                cls._schedule_tick(Config.IDLE_DELAY)
+        elif cls._scene_snapshot_dirty:
+            cls._schedule_tick(Config.TIMER_INTERVAL_MS / 1000.0)
+        return filepath
     
     @classmethod
     def _on_change(cls, *args):
         cls._dirty = True
+        cls._scene_snapshot_dirty = True
         cls._last_change_time = time.monotonic()
         cls._change_serial += 1
         invalidate_animated_objects_cache()
@@ -294,6 +379,7 @@ class RecoverySystem:
         cancel_async_checkpoints(auto_only=True)
         invalidate_animated_objects_cache()
         cls._dirty = False
+        cls._scene_snapshot_dirty = False
         if cls._timer:
             cls._timer.stop()
 
@@ -306,7 +392,10 @@ class RecoverySystem:
         invalidate_animated_objects_cache()
         cls._last_checkpoint_time = 0.0
         cls._last_checkpoint_path = None
+        cls._last_scene_snapshot_time = time.monotonic()
+        cls._last_scene_snapshot_path = None
         cls._dirty = True
+        cls._scene_snapshot_dirty = True
         cls._last_change_time = time.monotonic()
         cls._change_serial += 1
         cls._schedule_tick(Config.IDLE_DELAY)
@@ -323,6 +412,7 @@ class RecoverySystem:
         # recovery point as animBot does.  It is delayed and chunked, so it
         # never competes with Maya's save operation itself.
         cls._dirty = True
+        cls._scene_snapshot_dirty = True
         cls._last_change_time = time.monotonic()
         cls._change_serial += 1
         cls._schedule_tick(Config.IDLE_DELAY)
@@ -335,15 +425,20 @@ class RecoverySystem:
         cls._last_checkpoint_path = filepath
         if int(change_serial) == int(cls._change_serial):
             cls._dirty = False
-            if cls._timer:
-                cls._timer.stop()
-        elif cls._dirty:
+        needs_follow_up = cls._dirty or (
+            cls._scene_snapshot_dirty and
+            Config.scene_snapshot_interval() > 0.0
+        )
+        if needs_follow_up:
             cls._schedule_tick(Config.IDLE_DELAY)
+        elif cls._timer:
+            cls._timer.stop()
     
     @classmethod
     def _on_exit(cls, *args):
         # Maya is tearing down here.  Avoid DG reads during shutdown.
         cls._dirty = False
+        cls._scene_snapshot_dirty = False
         cls.stop()
 
 
@@ -567,6 +662,83 @@ def save_checkpoint(auto=False, desc=""):
         print(f"AnimKey Recovery Error: {e}")
         return None
 
+
+def _scene_snapshot_filename(auto):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return "{}_{}_scene.mb".format(
+        timestamp, "auto" if auto else "manual"
+    )
+
+
+def _scene_snapshot_metadata(auto, desc):
+    return {
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "scene_path": cmds.file(query=True, sn=True) or "",
+        "scene_name": get_scene_name(),
+        "description": desc or ("Auto scene snapshot" if auto else "Manual scene snapshot"),
+        "is_auto": bool(auto),
+        "kind": "scene_snapshot",
+        "file_type": "mayaBinary",
+    }
+
+
+def save_scene_snapshot(auto=False, desc=""):
+    """Write a complete, recoverable .mb copy without renaming the open scene.
+
+    Maya's ``exportAll`` serializes the whole dependency graph to the supplied
+    path while leaving the active scene name and modified state untouched.  It
+    must run on Maya's main thread, so automatic calls are made only by the
+    idle-only recovery timer.  Manual calls are intentionally synchronous: the
+    animator asked for an immediate, complete backup.
+    """
+    global _scene_snapshot_in_progress
+
+    if _scene_snapshot_in_progress:
+        return None
+
+    folder = get_scene_folder()
+    filepath = os.path.join(folder, _scene_snapshot_filename(auto))
+    metadata = _scene_snapshot_metadata(auto, desc)
+    _scene_snapshot_in_progress = True
+    started = time.perf_counter()
+    try:
+        # mayaBinary is smaller and faster than ASCII for scheduled recovery
+        # files.  exportAll does not change the current scene path or dirty
+        # state, unlike rename + save, which is crucial while animating.
+        cmds.file(
+            filepath,
+            exportAll=True,
+            force=True,
+            preserveReferences=True,
+            type="mayaBinary",
+        )
+        if not os.path.exists(filepath):
+            return None
+        metadata["size_bytes"] = os.path.getsize(filepath)
+        metadata["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+        atomic_write_json(
+            filepath + ".meta", metadata, indent=None, ensure_ascii=False
+        )
+        cleanup_old(folder)
+        print(
+            "AnimKey: Full scene recovery copy saved in {:.2f}s: {}".format(
+                time.perf_counter() - started, filepath
+            )
+        )
+        return filepath
+    except Exception as exc:
+        print("AnimKey Recovery scene snapshot error: {}".format(exc))
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+            if os.path.exists(filepath + ".meta"):
+                os.remove(filepath + ".meta")
+        except Exception:
+            pass
+        return None
+    finally:
+        _scene_snapshot_in_progress = False
+
 def _defer_to_main_thread(func, *args):
     try:
         import maya.utils as maya_utils
@@ -656,6 +828,13 @@ def _async_checkpoint_finished(capture, data, folder, filename, on_done):
             RecoverySystem._last_checkpoint_time = time.monotonic()
             if capture.change_serial == RecoverySystem._change_serial:
                 RecoverySystem._dirty = False
+            if (
+                RecoverySystem._scene_snapshot_dirty and
+                Config.scene_snapshot_interval() > 0.0
+            ):
+                RecoverySystem._schedule_tick(Config.IDLE_DELAY)
+            elif not RecoverySystem._dirty and RecoverySystem._timer:
+                RecoverySystem._timer.stop()
         if on_done:
             _defer_to_main_thread(on_done, None)
 
@@ -1096,18 +1275,20 @@ def get_checkpoints(folder=None):
     
     checkpoints = []
     for filename in os.listdir(folder):
-        if not filename.endswith('.json'):
+        is_animation_checkpoint = filename.endswith('.json')
+        is_scene_snapshot = (
+            filename.endswith('_scene.mb') or filename.endswith('_scene.ma')
+        )
+        if not is_animation_checkpoint and not is_scene_snapshot:
             continue
         filepath = os.path.join(folder, filename)
         try:
-            parts = filename.replace('.json', '').split('_')
+            parts = os.path.splitext(filename)[0].split('_')
             dt = datetime.strptime(parts[0] + "_" + parts[1], "%Y%m%d_%H%M%S")
-            is_auto = 'auto' in filename
             meta = _load_checkpoint_meta(filepath)
-            
+            is_auto = bool(meta.get('is_auto', 'auto' in filename))
             ns_raw = meta.get('namespaces', {})
             ns_names = safe_get_ns_names(ns_raw)
-            
             checkpoints.append({
                 'path': filepath,
                 'datetime': dt,
@@ -1115,17 +1296,22 @@ def get_checkpoints(folder=None):
                 'date': dt.strftime("%d/%m/%Y"),
                 'time': dt.strftime("%H:%M:%S"),
                 'is_auto': is_auto,
-                'type': "AUTO" if is_auto else "MANUAL",
-                'icon': "◉" if is_auto else "◆",
+                'type': (
+                    "SCENE AUTO" if is_scene_snapshot and is_auto else
+                    "SCENE MANUAL" if is_scene_snapshot else
+                    "AUTO" if is_auto else "MANUAL"
+                ),
+                'icon': "■" if is_scene_snapshot else ("◉" if is_auto else "◆"),
+                'kind': 'scene_snapshot' if is_scene_snapshot else 'animation',
                 'description': meta.get('description', ''),
-                'objects': meta.get('objects', 0),
-                'keys': meta.get('keys', 0),
+                'objects': meta.get('objects'),
+                'keys': meta.get('keys'),
                 'ns_names': ns_names,
                 'ns_counts': ns_raw if isinstance(ns_raw, dict) else {},
                 'scene_name': meta.get('scene_name', ''),
                 'size': os.path.getsize(filepath) / 1024
             })
-        except:
+        except Exception:
             continue
     
     checkpoints.sort(key=lambda x: x['datetime'], reverse=True)
@@ -1150,6 +1336,26 @@ def _list_checkpoint_files_light(folder):
     items.sort(key=lambda x: x[0], reverse=True)
     return items
 
+
+def _list_scene_snapshot_files_light(folder):
+    """List AnimKey full-scene copies without reading binary snapshot data."""
+    if not os.path.exists(folder):
+        return []
+    items = []
+    for filename in os.listdir(folder):
+        if not (
+            filename.endswith('_scene.mb') or filename.endswith('_scene.ma')
+        ):
+            continue
+        try:
+            parts = os.path.splitext(filename)[0].split('_')
+            dt = datetime.strptime(parts[0] + "_" + parts[1], "%Y%m%d_%H%M%S")
+            items.append((dt, os.path.join(folder, filename)))
+        except Exception:
+            continue
+    items.sort(key=lambda x: x[0], reverse=True)
+    return items
+
 def cleanup_old(folder=None):
     if folder is None:
         folder = get_scene_folder()
@@ -1167,6 +1373,22 @@ def cleanup_old(folder=None):
 
     if len(keep) > Config.MAX_CHECKPOINTS:
         for dt, path in keep[Config.MAX_CHECKPOINTS:]:
+            for candidate in (path, path + ".meta"):
+                try: os.remove(candidate)
+                except: pass
+
+    scene_items = _list_scene_snapshot_files_light(folder)
+    scene_keep = []
+    for dt, path in scene_items:
+        if dt < cutoff:
+            for candidate in (path, path + ".meta"):
+                try: os.remove(candidate)
+                except: pass
+        else:
+            scene_keep.append((dt, path))
+
+    if len(scene_keep) > Config.MAX_SCENE_SNAPSHOTS:
+        for dt, path in scene_keep[Config.MAX_SCENE_SNAPSHOTS:]:
             for candidate in (path, path + ".meta"):
                 try: os.remove(candidate)
                 except: pass
@@ -1376,6 +1598,48 @@ class RecoveryWindow(ContextPopupWindow):
         """)
         browse_btn.clicked.connect(self._browse_folder)
         header_layout.addWidget(browse_btn)
+
+        self.scene_snapshot_combo = QtWidgets.QComboBox()
+        self.scene_snapshot_combo.setFixedWidth(112)
+        self.scene_snapshot_combo.setToolTip(
+            "Automatic complete-scene recovery copy interval"
+        )
+        for label, minutes in (
+            ("Scene: Off", 0),
+            ("Scene: 5 min", 5),
+            ("Scene: 10 min", 10),
+            ("Scene: 15 min", 15),
+            ("Scene: 30 min", 30),
+        ):
+            self.scene_snapshot_combo.addItem(label, minutes)
+        interval_index = self.scene_snapshot_combo.findData(
+            Config.scene_snapshot_minutes()
+        )
+        self.scene_snapshot_combo.setCurrentIndex(
+            interval_index if interval_index >= 0 else 2
+        )
+        self.scene_snapshot_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #454545;
+                color: #F5F5F7;
+                border: 1px solid #606060;
+                border-radius: 4px;
+                padding: 4px 6px;
+                font-size: 10px;
+            }
+            QComboBox:hover { border-color: #6A6A6A; }
+            QComboBox::drop-down { border: none; width: 16px; }
+            QComboBox QAbstractItemView {
+                background-color: #454545;
+                color: #FFF;
+                border: 1px solid #606060;
+                selection-background-color: #3498DB;
+            }
+        """)
+        self.scene_snapshot_combo.currentIndexChanged.connect(
+            self._on_scene_snapshot_interval_changed
+        )
+        header_layout.addWidget(self.scene_snapshot_combo)
         
         header_layout.addStretch()
         
@@ -1624,6 +1888,25 @@ class RecoveryWindow(ContextPopupWindow):
         """)
         save_btn.clicked.connect(self._on_save)
         button_layout.addWidget(save_btn)
+
+        scene_save_btn = QtWidgets.QPushButton("Scene Copy")
+        scene_save_btn.setFixedHeight(32)
+        scene_save_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        scene_save_btn.setToolTip("Save a complete recoverable scene copy now")
+        scene_save_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #454545;
+                color: #FFF;
+                border: 1px solid #606060;
+                border-radius: 6px;
+                font-size: 11px;
+                font-weight: 500;
+                padding: 0 12px;
+            }
+            QPushButton:hover { background-color: #5A6F86; border-color: #7AA6C8; }
+        """)
+        scene_save_btn.clicked.connect(self._on_scene_save)
+        button_layout.addWidget(scene_save_btn)
         
         button_layout.addStretch()
         
@@ -1707,6 +1990,10 @@ class RecoveryWindow(ContextPopupWindow):
             fade=True,
             fadeStayTime=1500
         )
+
+    def _on_scene_snapshot_interval_changed(self, *args):
+        minutes = self.scene_snapshot_combo.currentData()
+        Config.set_scene_snapshot_minutes(minutes)
     
     def _refresh(self, *args):
         self.checkpoints = get_checkpoints(self.current_folder)
@@ -1729,6 +2016,12 @@ class RecoveryWindow(ContextPopupWindow):
         # Update list
         self.checkpoint_list.clear()
         for cp in self.filtered:
+            if cp.get('kind') == 'scene_snapshot':
+                text = "{}  {}  │  Full Scene".format(
+                    cp['icon'], cp['display']
+                )
+                self.checkpoint_list.addItem(text)
+                continue
             ns_str = ", ".join(cp.get('ns_names', [])[:2]) or "-"
             if len(cp.get('ns_names', [])) > 2:
                 ns_str += "..."
@@ -1755,10 +2048,22 @@ class RecoveryWindow(ContextPopupWindow):
         self.info_labels['Date'].setText(cp['date'])
         self.info_labels['Time'].setText(cp['time'])
         self.info_labels['Type'].setText(cp['type'])
-        self.info_labels['Objects'].setText(str(cp['objects']))
-        self.info_labels['Keyframes'].setText(str(cp['keys']))
-        
+        self.info_labels['Objects'].setText(
+            str(cp['objects']) if cp.get('objects') is not None else "--"
+        )
+        self.info_labels['Keyframes'].setText(
+            str(cp['keys']) if cp.get('keys') is not None else "--"
+        )
+
+        if cp.get('kind') == 'scene_snapshot':
+            self.ns_list.clear()
+            self.ns_list.setEnabled(False)
+            self.target_combo.setCurrentIndex(0)
+            self.target_combo.setEnabled(False)
+            return
+
         # Update namespace list
+        self.ns_list.setEnabled(True)
         self.ns_list.clear()
         ns_counts = cp.get("ns_counts", {})
         all_item = QtWidgets.QListWidgetItem(
@@ -1780,6 +2085,9 @@ class RecoveryWindow(ContextPopupWindow):
         return namespace or "TODOS"
 
     def _on_namespace_selection_changed(self, *args):
+        if self.selected and self.selected.get('kind') == 'scene_snapshot':
+            self.target_combo.setEnabled(False)
+            return
         # Remapping several source rigs into one namespace would overwrite
         # them on top of each other, so target remapping is available only
         # when one concrete source rig is selected.
@@ -1792,6 +2100,9 @@ class RecoveryWindow(ContextPopupWindow):
     def _on_recover(self, *args):
         if not self.selected:
             cmds.warning("AnimKey: Please select a checkpoint first.")
+            return
+        if self.selected.get('kind') == 'scene_snapshot':
+            self._open_scene_snapshot()
             return
         if not self.selected_data:
             self.selected_data = load_checkpoint(self.selected['path'])
@@ -1827,6 +2138,44 @@ class RecoveryWindow(ContextPopupWindow):
     
     def _on_save(self):
         request_checkpoint(auto=False, desc="Manual save", on_done=self._on_manual_save_done)
+
+    def _on_scene_save(self):
+        filepath = save_scene_snapshot(
+            auto=False, desc="Manual scene copy"
+        )
+        if filepath:
+            self._refresh()
+            cmds.inViewMessage(
+                amg="<span style='color:#a3be8c'>Full Scene Copy Saved</span>",
+                pos='topCenter',
+                fade=True,
+                fadeStayTime=1500
+            )
+        else:
+            cmds.warning("AnimKey: Could not save the full scene copy.")
+
+    def _open_scene_snapshot(self):
+        filepath = self.selected.get('path')
+        if not filepath or not os.path.exists(filepath):
+            cmds.warning("AnimKey: The selected scene copy no longer exists.")
+            return
+        result = cmds.confirmDialog(
+            title="Open Scene Copy",
+            message=(
+                "Open this complete recovery copy?\n\n"
+                "Unsaved changes in the current scene will be lost."
+            ),
+            button=["Open Copy", "Cancel"],
+            defaultButton="Cancel",
+            cancelButton="Cancel",
+            dismissString="Cancel",
+        )
+        if result != "Open Copy":
+            return
+        try:
+            cmds.file(filepath, open=True, force=True)
+        except Exception as exc:
+            cmds.warning("AnimKey: Could not open scene copy: {}".format(exc))
 
     def _on_manual_save_done(self, filepath):
         if filepath:
