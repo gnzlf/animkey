@@ -59,7 +59,26 @@ class AnimCrashRecoveryTests(unittest.TestCase):
                 name for name in os.listdir(self.folder)
                 if name.endswith(".json") and not name.endswith(".meta")
             ]
-            if files and not animCrash._async_checkpoint_write_in_progress:
+            if (
+                files
+                and not animCrash._async_checkpoint_write_in_progress
+                and not animCrash.RecoverySystem._dirty
+            ):
+                return os.path.join(self.folder, files[0])
+            time.sleep(0.005)
+        return None
+
+    def _wait_for_scene_snapshot(self, timeout=8.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _APP.processEvents()
+            maya_utils.processIdleEvents()
+            animCrash.RecoverySystem._tick()
+            files = [
+                name for name in os.listdir(self.folder)
+                if name.endswith("_auto_scene.mb")
+            ]
+            if files:
                 return os.path.join(self.folder, files[0])
             time.sleep(0.005)
         return None
@@ -150,6 +169,23 @@ class AnimCrashRecoveryTests(unittest.TestCase):
         self.assertAlmostEqual(
             cmds.getAttr(node + ".rotateY"), -31.5, places=5
         )
+
+    def test_first_auto_scene_snapshot_follows_the_json_checkpoint(self):
+        node = cmds.createNode("transform", name="FirstAutoSceneProbe")
+        cmds.setKeyframe(node, attribute="translateX", time=1, value=4.0)
+        original_interval = animCrash.Config.__dict__["scene_snapshot_interval"]
+        animCrash.Config.scene_snapshot_interval = classmethod(
+            lambda cls: 300.0
+        )
+        try:
+            animCrash.RecoverySystem.start()
+            self.assertIsNotNone(self._wait_for_checkpoint())
+            snapshot_path = self._wait_for_scene_snapshot()
+            self.assertIsNotNone(snapshot_path)
+            self.assertTrue(os.path.exists(snapshot_path + ".meta"))
+            self.assertFalse(animCrash.RecoverySystem._scene_snapshot_dirty)
+        finally:
+            animCrash.Config.scene_snapshot_interval = original_interval
 
     def test_auto_scene_snapshot_uses_its_own_interval_after_idle(self):
         calls = []

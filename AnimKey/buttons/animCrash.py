@@ -42,6 +42,25 @@ if QT_SINGLE_SELECTION is None:
     )
 
 
+class _MainThreadCallbackDispatcher(QtCore.QObject):
+    """Queue Python callbacks back to Maya's Qt main thread."""
+
+    callback_ready = QtCore.Signal(object)
+
+    def __init__(self, parent=None):
+        super(_MainThreadCallbackDispatcher, self).__init__(parent)
+        self.callback_ready.connect(self._run_callback)
+
+    def _run_callback(self, callback):
+        try:
+            callback()
+        except Exception as exc:
+            print("AnimKey Recovery completion error: {}".format(exc))
+
+
+_main_thread_callback_dispatcher = None
+
+
 # ==============================================================================
 # CONFIGURACIÓN
 # ==============================================================================
@@ -154,14 +173,15 @@ class RecoverySystem:
         if cls._active:
             return
         Config.get_save_folder()
+        _ensure_main_thread_callback_dispatcher()
         cls._active = True
         invalidate_animated_objects_cache()
         cls._dirty = True
         cls._scene_snapshot_dirty = True
         cls._last_change_time = time.monotonic()
-        # Do not serialize a just-opened production scene immediately.  The
-        # first full backup is eligible after the selected interval instead.
-        cls._last_scene_snapshot_time = cls._last_change_time
+        # The first complete copy follows the first lightweight checkpoint
+        # once Maya is idle.  Later copies use the selected interval.
+        cls._last_scene_snapshot_time = 0.0
         cls._change_serial += 1
         
         try:
@@ -392,7 +412,7 @@ class RecoverySystem:
         invalidate_animated_objects_cache()
         cls._last_checkpoint_time = 0.0
         cls._last_checkpoint_path = None
-        cls._last_scene_snapshot_time = time.monotonic()
+        cls._last_scene_snapshot_time = 0.0
         cls._last_scene_snapshot_path = None
         cls._dirty = True
         cls._scene_snapshot_dirty = True
@@ -740,17 +760,37 @@ def save_scene_snapshot(auto=False, desc=""):
         _scene_snapshot_in_progress = False
 
 def _defer_to_main_thread(func, *args):
+    callback = lambda: func(*args)
+    dispatcher = _main_thread_callback_dispatcher
+    if dispatcher is not None:
+        try:
+            dispatcher.callback_ready.emit(callback)
+            return
+        except Exception:
+            pass
     try:
         import maya.utils as maya_utils
-        maya_utils.executeDeferred(lambda: func(*args))
+        maya_utils.executeDeferred(callback)
     except Exception:
         try:
-            QtCore.QTimer.singleShot(0, lambda: func(*args))
+            QtCore.QTimer.singleShot(0, callback)
         except Exception:
             try:
-                func(*args)
+                callback()
             except Exception:
                 pass
+
+
+def _ensure_main_thread_callback_dispatcher():
+    global _main_thread_callback_dispatcher
+    if _main_thread_callback_dispatcher is not None:
+        return _main_thread_callback_dispatcher
+    try:
+        app = QtWidgets.QApplication.instance()
+        _main_thread_callback_dispatcher = _MainThreadCallbackDispatcher(app)
+    except Exception:
+        _main_thread_callback_dispatcher = None
+    return _main_thread_callback_dispatcher
 
 def _write_checkpoint_payload_async(data, folder, filename, on_done=None):
     def worker():
@@ -796,20 +836,23 @@ def _async_checkpoint_finished(capture, data, folder, filename, on_done):
 
     def finished(filepath):
         global _async_checkpoint_write_in_progress, _async_checkpoint_pending
-        if filepath:
-            RecoverySystem._checkpoint_completed(
-                filepath, capture.change_serial
-            )
         pending_request = _async_checkpoint_pending
         _async_checkpoint_pending = None
         _async_checkpoint_write_in_progress = False
-        if not filepath and capture.auto and RecoverySystem._dirty:
-            RecoverySystem._schedule_tick(
-                Config.TIMER_INTERVAL_MS / 1000.0
-            )
 
-        if filepath or on_done or pending_request:
+        # ``finished`` runs on the JSON worker.  QTimer and every Maya-facing
+        # operation must return to Maya's main thread before they can schedule
+        # the complete-scene copy.
+        if filepath or on_done or pending_request or capture.auto:
             def notify_and_continue():
+                if filepath:
+                    RecoverySystem._checkpoint_completed(
+                        filepath, capture.change_serial
+                    )
+                elif capture.auto and RecoverySystem._dirty:
+                    RecoverySystem._schedule_tick(
+                        Config.TIMER_INTERVAL_MS / 1000.0
+                    )
                 if filepath and RecoverySystem.is_active():
                     update_toolbar_checkpoint_status(filepath)
                 if on_done:
@@ -970,6 +1013,8 @@ def request_checkpoint(auto=True, desc="", on_done=None):
     """
     global _async_checkpoint_capture, _async_checkpoint_pending
     global _async_checkpoint_write_in_progress
+
+    _ensure_main_thread_callback_dispatcher()
 
     request = {
         "auto": auto,
