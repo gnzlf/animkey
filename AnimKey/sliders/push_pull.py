@@ -20,6 +20,7 @@ from AnimKey.sliders.slider_utils import (
     get_slider_value,
     get_selection_guide_frames,
     get_processing_context,
+    get_slider_candidate_attributes,
     get_value_at_time,
     should_process_attribute,
     slider_attribute_is_editable,
@@ -49,7 +50,9 @@ def prepare_push_pull_data(objs=None, attrs=None):
         if not cmds.objExists(obj):
             continue
         
-        current_attrs = attrs if attrs else (selected_channels if selected_channels else cmds.listAttr(obj, keyable=True, scalar=True) or [])
+        current_attrs = attrs if attrs else get_slider_candidate_attributes(
+            obj, selected_channels, _processing_context, scalar_only=True
+        )
         if not current_attrs:
             continue
         

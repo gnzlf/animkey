@@ -241,11 +241,13 @@ class AnimCrashRecoveryTests(unittest.TestCase):
 
         expected = {}
         for object_name, object_data in data["animation"].items():
-            for attribute, keys in object_data.items():
+            for attribute, payload in object_data.items():
                 plug = object_name + "." + attribute
-                expected[plug] = [
-                    (float(key["t"]), float(key["v"])) for key in keys
-                ]
+                curve_data = payload["curves"][0]["curve"]
+                expected[plug] = list(zip(
+                    map(float, curve_data["keyframes"]),
+                    map(float, curve_data["values"]),
+                ))
                 cmds.cutKey(plug, clear=True)
 
         success, failed, skipped = animCrash.apply_animation(data)

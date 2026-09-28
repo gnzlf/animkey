@@ -842,7 +842,10 @@ def ensure_target_curve(attr_path, layer_name=None, seed_time=None):
         "attribute": attr,
         "time": (frame, frame),
     }
-    if layer_name:
+    # ``setKeyframe(..., animLayer='BaseAnimation')`` can silently route to
+    # Maya's currently preferred non-base layer.  Omit the flag for Base so
+    # the native command creates/edits the inputA branch as intended.
+    if layer_name and not is_base_layer(layer_name):
         kwargs["animLayer"] = layer_name
     try:
         cmds.setKeyframe(node, **kwargs)
@@ -885,6 +888,7 @@ def paste_curve(
     layer_name=None,
     time_offset=0.0,
     clear_existing=True,
+    clear_all=False,
     value_scale=1.0,
     value_offset=0.0,
 ):
@@ -895,14 +899,18 @@ def paste_curve(
     if not source_range or not key_target_range or not target_range:
         return False, 0
 
-    target_curve = ensure_target_curve(
-        attr_path,
-        layer_name=layer_name,
-        # Creating a destination animCurve requires one seed key.  Put it on
-        # the first real pasted key so merge overwrites it and never leaves a
-        # phantom key at the beginning of a selected clip range.
-        seed_time=key_target_range[0],
+    target_curve = _create_direct_target_curve(
+        attr_path, curve_data, layer_name=layer_name
     )
+    if not target_curve:
+        target_curve = ensure_target_curve(
+            attr_path,
+            layer_name=layer_name,
+            # Creating a destination animCurve requires one seed key.  Put it
+            # on the first real pasted key so merge overwrites it and never
+            # leaves a phantom key at the beginning of a selected clip range.
+            seed_time=key_target_range[0],
+        )
     if not target_curve:
         return False, 0
 
@@ -928,9 +936,17 @@ def paste_curve(
             )
 
         if clear_existing:
-            _clear_curve_range(target_curve, target_range)
+            if clear_all:
+                try:
+                    cmds.cutKey(target_curve, clear=True)
+                except Exception:
+                    pass
+            else:
+                _clear_curve_range(target_curve, target_range)
             if not cmds.objExists(target_curve):
-                target_curve = ensure_target_curve(
+                target_curve = _create_direct_target_curve(
+                    attr_path, curve_data, layer_name=layer_name
+                ) or ensure_target_curve(
                     attr_path,
                     layer_name=layer_name,
                     seed_time=key_target_range[0],
@@ -1192,7 +1208,7 @@ def set_key_on_layer(attr_path, frame, value, layer_name=None):
         "time": (float(frame), float(frame)),
         "value": float(value),
     }
-    if layer_name:
+    if layer_name and not is_base_layer(layer_name):
         kwargs["animLayer"] = layer_name
     try:
         cmds.setKeyframe(node, **kwargs)
@@ -1231,7 +1247,7 @@ def set_keys_on_layer(key_values, frame, layer_name=None):
             "time": (float(frame), float(frame)),
             "value": float(value),
         }
-        if layer_name:
+        if layer_name and not is_base_layer(layer_name):
             kwargs["animLayer"] = layer_name
         try:
             cmds.setKeyframe(node, **kwargs)

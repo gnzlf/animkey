@@ -3582,16 +3582,15 @@ class AnimKeyToolbar:
         from AnimKey.sliders.blend_to_undo import execute as blend_undo_execute
         from AnimKey.sliders.push_pull import execute as push_pull_execute
         
+        refresh_suspended = False
         try:
+            # Every slider mode now shares Tweener's cheap live-preview path.
+            # The graph and viewport repaint once after a complete slider tick,
+            # instead of once for every edited key.
+            cmds.refresh(suspend=True)
+            refresh_suspended = True
             if mode == "Tweener":
-                # Match Animo's responsive preview: suppress intermediate
-                # viewport paints while all selected curves are updated, then
-                # let Maya draw the completed slider tick once.
-                cmds.refresh(suspend=True)
-                try:
-                    tweener_execute(value)
-                finally:
-                    cmds.refresh(suspend=False)
+                tweener_execute(value)
             elif mode == "Tweener World Space":
                 tweener_ws_execute(value)
             elif mode == "Blend to Buffer":
@@ -3620,6 +3619,12 @@ class AnimKeyToolbar:
             print(f"Error in slider: {e}")
         else:
             self._slider_graph_view_sync.refresh()
+        finally:
+            if refresh_suspended:
+                try:
+                    cmds.refresh(suspend=False)
+                except Exception:
+                    pass
     
     def _on_tween_press(self):
         """Handle tween slider press - prepare data cache before any changes"""
@@ -3693,14 +3698,13 @@ class AnimKeyToolbar:
         from AnimKey.sliders.push_pull import execute as exe_push, reset as res_push
         
         # IMPORTANT: Apply the final slider value and create keyframes
+        refresh_suspended = False
         try:
+            cmds.refresh(suspend=True)
+            refresh_suspended = True
             if mode == "Tweener":
-                cmds.refresh(suspend=True)
-                try:
-                    exe_tween(final_value)
-                    res_tween()
-                finally:
-                    cmds.refresh(suspend=False)
+                exe_tween(final_value)
+                res_tween()
             elif mode == "Tweener World Space":
                 exe_tween_ws(final_value)
                 res_tween_ws()
@@ -3740,6 +3744,11 @@ class AnimKeyToolbar:
         except Exception as e:
             print(f"Error in slider release: {e}")
         finally:
+            if refresh_suspended:
+                try:
+                    cmds.refresh(suspend=False)
+                except Exception:
+                    pass
             self._sync_animation_offset_after_slider(force=True)
             self._slider_graph_view_sync.end()
     
@@ -3784,21 +3793,31 @@ class AnimKeyToolbar:
         from AnimKey.sliders.curve_ease_in_out import execute as exe_ease
         from AnimKey.sliders.curve_noise import execute as exe_noise
         
-        # Execute based on mode
-        if mode in ("Smooth", "Smooth/Rough"):
-            exe_smooth(value)
-        elif mode == "Wave":
-            exe_wave(value)
-        elif mode == "Scale":
-            exe_scale(value)
-        elif mode == "Linear":
-            exe_linear(value)
-        elif mode == "Flat":
-            exe_flat(value)
-        elif mode == "Ease In/Out":
-            exe_ease(value)
-        elif mode == "Noise":
-            exe_noise(value)
+        refresh_suspended = False
+        try:
+            cmds.refresh(suspend=True)
+            refresh_suspended = True
+            # Execute based on mode
+            if mode in ("Smooth", "Smooth/Rough"):
+                exe_smooth(value)
+            elif mode == "Wave":
+                exe_wave(value)
+            elif mode == "Scale":
+                exe_scale(value)
+            elif mode == "Linear":
+                exe_linear(value)
+            elif mode == "Flat":
+                exe_flat(value)
+            elif mode == "Ease In/Out":
+                exe_ease(value)
+            elif mode == "Noise":
+                exe_noise(value)
+        finally:
+            if refresh_suspended:
+                try:
+                    cmds.refresh(suspend=False)
+                except Exception:
+                    pass
         self._slider_graph_view_sync.refresh()
     
     def _on_curve_release_new(self, final_value):

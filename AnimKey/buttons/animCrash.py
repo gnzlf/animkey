@@ -24,7 +24,7 @@ from AnimKey.mods.maya_compat import (
     QtCore, QtGui, QtWidgets, wrap_instance as wrapInstance,
 )
 from AnimKey.mods.storage import atomic_write_json
-from AnimKey.core.animation_curve_transfer import paste_curve
+from AnimKey.core.animation_curve_transfer import capture_curve, paste_curve
 
 
 QT_NO_BUTTON = getattr(QtCore.Qt, "NoButton", None)
@@ -539,88 +539,81 @@ def invalidate_animated_objects_cache():
     _animated_objects_cache["objects"] = None
     _animated_objects_cache["time"] = 0.0
 
+
+ANIM_CURVE_TYPES = ('animCurveTL', 'animCurveTA', 'animCurveTU', 'animCurveTT')
+
+
+def _direct_curve_records(objects=None):
+    """Return concrete ``animCurve.output`` destinations grouped by node.
+
+    Node-level connection queries can include inherited DAG attributes. Recovery
+    must only serialize real curve outputs; otherwise a checkpoint can create
+    animation on a shape that was only inheriting its parent's visibility.
+    """
+    requested = set(objects or [])
+    curves = []
+    for curve_type in ANIM_CURVE_TYPES:
+        curves.extend(cmds.ls(type=curve_type) or [])
+    if not curves:
+        return {}
+
+    records = {}
+    for curve in curves:
+        # Maya's list-argument overload can report inherited DAG attributes.
+        # The per-output query is the only form that consistently returns the
+        # physical destination plug across referenced production rigs.
+        for destination in cmds.listConnections(
+                curve + '.output', source=False, destination=True, plugs=True
+        ) or []:
+            if '.' not in destination:
+                continue
+            obj, attr = destination.rsplit('.', 1)
+            if requested and obj not in requested:
+                continue
+            records.setdefault(obj, []).append((attr, curve))
+    return records
+
+
 def get_animated_objects(force=False):
     now = time.time()
     if (not force and _animated_objects_cache["objects"] is not None and
             (now - _animated_objects_cache["time"]) < ANIMATED_OBJECTS_CACHE_TTL):
         return list(_animated_objects_cache["objects"])
 
-    animated = set()
-    curve_types = ['animCurveTL', 'animCurveTA', 'animCurveTU', 'animCurveTT']
-    curves = []
-    for curve_type in curve_types:
-        curves.extend(cmds.ls(type=curve_type) or [])
-
-    # One batched graph query is considerably cheaper than one Maya command
-    # per curve (10k+ calls in a production shot).  Keep the old path only as
-    # a compatibility fallback for Maya builds that reject list arguments.
-    try:
-        if curves:
-            destinations = cmds.listConnections(
-                curves, destination=True, source=False, plugs=True
-            ) or []
-        else:
-            destinations = []
-    except Exception:
-        destinations = []
-        for curve in curves:
-            destinations.extend(
-                cmds.listConnections(
-                    curve, destination=True, source=False, plugs=True
-                ) or []
-            )
-    for destination in destinations:
-        obj = destination.split('.', 1)[0]
-        if obj:
-            animated.add(obj)
-
-    result = list(animated)
+    result = list(_direct_curve_records().keys())
     _animated_objects_cache["objects"] = result
     _animated_objects_cache["time"] = now
     return result
 
-def _extract_object_animation(obj):
+def _extract_object_animation(obj, curve_records=None, curve_payloads=None):
     if not cmds.objExists(obj):
         return None, 0
 
     obj_anim = {}
     total_keys = 0
-    for curve in (cmds.listConnections(obj, type='animCurve', s=True, d=False) or []):
-        for conn in (cmds.listConnections(curve, d=True, s=False, p=True) or []):
-            if not conn.startswith(obj + '.'):
+    if curve_records is None:
+        curve_records = _direct_curve_records([obj]).get(obj, [])
+    curve_payloads = curve_payloads if curve_payloads is not None else {}
+    for attr, curve in curve_records:
+        try:
+            # Store the concrete curve branch, rather than a composed value.
+            # Animation layers expose their base/additive inputs as animBlend
+            # plugs, so restoring onto that same plug preserves the layer graph.
+            curve_data = curve_payloads.get(curve)
+            if curve_data is None:
+                curve_data = capture_curve(curve, layer_name="BaseAnimation")
+                curve_payloads[curve] = curve_data
+            if not curve_data:
                 continue
-            attr = conn.split('.')[-1]
-            try:
-                times = cmds.keyframe(curve, q=True, tc=True) or []
-                values = cmds.keyframe(curve, q=True, vc=True) or []
-                if times:
-                    try:
-                        in_tangents = cmds.keyTangent(curve, q=True, itt=True) or []
-                        out_tangents = cmds.keyTangent(curve, q=True, ott=True) or []
-                        in_angles = cmds.keyTangent(curve, q=True, ia=True) or []
-                        out_angles = cmds.keyTangent(curve, q=True, oa=True) or []
-                    except:
-                        in_tangents = []
-                        out_tangents = []
-                        in_angles = []
-                        out_angles = []
-
-                    keys = []
-                    for index, (t, v) in enumerate(zip(times, values)):
-                        key = {'t': t, 'v': v}
-                        if index < len(in_tangents):
-                            key['itt'] = in_tangents[index]
-                        if index < len(out_tangents):
-                            key['ott'] = out_tangents[index]
-                        if index < len(in_angles):
-                            key['ia'] = in_angles[index]
-                        if index < len(out_angles):
-                            key['oa'] = out_angles[index]
-                        keys.append(key)
-                    obj_anim[attr] = keys
-                    total_keys += len(keys)
-            except:
-                pass
+            obj_anim[attr] = {
+                "curves": [{
+                    "layer": "BaseAnimation",
+                    "curve": curve_data,
+                }]
+            }
+            total_keys += len(curve_data.get("keyframes", []))
+        except Exception:
+            pass
 
     return (obj_anim if obj_anim else None), total_keys
 
@@ -644,9 +637,13 @@ def extract_animation(objects=None):
         'animation': {}
     }
     
+    curve_records_by_object = _direct_curve_records(objects)
+    curve_payloads = {}
     total_keys = 0
     for obj in objects:
-        obj_anim, key_count = _extract_object_animation(obj)
+        obj_anim, key_count = _extract_object_animation(
+            obj, curve_records_by_object.get(obj, []), curve_payloads
+        )
         if obj_anim:
             data['animation'][obj] = obj_anim
             total_keys += key_count
@@ -905,6 +902,8 @@ class _AsyncCheckpointCapture(object):
         self.on_done = on_done
         self.change_serial = RecoverySystem._change_serial
         self.objects = get_animated_objects()
+        self.curve_records_by_object = _direct_curve_records(self.objects)
+        self.curve_payloads = {}
         self.index = 0
         self.total_keys = 0
         self.folder = get_scene_folder()
@@ -991,7 +990,11 @@ class _AsyncCheckpointCapture(object):
         while self.index < len(self.objects):
             obj = self.objects[self.index]
             self.index += 1
-            obj_anim, key_count = _extract_object_animation(obj)
+            obj_anim, key_count = _extract_object_animation(
+                obj,
+                self.curve_records_by_object.get(obj, []),
+                self.curve_payloads,
+            )
             if obj_anim:
                 self.data['animation'][obj] = obj_anim
                 self.total_keys += key_count
@@ -1261,6 +1264,7 @@ def apply_animation(data, namespace_filter="TODOS", target_namespace=None):
                             curve_data,
                             layer_name=layer_name,
                             clear_existing=True,
+                            clear_all=True,
                         )
                         recovered_any = recovered_any or bool(pasted)
                     continue

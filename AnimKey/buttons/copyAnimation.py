@@ -165,6 +165,121 @@ def _channel_exists(channel, all_attrs):
     return channel in all_attrs or channel.split("[", 1)[0] in all_attrs
 
 
+_LAYER_BUNDLE_MARKER = "__animkey_layered_curves__"
+
+
+def _is_layer_bundle(curve_data):
+    return bool(
+        isinstance(curve_data, dict)
+        and curve_data.get(_LAYER_BUNDLE_MARKER)
+        and isinstance(curve_data.get("layers"), dict)
+    )
+
+
+def _iter_curve_payloads(curve_data):
+    """Yield ``(source_layer, payload)`` while accepting v1-v3 clips."""
+    if _is_layer_bundle(curve_data):
+        for layer_name, payload in curve_data.get("layers", {}).items():
+            if isinstance(payload, dict) and payload.get("keyframes"):
+                yield layer_name, payload
+        return
+    if isinstance(curve_data, dict) and curve_data.get("keyframes"):
+        yield curve_data.get("source_layer") or "BaseAnimation", curve_data
+
+
+def _animation_payload_count(animation_data):
+    return sum(
+        1
+        for channels in (animation_data or {}).values()
+        for curve_data in channels.values()
+        for _layer, _payload in _iter_curve_payloads(curve_data)
+    )
+
+
+def _store_curve_payload(animation_data, control_key, channel, snapshot):
+    """Store a curve without dropping a second animation layer on one plug."""
+    if not snapshot:
+        return
+    channel_data = animation_data.setdefault(control_key, {})
+    source_layer = snapshot.get("source_layer") or "BaseAnimation"
+    current = channel_data.get(channel)
+    if current is None:
+        channel_data[channel] = snapshot
+        return
+
+    if _is_layer_bundle(current):
+        current["layers"][source_layer] = snapshot
+        return
+
+    existing_layer = current.get("source_layer") or "BaseAnimation"
+    if existing_layer == source_layer:
+        channel_data[channel] = snapshot
+        return
+
+    channel_data[channel] = {
+        _LAYER_BUNDLE_MARKER: True,
+        "layers": {
+            existing_layer: current,
+            source_layer: snapshot,
+        },
+    }
+
+
+def _capture_layer_state(layer_name):
+    """Capture the layer knobs that change the evaluated animation result."""
+    if curve_transfer.is_base_layer(layer_name):
+        return {"name": "BaseAnimation", "base": True}
+    state = {"name": layer_name, "base": False}
+    for flag in ("override", "weight", "mute", "solo", "lock"):
+        try:
+            state[flag] = cmds.animLayer(layer_name, query=True, **{flag: True})
+        except Exception:
+            pass
+    return state
+
+
+def _remember_layer_state(layer_name):
+    if not layer_name:
+        layer_name = "BaseAnimation"
+    _anim_layer_metadata[layer_name] = _capture_layer_state(layer_name)
+
+
+def _ensure_target_layer(layer_name):
+    """Return/create the destination layer without changing the user's active layer."""
+    layer_name = layer_name or "BaseAnimation"
+    if curve_transfer.is_base_layer(layer_name):
+        return "BaseAnimation"
+    if not cmds.objExists(layer_name):
+        state = _anim_layer_metadata.get(layer_name, {})
+        try:
+            cmds.animLayer(layer_name, override=bool(state.get("override", False)))
+        except Exception:
+            try:
+                cmds.animLayer(layer_name)
+            except Exception:
+                return None
+    # A locked copied layer cannot receive curves. Restore its lock only once
+    # transfers are complete.
+    try:
+        cmds.animLayer(layer_name, edit=True, lock=False)
+    except Exception:
+        pass
+    return layer_name
+
+
+def _restore_layer_state(layer_name):
+    if curve_transfer.is_base_layer(layer_name):
+        return
+    state = _anim_layer_metadata.get(layer_name, {})
+    for flag in ("weight", "mute", "solo", "lock"):
+        if flag not in state:
+            continue
+        try:
+            cmds.animLayer(layer_name, edit=True, **{flag: state[flag]})
+        except Exception:
+            pass
+
+
 def _build_animation_transfers(assignments, animation_data):
     transfers = []
     prevalidated = set()
@@ -186,6 +301,32 @@ def _build_animation_transfers(assignments, animation_data):
             transfers.append((attr_path, curve_data))
             prevalidated.add(attr_path)
     return transfers, prevalidated, skipped
+
+
+def _build_layered_animation_transfers(assignments, animation_data):
+    """Build batch-paste inputs grouped by their original animation layer."""
+    groups = {}
+    skipped = 0
+    attr_cache = {}
+    for ctrl_key, control in assignments:
+        if control not in attr_cache:
+            attr_cache[control] = _control_channel_sets(control)
+        all_attrs, locked_attrs = attr_cache[control]
+        for channel, stored_data in animation_data.get(ctrl_key, {}).items():
+            base_channel = channel.split("[", 1)[0]
+            if (not _channel_exists(channel, all_attrs) or
+                    channel in locked_attrs or base_channel in locked_attrs):
+                skipped += len(list(_iter_curve_payloads(stored_data))) or 1
+                continue
+            attr_path = f"{control}.{channel}"
+            for layer_name, curve_data in _iter_curve_payloads(stored_data):
+                group = groups.setdefault(
+                    layer_name or "BaseAnimation",
+                    {"transfers": [], "prevalidated": set()},
+                )
+                group["transfers"].append((attr_path, curve_data))
+                group["prevalidated"].add(attr_path)
+    return groups, skipped
 
 
 def get_control_short_name(control):
@@ -634,7 +775,8 @@ def _curves_on_layer(candidate_curves, layer_name):
     return [curve for curve in candidate_curves if curve in requested_curves]
 
 
-def collect_animation_for_controls(controls, time_range=None, layer_name=None):
+def collect_animation_for_controls(controls, time_range=None, layer_name=None,
+                                   all_layers=False):
     """Capture selected controls with one curve query instead of per-attribute scans."""
     controls = list_selected_transform_targets(controls)
     if not controls:
@@ -644,14 +786,36 @@ def collect_animation_for_controls(controls, time_range=None, layer_name=None):
         candidate_curves = cmds.keyframe(controls, query=True, name=True) or []
     except Exception:
         candidate_curves = []
-    curves = _curves_on_layer(candidate_curves, layer_name)
+    if all_layers:
+        # Maya's attribute query often exposes only the currently composed
+        # layer curve.  Include concrete curves owned by every layer, then
+        # resolve the BaseAnimation counterpart from their driven plug below.
+        for candidate_layer in cmds.ls(type="animLayer") or []:
+            if curve_transfer.is_base_layer(candidate_layer):
+                continue
+            try:
+                candidate_curves.extend(
+                    cmds.animLayer(candidate_layer, query=True, animCurves=True) or []
+                )
+            except Exception:
+                pass
+    curves = list(dict.fromkeys(candidate_curves)) if all_layers else _curves_on_layer(
+        candidate_curves, layer_name
+    )
     if not curves:
         return {}, {}
 
     selected_set = set(controls)
     animation_data = {}
     source_controls = {}
-    for curve in curves:
+    curve_index = 0
+    seen_curves = set()
+    while curve_index < len(curves):
+        curve = curves[curve_index]
+        curve_index += 1
+        if curve in seen_curves:
+            continue
+        seen_curves.add(curve)
         try:
             driven_plugs = curve_transfer.driven_plugs_for_curve(curve)
         except Exception:
@@ -667,18 +831,30 @@ def collect_animation_for_controls(controls, time_range=None, layer_name=None):
             attr_path = "{}.{}".format(control, channel)
             if not cmds.objExists(attr_path):
                 continue
+            source_layer = (
+                curve_transfer.animation_layer_for_curve(attr_path, curve)
+                or "BaseAnimation"
+            )
+            requested_layer = layer_name or "BaseAnimation"
+            if not all_layers and source_layer != requested_layer:
+                continue
+            if all_layers and source_layer != "BaseAnimation":
+                base_curve = curve_transfer.resolve_anim_curve(
+                    attr_path, layer_name="BaseAnimation"
+                )
+                if base_curve and base_curve not in seen_curves:
+                    curves.append(base_curve)
             snapshot = curve_transfer.capture_curve(
                 curve,
                 time_range=time_range,
-                layer_name=layer_name,
+                layer_name=source_layer,
             )
             if not snapshot:
                 continue
             ctrl_key = get_control_storage_key(control)
-            animation_data.setdefault(ctrl_key, {})
-            if channel not in animation_data[ctrl_key]:
-                animation_data[ctrl_key][channel] = snapshot
-                source_controls[ctrl_key] = control
+            _store_curve_payload(animation_data, ctrl_key, channel, snapshot)
+            _remember_layer_state(source_layer)
+            source_controls[ctrl_key] = control
             break
     return animation_data, source_controls
 
@@ -745,7 +921,7 @@ def _collect_selected_graph_animation(selected):
         source_layer = curve_transfer.animation_layer_for_curve(
             "{}.{}".format(control, channel),
             curve,
-        )
+        ) or "BaseAnimation"
         snapshot = curve_transfer.capture_curve(
             curve,
             layer_name=source_layer,
@@ -755,12 +931,8 @@ def _collect_selected_graph_animation(selected):
             continue
 
         ctrl_key = get_control_storage_key(control)
-        animation_data.setdefault(ctrl_key, {})
-        # One channel cannot represent two source layers simultaneously. Keep
-        # the first concrete curve instead of replacing it by enumeration order.
-        if channel in animation_data[ctrl_key]:
-            continue
-        animation_data[ctrl_key][channel] = snapshot
+        _store_curve_payload(animation_data, ctrl_key, channel, snapshot)
+        _remember_layer_state(source_layer)
         source_controls[ctrl_key] = control
 
     return animation_data, source_controls
@@ -827,10 +999,11 @@ def find_mirror_control(control_name):
 
 _BUFFER_PREFIX = "ANIMKEY_BUF_"
 
-# {control identity: {channel: serialized curve}}
+# {control identity: {channel: serialized curve or layered curve bundle}}
 _anim_buffer = {}
 _anim_sources = {}
 _anim_source_snapshots = {}
+_anim_layer_metadata = {}
 _last_disk_mtime = 0
 _buffer_is_current = False
 _pose_buffer = None
@@ -843,6 +1016,7 @@ _json_write_generation = {}
 def _cleanup_buffer():
     """Clear the clip and remove buffer nodes left by AnimKey versions before v3."""
     global _anim_buffer, _anim_sources, _anim_source_snapshots
+    global _anim_layer_metadata
     global _last_disk_mtime, _buffer_is_current
     nodes = cmds.ls(f"{_BUFFER_PREFIX}*", type='transform')
     if nodes:
@@ -853,6 +1027,7 @@ def _cleanup_buffer():
     _anim_buffer = {}
     _anim_sources = {}
     _anim_source_snapshots = {}
+    _anim_layer_metadata = {}
     _last_disk_mtime = 0
     _buffer_is_current = True
 
@@ -1217,11 +1392,12 @@ def get_animation_frame_range(animation_data):
     all_frames = []
     for channels in animation_data.values():
         for curve_data in channels.values():
-            clip_range = curve_data.get("clip_range")
-            if isinstance(clip_range, (list, tuple)) and len(clip_range) == 2:
-                all_frames.extend(clip_range)
-            else:
-                all_frames.extend(curve_data.get("keyframes", []))
+            for _layer_name, payload in _iter_curve_payloads(curve_data):
+                clip_range = payload.get("clip_range")
+                if isinstance(clip_range, (list, tuple)) and len(clip_range) == 2:
+                    all_frames.extend(clip_range)
+                else:
+                    all_frames.extend(payload.get("keyframes", []))
     if not all_frames:
         return None
     return min(all_frames), max(all_frames)
@@ -1266,9 +1442,13 @@ def apply_animation_data_to_scene(
     selected_objects=None,
     time_offset=None,
     preferred_namespace=None,
-    paste_mode="replace"
+    paste_mode="replace",
+    layer_metadata=None,
 ):
     """Apply serialized animation data to matching controls in the current scene."""
+    global _anim_layer_metadata
+    if layer_metadata is not None:
+        _anim_layer_metadata = dict(layer_metadata or {})
     selected_objects = cmds.ls(selection=True, long=True) if selected_objects is None else selected_objects
     selected_objects = selected_objects or []
     if preferred_namespace is None:
@@ -1289,7 +1469,6 @@ def apply_animation_data_to_scene(
 
     applied = 0
     skipped = 0
-    target_layer = curve_transfer.active_animation_layer()
     cmds.undoInfo(openChunk=True)
     refresh_suspended = False
     try:
@@ -1299,20 +1478,29 @@ def apply_animation_data_to_scene(
         except Exception:
             pass
 
-        transfers, prevalidated, skipped_channels = _build_animation_transfers(
+        layer_groups, skipped_channels = _build_layered_animation_transfers(
             target_assignments,
             animation_data,
         )
         skipped += skipped_channels
-        results = curve_transfer.paste_curves_batch(
-            transfers,
-            layer_name=target_layer,
-            time_offset=float(time_offset or 0.0),
-            clear_existing=paste_mode != "insert",
-            prevalidated_attr_paths=prevalidated,
-        )
-        applied += sum(1 for result in results if result)
-        skipped += sum(1 for result in results if not result)
+        for source_layer in sorted(
+                layer_groups,
+                key=lambda name: 0 if curve_transfer.is_base_layer(name) else 1):
+            group = layer_groups[source_layer]
+            target_layer = _ensure_target_layer(source_layer)
+            if not target_layer:
+                skipped += len(group["transfers"])
+                continue
+            results = curve_transfer.paste_curves_batch(
+                group["transfers"],
+                layer_name=target_layer,
+                time_offset=float(time_offset or 0.0),
+                clear_existing=paste_mode != "insert",
+                prevalidated_attr_paths=group["prevalidated"],
+            )
+            applied += sum(1 for result in results if result)
+            skipped += sum(1 for result in results if not result)
+            _restore_layer_state(target_layer)
     finally:
         if refresh_suspended:
             try:
@@ -1344,9 +1532,23 @@ def trim_animation_data_to_range(animation_data, start_frame, end_frame):
     for ctrl_name, channels in animation_data.items():
         trimmed_channels = {}
         for channel, curve_data in channels.items():
-            trimmed_curve = trim_curve_data_to_range(curve_data, start_frame, end_frame)
-            if trimmed_curve:
-                trimmed_channels[channel] = trimmed_curve
+            payloads = list(_iter_curve_payloads(curve_data))
+            trimmed_payloads = {
+                layer_name: trim_curve_data_to_range(payload, start_frame, end_frame)
+                for layer_name, payload in payloads
+            }
+            trimmed_payloads = {
+                layer_name: payload
+                for layer_name, payload in trimmed_payloads.items()
+                if payload
+            }
+            if len(trimmed_payloads) == 1 and not _is_layer_bundle(curve_data):
+                trimmed_channels[channel] = next(iter(trimmed_payloads.values()))
+            elif trimmed_payloads:
+                trimmed_channels[channel] = {
+                    _LAYER_BUNDLE_MARKER: True,
+                    "layers": trimmed_payloads,
+                }
         if trimmed_channels:
             trimmed_animation[ctrl_name] = trimmed_channels
     return trimmed_animation
@@ -1467,7 +1669,7 @@ def _schedule_json_write(file_path, data, indent=None, on_written=None):
 
 
 def _export_buffer_to_disk(save_to_library=False):
-    global _anim_buffer, _last_disk_mtime, _buffer_is_current
+    global _anim_buffer, _anim_layer_metadata, _last_disk_mtime, _buffer_is_current
     if not _anim_buffer:
         _buffer_is_current = True
         json_path = get_copy_paste_animation_file()
@@ -1489,8 +1691,8 @@ def _export_buffer_to_disk(save_to_library=False):
         "animation": _anim_buffer,
         "meta": {
             "source_controls": source_controls_meta,
-            "format_version": 3,
-            "source_layer": curve_transfer.active_animation_layer(),
+            "format_version": 4,
+            "layers": _anim_layer_metadata,
         },
     }
 
@@ -1531,6 +1733,7 @@ def _export_buffer_to_disk(save_to_library=False):
 
 def _sync_buffer_from_disk():
     global _anim_buffer, _anim_sources, _anim_source_snapshots
+    global _anim_layer_metadata
     global _last_disk_mtime, _buffer_is_current
     json_path = get_copy_paste_animation_file()
     if not os.path.exists(json_path):
@@ -1547,6 +1750,7 @@ def _sync_buffer_from_disk():
             data = json.load(f)
             
         animation_data = data.get("animation", data)
+        meta = data.get("meta", {}) if isinstance(data, dict) else {}
         if not animation_data:
             return
             
@@ -1557,7 +1761,7 @@ def _sync_buffer_from_disk():
             ctrl_key: {
                 channel: curve_data
                 for channel, curve_data in channels_data.items()
-                if curve_data.get("keyframes")
+                if list(_iter_curve_payloads(curve_data))
             }
             for ctrl_key, channels_data in animation_data.items()
             if isinstance(channels_data, dict)
@@ -1567,6 +1771,7 @@ def _sync_buffer_from_disk():
             for ctrl_key, channels in _anim_buffer.items()
             if channels
         }
+        _anim_layer_metadata = dict(meta.get("layers", {}) or {})
 
         _last_disk_mtime = mtime
         _buffer_is_current = True
@@ -2704,7 +2909,8 @@ class SmartAnimationLibraryWindow(ContextPopupWindow):
             animation_data,
             preferred_namespace=preferred_namespace,
             time_offset=time_offset,
-            paste_mode=target_mode
+            paste_mode=target_mode,
+            layer_metadata=entry.get("meta", {}).get("layers", {}),
         )
         if applied:
             cmds.inViewMessage(
@@ -2784,7 +2990,7 @@ def show_smart_animation_library(anchor_button=None):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def copy_animation(*args):
-    """Copy animation from selected controls on the active layer."""
+    """Copy all animation layers that contribute to selected controls."""
     from AnimKey.core.executionGuard import require_animkey_context
     if not require_animkey_context("AnimKey.buttons.copyAnimation.copy_animation"):
         return None
@@ -2803,19 +3009,18 @@ def copy_animation(*args):
         _anim_buffer.update(graph_animation)
         _anim_sources.update(graph_sources)
         _anim_source_snapshots.update(graph_animation)
-        copied_channels = sum(len(channels) for channels in graph_animation.values())
+        copied_channels = _animation_payload_count(graph_animation)
     else:
         time_range = get_selected_time_range()
-        source_layer = curve_transfer.active_animation_layer()
         captured, sources = collect_animation_for_controls(
             selected,
             time_range=time_range,
-            layer_name=source_layer,
+            all_layers=True,
         )
         _anim_buffer.update(captured)
         _anim_sources.update(sources)
         _anim_source_snapshots.update(captured)
-        copied_channels = sum(len(channels) for channels in captured.values())
+        copied_channels = _animation_payload_count(captured)
 
     # Sync buffer to disk for cross-instance copy/paste
     _export_buffer_to_disk(save_to_library=False)
@@ -2884,24 +3089,32 @@ def _validate_buffer(ctrl_short):
 
 def _paste_clip_to_targets(target_map, time_offset=0.0, clear_existing=True):
     """Paste the in-memory clip to a resolved source-key -> target-control map."""
-    target_layer = curve_transfer.active_animation_layer()
     pasted_count = 0
     skipped_count = 0
     assignments = target_map.items() if hasattr(target_map, "items") else target_map
-    transfers, prevalidated, skipped_channels = _build_animation_transfers(
+    layer_groups, skipped_channels = _build_layered_animation_transfers(
         assignments,
         _anim_buffer,
     )
     skipped_count += skipped_channels
-    results = curve_transfer.paste_curves_batch(
-        transfers,
-        layer_name=target_layer,
-        time_offset=float(time_offset or 0.0),
-        clear_existing=clear_existing,
-        prevalidated_attr_paths=prevalidated,
-    )
-    pasted_count += sum(1 for result in results if result)
-    skipped_count += sum(1 for result in results if not result)
+    for source_layer in sorted(
+            layer_groups,
+            key=lambda name: 0 if curve_transfer.is_base_layer(name) else 1):
+        group = layer_groups[source_layer]
+        target_layer = _ensure_target_layer(source_layer)
+        if not target_layer:
+            skipped_count += len(group["transfers"])
+            continue
+        results = curve_transfer.paste_curves_batch(
+            group["transfers"],
+            layer_name=target_layer,
+            time_offset=float(time_offset or 0.0),
+            clear_existing=clear_existing,
+            prevalidated_attr_paths=group["prevalidated"],
+        )
+        pasted_count += sum(1 for result in results if result)
+        skipped_count += sum(1 for result in results if not result)
+        _restore_layer_state(target_layer)
     return pasted_count, skipped_count
 
 
@@ -3046,7 +3259,6 @@ def paste_opposite_animation(*args):
 
         from AnimKey.buttons import mirror as mirror_module
 
-        target_layer = curve_transfer.active_animation_layer()
         snapshots = {}
         for ctrl_key, source_side in target_map.items():
             rig_name = mirror_module.get_rig_identifier([source_side])
@@ -3074,11 +3286,11 @@ def paste_opposite_animation(*args):
                 sym_plane,
                 source_data=source_data,
             )
-            for channel, curve_data in _anim_buffer.get(ctrl_key, {}).items():
+            for channel, stored_data in _anim_buffer.get(ctrl_key, {}).items():
                 spec = attr_map.get(channel, {})
                 target_channel = spec.get("target", channel)
                 if not cmds.attributeQuery(target_channel, node=opposite, exists=True):
-                    skipped_count += 1
+                    skipped_count += len(list(_iter_curve_payloads(stored_data))) or 1
                     continue
 
                 multiplier = float(
@@ -3088,31 +3300,38 @@ def paste_opposite_animation(*args):
                     )
                 )
                 value_offset = 0.0
-                if (
-                    not curve_transfer.is_additive_layer(target_layer)
-                    and spec.get("mode") != "copy_value"
-                ):
-                    source_rest = source_data.get("rest_attrs", {}).get(channel, 0.0)
-                    target_rest = target_data.get("rest_attrs", {}).get(
-                        target_channel,
-                        0.0,
-                    )
-                    value_offset = float(target_rest) - (
-                        float(source_rest) * multiplier
-                    )
+                for source_layer, curve_data in _iter_curve_payloads(stored_data):
+                    target_layer = _ensure_target_layer(source_layer)
+                    if not target_layer:
+                        skipped_count += 1
+                        continue
+                    value_offset = 0.0
+                    if (
+                        not curve_transfer.is_additive_layer(target_layer)
+                        and spec.get("mode") != "copy_value"
+                    ):
+                        source_rest = source_data.get("rest_attrs", {}).get(channel, 0.0)
+                        target_rest = target_data.get("rest_attrs", {}).get(
+                            target_channel,
+                            0.0,
+                        )
+                        value_offset = float(target_rest) - (
+                            float(source_rest) * multiplier
+                        )
 
-                pasted, _ = curve_transfer.paste_curve(
-                    f"{opposite}.{target_channel}",
-                    curve_data,
-                    layer_name=target_layer,
-                    clear_existing=True,
-                    value_scale=multiplier,
-                    value_offset=value_offset,
-                )
-                if pasted:
-                    pasted_count += 1
-                else:
-                    skipped_count += 1
+                    pasted, _ = curve_transfer.paste_curve(
+                        f"{opposite}.{target_channel}",
+                        curve_data,
+                        layer_name=target_layer,
+                        clear_existing=True,
+                        value_scale=multiplier,
+                        value_offset=value_offset,
+                    )
+                    if pasted:
+                        pasted_count += 1
+                    else:
+                        skipped_count += 1
+                    _restore_layer_state(target_layer)
 
         if pasted_count:
             cmds.warning(

@@ -18,6 +18,8 @@ _COMPOSITE_LAYER_PREVIEW_TARGETS = set()
 _ACTIVE_LAYER_TARGET_CACHE = {}
 _SLIDER_KEY_EXISTS_CACHE = {}
 _SLIDER_EDITABLE_ATTR_CACHE = {}
+_SELECTED_CURVE_CACHE = {}
+_SELECTED_CURVE_FRAME_CACHE = {}
 
 
 def _animation_offset_is_active():
@@ -221,9 +223,12 @@ def get_graph_editor_selection():
     Returns:
         dict: {attr_full: [frame1, frame2, ...]} or empty dict
     """
-    global _GRAPH_EDITOR_CURVE_ENTRIES
+    global _GRAPH_EDITOR_CURVE_ENTRIES, _SELECTED_CURVE_CACHE
+    global _SELECTED_CURVE_FRAME_CACHE
     result = {}
     _GRAPH_EDITOR_CURVE_ENTRIES = []
+    _SELECTED_CURVE_CACHE = {}
+    _SELECTED_CURVE_FRAME_CACHE = {}
     
     try:
         # Get selected animation curves
@@ -441,6 +446,196 @@ def get_processing_context(explicit_attributes=False):
     }
 
 
+def _same_slider_object(candidate, expected):
+    """Compare DAG nodes without letting a short name match a sibling rig."""
+    if not candidate or not expected:
+        return False
+    if candidate == expected:
+        return True
+    try:
+        candidate_long = (cmds.ls(candidate, long=True) or [candidate])[0]
+        expected_long = (cmds.ls(expected, long=True) or [expected])[0]
+        if candidate_long == expected_long:
+            return True
+    except Exception:
+        pass
+    # Namespace is significant.  Only use the leaf fallback when it is the
+    # complete leaf name, rather than a substring of another control.
+    return candidate.split('|')[-1] == expected.split('|')[-1]
+
+
+def _slider_attr_matches(candidate, requested):
+    """Match long/short Maya attributes without accepting a different plug."""
+    if not requested:
+        return True
+    candidate = str(candidate).split('[', 1)[0]
+    requested = str(requested).split('[', 1)[0]
+    candidate_names = set(normalize_attr_name(candidate))
+    requested_names = set(normalize_attr_name(requested))
+    return bool(candidate_names.intersection(requested_names))
+
+
+def _curve_keyframes(curve):
+    try:
+        return _as_unique_sorted_frames(cmds.keyframe(curve, query=True) or [])
+    except Exception:
+        return []
+
+
+def get_slider_target_records(objs=None, attrs=None, context=None,
+                              scalar_only=False):
+    """Return the exact slider targets for a gesture, curve first.
+
+    A Graph Editor selection owns the operation: every selected animCurve is
+    returned independently, including two layer curves that drive the same
+    visible attribute.  This prevents the old ``plug@frame`` cache from
+    merging distinct layers and avoids walking every keyable channel on a
+    dense production rig.
+    """
+    if context is None:
+        context = get_processing_context(explicit_attributes=attrs is not None)
+
+    objects = list(objs) if objs else (cmds.ls(selection=True, long=True) or [])
+    requested_attrs = list(attrs or [])
+    selected_channels = list(context.get('selected_channels') or [])
+    records = []
+    seen = set()
+
+    def include_plug(curve, plug, selected_frames=None):
+        if not plug or '.' not in plug:
+            return
+        obj, attr = plug.rsplit('.', 1)
+        attr = attr.split('[', 1)[0]
+        if objects and not any(_same_slider_object(obj, item) for item in objects):
+            return
+        if requested_attrs and not any(
+                _slider_attr_matches(attr, item) for item in requested_attrs):
+            return
+        if selected_channels and not any(
+                _slider_attr_matches(attr, item) for item in selected_channels):
+            return
+        if scalar_only:
+            try:
+                if cmds.getAttr(plug, type=True) in ('double3', 'float3'):
+                    return
+            except Exception:
+                return
+        identifier = (curve or plug, plug)
+        if identifier in seen:
+            return
+
+        keyframes = _curve_keyframes(curve) if curve else []
+        frames = _as_unique_sorted_frames(selected_frames)
+        if not frames:
+            frames = get_frames_to_process(
+                plug, keyframes, attr, context,
+                use_neighbor_keys_when_unkeyed=False,
+            )
+        if not frames:
+            return
+        seen.add(identifier)
+        records.append({
+            'curve': curve,
+            'attr_full': plug,
+            'attr': attr,
+            'object': obj,
+            'keyframes': keyframes,
+            'frames': frames,
+        })
+
+    graph_entries = get_graph_editor_curve_entries()
+    if graph_entries:
+        for entry in graph_entries:
+            curve = entry.get('curve')
+            for plug in entry.get('driven_plugs') or []:
+                include_plug(curve, plug, entry.get('frames') or [])
+        return records
+
+    # For Time Slider/current-frame edits use only animated curves on the
+    # selected controls.  The legacy path asked Maya about every keyable
+    # attribute even though unanimated channels cannot be slider targets.
+    candidate_curves = []
+    if objects:
+        try:
+            candidate_curves = cmds.keyframe(objects, query=True, name=True) or []
+        except Exception:
+            candidate_curves = []
+    for curve in dict.fromkeys(candidate_curves):
+        for plug in _anim_curve_driven_plugs(curve):
+            active_curve = get_curve_target(plug, attr=plug.rsplit('.', 1)[-1])
+            if active_curve and active_curve != plug and active_curve != curve:
+                continue
+            include_plug(curve, plug)
+
+    # An explicit Channel Box/API attribute may intentionally create a key on
+    # an otherwise unanimated plug.  Preserve that behavior without bringing
+    # back the full keyable-attribute scan for normal object selections.
+    if requested_attrs:
+        for obj in objects:
+            for attr in requested_attrs:
+                attr_full = '{}.{}'.format(obj, attr)
+                if cmds.objExists(attr_full):
+                    include_plug(None, attr_full)
+    return records
+
+
+def get_slider_candidate_attributes(obj, selected_channels=None, context=None,
+                                    scalar_only=False):
+    """Return only channels that can be affected by a slider gesture.
+
+    This is the inexpensive compatibility bridge for legacy slider modes.  It
+    keeps their existing math while replacing the costly per-control
+    ``listAttr(keyable=True)`` scan with the actual selected/animated curves.
+    """
+    candidates = []
+
+    def add(attr):
+        attr = (attr or '').split('[', 1)[0]
+        if not attr or attr in candidates:
+            return
+        attr_full = '{}.{}'.format(obj, attr)
+        if not cmds.objExists(attr_full):
+            return
+        if scalar_only:
+            try:
+                if cmds.getAttr(attr_full, type=True) in ('double3', 'float3'):
+                    return
+            except Exception:
+                return
+        candidates.append(attr)
+
+    graph_entries = get_graph_editor_curve_entries()
+    if graph_entries:
+        for entry in graph_entries:
+            for plug in entry.get('driven_plugs') or []:
+                if '.' not in plug:
+                    continue
+                driven_obj, attr = plug.rsplit('.', 1)
+                if _same_slider_object(driven_obj, obj):
+                    add(attr)
+        return candidates
+
+    if selected_channels:
+        for attr in selected_channels:
+            # Channel Box returns a valid user-facing attribute name. Maya's
+            # later attribute checks retain support for short aliases.
+            add(attr)
+        return candidates
+
+    try:
+        curves = cmds.keyframe(obj, query=True, name=True) or []
+    except Exception:
+        curves = []
+    for curve in dict.fromkeys(curves):
+        for plug in _anim_curve_driven_plugs(curve):
+            if '.' not in plug:
+                continue
+            driven_obj, attr = plug.rsplit('.', 1)
+            if _same_slider_object(driven_obj, obj):
+                add(attr)
+    return candidates
+
+
 def _as_unique_sorted_frames(frames):
     """Return sorted unique frame numbers while keeping Maya's float times."""
     unique = []
@@ -605,12 +800,17 @@ def get_infinity_type(attr_full, pre=True, attr=None):
 
 def get_selected_curve_for_attribute_frame(attr_full, frame, attr=None):
     """Return the selected animCurve that owns attr_full at frame, if any."""
+    cache_key = (attr_full, round(float(frame), 6), attr or '')
+    if cache_key in _SELECTED_CURVE_FRAME_CACHE:
+        return _SELECTED_CURVE_FRAME_CACHE[cache_key]
     for entry in _GRAPH_EDITOR_CURVE_ENTRIES:
         if not _curve_entry_matches_attribute(entry, attr_full, attr):
             continue
         for selected_frame in entry.get('frames') or []:
             if frame_matches(selected_frame, frame):
-                return entry.get('curve')
+                result = entry.get('curve')
+                _SELECTED_CURVE_FRAME_CACHE[cache_key] = result
+                return result
 
     # Channel Box and Time Slider workflows do not select Graph Editor keys.
     # In that case, use the curve owned by the active Animation Layer, but only
@@ -625,18 +825,27 @@ def get_selected_curve_for_attribute_frame(attr_full, frame, attr=None):
                 valueChange=True,
             ) or []
             if values:
+                _SELECTED_CURVE_FRAME_CACHE[cache_key] = active_curve
                 return active_curve
         except Exception:
             pass
+    _SELECTED_CURVE_FRAME_CACHE[cache_key] = None
     return None
 
 
 def get_selected_curve_for_attribute(attr_full, attr=None):
     """Return the Graph-selected or active-layer curve for an attribute."""
+    cache_key = (attr_full, attr or '')
+    if cache_key in _SELECTED_CURVE_CACHE:
+        return _SELECTED_CURVE_CACHE[cache_key]
     for entry in _GRAPH_EDITOR_CURVE_ENTRIES:
         if _curve_entry_matches_attribute(entry, attr_full, attr):
-            return entry.get('curve')
-    return _active_layer_target(attr_full)[1]
+            result = entry.get('curve')
+            _SELECTED_CURVE_CACHE[cache_key] = result
+            return result
+    result = _active_layer_target(attr_full)[1]
+    _SELECTED_CURVE_CACHE[cache_key] = result
+    return result
 
 
 def get_keyframes_for_attribute(attr_full, attr=None, context=None):
@@ -891,7 +1100,7 @@ def get_selection_outer_keyframes(all_keyframes, frames_to_process):
             min(next_keys) if next_keys else None)
 
 
-def get_value_at_time(attr_full, time):
+def get_value_at_time(attr_full, time, curve=None):
     """
     Get the value of an attribute at a specific time.
     
@@ -903,7 +1112,7 @@ def get_value_at_time(attr_full, time):
         Value at that time or None
     """
     try:
-        selected_curve = (
+        selected_curve = curve or (
             get_selected_curve_for_attribute_frame(attr_full, time) or
             get_selected_curve_for_attribute(attr_full)
         )
@@ -990,10 +1199,10 @@ def average_angles_degrees(values):
     return math.degrees(math.atan2(sine, cosine))
 
 
-def has_key_at_frame(attr_full, frame):
+def has_key_at_frame(attr_full, frame, curve=None):
     """Return True if an attribute has a keyed value at frame."""
     try:
-        selected_curve = (
+        selected_curve = curve or (
             get_selected_curve_for_attribute_frame(attr_full, frame) or
             get_selected_curve_for_attribute(attr_full)
         )
@@ -1013,7 +1222,7 @@ def has_key_at_frame(attr_full, frame):
         return False
 
 
-def apply_slider_value(attr_full, frame, value, current_time=None):
+def apply_slider_value(attr_full, frame, value, current_time=None, curve=None):
     """
     Apply a slider value to an existing key, or preview it on the current frame.
 
@@ -1021,6 +1230,28 @@ def apply_slider_value(attr_full, frame, value, current_time=None):
     with setAttr during dragging and baked by the slider reset step.
     """
     global _COMPOSITE_LAYER_PREVIEW_TARGETS
+
+    # A Graph Editor record names the exact animCurve to edit.  It must win
+    # over the currently preferred layer, otherwise two selected layer curves
+    # on one plug can be redirected into whichever layer Maya last selected.
+    if curve:
+        key_signature = (curve, round(float(frame), 6))
+        key_exists = _SLIDER_KEY_EXISTS_CACHE.get(key_signature)
+        if key_exists is None:
+            key_exists = bool(cmds.keyframe(
+                curve, query=True, time=(frame, frame), valueChange=True,
+            ) or [])
+            _SLIDER_KEY_EXISTS_CACHE[key_signature] = key_exists
+        if key_exists:
+            cmds.keyframe(curve, edit=True, time=(frame, frame), valueChange=value)
+        else:
+            cmds.setKeyframe(curve, time=(frame,), value=value)
+            _SLIDER_KEY_EXISTS_CACHE[key_signature] = True
+        try:
+            cmds.dgdirty(attr_full)
+        except Exception:
+            pass
+        return True
 
     active_layer, active_curve = _active_layer_target(attr_full)
     if (
@@ -1042,7 +1273,7 @@ def apply_slider_value(attr_full, frame, value, current_time=None):
                 pass
         return applied
 
-    selected_curve = (
+    selected_curve = curve or (
         get_selected_curve_for_attribute_frame(attr_full, frame) or
         get_selected_curve_for_attribute(attr_full)
     )
@@ -1118,7 +1349,7 @@ def apply_slider_value(attr_full, frame, value, current_time=None):
                 pass
         return applied
 
-    if has_key_at_frame(attr_full, frame):
+    if has_key_at_frame(attr_full, frame, curve=curve):
         cmds.keyframe(attr_full, edit=True, time=(frame, frame), valueChange=value)
         try:
             cmds.dgdirty(attr_full)
@@ -1140,9 +1371,9 @@ def apply_slider_value(attr_full, frame, value, current_time=None):
     return True
 
 
-def finalize_slider_value(attr_full, frame, value, current_time=None):
+def finalize_slider_value(attr_full, frame, value, current_time=None, curve=None):
     """Bake/finalize a slider value while respecting selected animLayer curves."""
-    selected_curve = (
+    selected_curve = curve or (
         get_selected_curve_for_attribute_frame(attr_full, frame) or
         get_selected_curve_for_attribute(attr_full)
     )
@@ -1173,7 +1404,7 @@ def finalize_slider_value(attr_full, frame, value, current_time=None):
             layer_name=active_layer,
         )
 
-    if has_key_at_frame(attr_full, frame):
+    if has_key_at_frame(attr_full, frame, curve=curve):
         cmds.keyframe(
             attr_full,
             edit=True,
@@ -1361,11 +1592,11 @@ def apply_worldspace_slider_values(updates):
     return applied
 
 
-def get_slider_value(attr_full, frame, current_time=None):
+def get_slider_value(attr_full, frame, current_time=None, curve=None):
     """Read a value from an existing key or from the current unkeyed frame."""
     values = None
     try:
-        selected_curve = (
+        selected_curve = curve or (
             get_selected_curve_for_attribute_frame(attr_full, frame) or
             get_selected_curve_for_attribute(attr_full)
         )

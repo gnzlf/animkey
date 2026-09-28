@@ -24,6 +24,8 @@ from AnimKey.sliders.slider_utils import (
     get_slider_value,
     get_selection_outer_keyframes,
     get_processing_context,
+    get_slider_candidate_attributes,
+    get_slider_target_records,
     get_value_at_time,
     should_process_attribute,
     slider_attribute_is_editable,
@@ -43,65 +45,47 @@ def prepare_blend_data(objs=None, attrs=None):
     _blend_neighbors_data_cache = {}
     
     _processing_context = get_processing_context(explicit_attributes=attrs is not None)
-    selected_channels = _processing_context.get('selected_channels')
-    
-    objects = objs if objs else cmds.ls(selection=True)
-    if not objects:
-        return _blend_neighbors_data_cache
-    
-    for obj in objects:
-        if not cmds.objExists(obj):
+    for target in get_slider_target_records(objs, attrs, _processing_context):
+        attr_full = target['attr_full']
+        curve = target['curve']
+        all_keyframes = target['keyframes']
+        frames_to_process = target['frames']
+        if len(all_keyframes) < 2:
             continue
-        
-        current_attrs = attrs if attrs else cmds.listAttr(obj, keyable=True)
-        if not current_attrs:
+        prev_frame, next_frame = get_selection_outer_keyframes(
+            all_keyframes, frames_to_process
+        )
+        prev_value = (
+            get_value_at_time(attr_full, prev_frame, curve=curve)
+            if prev_frame is not None else None
+        )
+        next_value = (
+            get_value_at_time(attr_full, next_frame, curve=curve)
+            if next_frame is not None else None
+        )
+        if isinstance(prev_value, (list, tuple)):
+            prev_value = None
+        if isinstance(next_value, (list, tuple)):
+            next_value = None
+        if prev_value is None and next_value is None:
             continue
-        
-        for attr in current_attrs:
-            if not should_process_attribute(obj, attr, selected_channels):
-                continue
-            
-            attr_full = f'{obj}.{attr}'
-            all_keyframes = get_keyframes_for_attribute(attr_full, attr, _processing_context)
-            
-            if len(all_keyframes) < 2:
-                continue
-            
-            frames_to_process = get_frames_to_process(
-                attr_full, all_keyframes, attr, _processing_context
-            )
-            if not frames_to_process:
-                continue
-            
-            prev_frame, next_frame = get_selection_outer_keyframes(all_keyframes, frames_to_process)
-            prev_value = get_value_at_time(attr_full, prev_frame) if prev_frame is not None else None
-            next_value = get_value_at_time(attr_full, next_frame) if next_frame is not None else None
-
-            if isinstance(prev_value, (list, tuple)):
-                prev_value = None
-            if isinstance(next_value, (list, tuple)):
-                next_value = None
-            if prev_value is None and next_value is None:
-                continue
-
-            for frame in frames_to_process:
-                try:
-                    # Get original value
-                    original_value = get_value_at_time(attr_full, frame)
-                    if isinstance(original_value, (list, tuple)):
-                        continue
-                    
-                    cache_key = f"{attr_full}@{frame}"
-                    _blend_neighbors_data_cache[cache_key] = {
-                        "originalValue": original_value,
-                        "prevValue": prev_value,
-                        "nextValue": next_value,
-                        "attr_full": attr_full,
-                        "frame": frame,
-                        "hasKeyframe": frame in all_keyframes
-                    }
-                except Exception:
+        for frame in frames_to_process:
+            try:
+                original_value = get_value_at_time(attr_full, frame, curve=curve)
+                if isinstance(original_value, (list, tuple)):
                     continue
+                cache_key = '{}@{}'.format(curve or attr_full, frame)
+                _blend_neighbors_data_cache[cache_key] = {
+                    "originalValue": original_value,
+                    "prevValue": prev_value,
+                    "nextValue": next_value,
+                    "attr_full": attr_full,
+                    "curve": curve,
+                    "frame": frame,
+                    "hasKeyframe": frame in all_keyframes,
+                }
+            except Exception:
+                continue
     
     return _blend_neighbors_data_cache
 
@@ -133,6 +117,7 @@ def execute(percentage):
     
     for cache_key, cache in _blend_neighbors_data_cache.items():
         attr_full = cache.get("attr_full")
+        curve = cache.get("curve")
         frame = cache.get("frame")
         has_keyframe = cache.get("hasKeyframe", False)
         
@@ -178,7 +163,9 @@ def execute(percentage):
             except:
                 pass
             
-            apply_slider_value(attr_full, frame, blended_value, current_time)
+            apply_slider_value(
+                attr_full, frame, blended_value, current_time, curve=curve
+            )
             
         except Exception:
             continue
@@ -194,13 +181,14 @@ def reset():
         for cache_key, cache_data in _blend_neighbors_data_cache.items():
             try:
                 attr_full = cache_data.get("attr_full")
+                curve = cache_data.get("curve")
                 frame = cache_data.get("frame")
                 has_keyframe = cache_data.get("hasKeyframe", False)
                 
                 if not attr_full:
                     continue
                 
-                current_value = get_slider_value(attr_full, frame, current_time)
+                current_value = get_slider_value(attr_full, frame, current_time, curve=curve)
                 
                 if isinstance(current_value, (list, tuple)):
                     if len(current_value) == 1:
@@ -208,7 +196,9 @@ def reset():
                     else:
                         continue
                 
-                finalize_slider_value(attr_full, frame, current_value, current_time)
+                finalize_slider_value(
+                    attr_full, frame, current_value, current_time, curve=curve
+                )
                 
             except Exception:
                 continue

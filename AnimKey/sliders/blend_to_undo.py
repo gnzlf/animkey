@@ -21,6 +21,7 @@ from AnimKey.sliders.slider_utils import (
     get_frames_to_process,
     get_keyframes_for_attribute,
     get_processing_context,
+    get_slider_candidate_attributes,
     get_slider_value,
     get_value_at_time,
     should_process_attribute,
@@ -63,7 +64,9 @@ def prepare_blend_data(objs=None, attrs=None):
         if not cmds.objExists(obj):
             continue
         
-        current_attrs = attrs if attrs else cmds.listAttr(obj, keyable=True)
+        current_attrs = attrs if attrs else get_slider_candidate_attributes(
+            obj, selected_channels, _processing_context
+        )
         if not current_attrs:
             continue
         

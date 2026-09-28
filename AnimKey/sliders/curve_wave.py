@@ -19,6 +19,8 @@ from AnimKey.sliders.slider_utils import (
     get_slider_value,
     get_selection_guide_frames,
     get_processing_context,
+    get_slider_candidate_attributes,
+    get_slider_target_records,
     get_value_at_time,
     should_process_attribute,
     slider_attribute_is_editable,
@@ -40,55 +42,30 @@ def prepare_curve_data(objs=None, attrs=None):
     _curve_data_cache = {}
     
     _processing_context = get_processing_context(explicit_attributes=attrs is not None)
-    selected_channels = _processing_context.get('selected_channels')
-    
-    objects = objs if objs else cmds.ls(selection=True)
-    if not objects:
-        return _curve_data_cache
-
-    for obj in objects:
-        if not cmds.objExists(obj):
-            continue
-        
-        current_attrs = attrs if attrs else cmds.listAttr(obj, keyable=True)
-        if not current_attrs:
-            continue
-        
-        for attr in current_attrs:
-            if not should_process_attribute(obj, attr, selected_channels):
-                continue
-            
-            attr_full = f'{obj}.{attr}'
-            all_keyframes = get_keyframes_for_attribute(attr_full, attr, _processing_context)
-            
-            frames_to_process = get_frames_to_process(
-                attr_full, all_keyframes, attr, _processing_context
-            )
-            if not frames_to_process:
-                continue
-            
-            first_frame, _ = get_selection_guide_frames(all_keyframes, frames_to_process)
-            if first_frame is None:
-                first_frame = min(frames_to_process)
-            
-            for frame in frames_to_process:
-                try:
-                    original_value = get_value_at_time(attr_full, frame)
-                    if isinstance(original_value, (list, tuple)):
-                        continue
-                    
-                    phase = (frame - first_frame) * WAVE_FREQUENCY * 0.1 * 2 * math.pi
-                    wave_offset = math.sin(phase)
-                    
-                    cache_key = f"{attr_full}@{frame}"
-                    _curve_data_cache[cache_key] = {
-                        "originalValue": original_value,
-                        "waveOffset": wave_offset,
-                        "attr_full": attr_full,
-                        "frame": frame
-                    }
-                except Exception:
+    for target in get_slider_target_records(objs, attrs, _processing_context):
+        attr_full = target['attr_full']
+        curve = target['curve']
+        frames_to_process = target['frames']
+        first_frame, _ = get_selection_guide_frames(
+            target['keyframes'], frames_to_process
+        )
+        first_frame = min(frames_to_process) if first_frame is None else first_frame
+        for frame in frames_to_process:
+            try:
+                original_value = get_value_at_time(attr_full, frame, curve=curve)
+                if isinstance(original_value, (list, tuple)):
                     continue
+                phase = (frame - first_frame) * WAVE_FREQUENCY * 0.1 * 2 * math.pi
+                cache_key = '{}@{}'.format(curve or attr_full, frame)
+                _curve_data_cache[cache_key] = {
+                    "originalValue": original_value,
+                    "waveOffset": math.sin(phase),
+                    "attr_full": attr_full,
+                    "curve": curve,
+                    "frame": frame,
+                }
+            except Exception:
+                continue
     
     return _curve_data_cache
 
@@ -110,6 +87,7 @@ def execute(percentage):
     
     for cache_key, cache in _curve_data_cache.items():
         attr_full = cache.get("attr_full")
+        curve = cache.get("curve")
         frame = cache.get("frame")
         
         if not attr_full:
@@ -128,7 +106,10 @@ def execute(percentage):
                 continue
             
             new_value = original_value + (wave_offset * amplitude)
-            apply_slider_value(attr_full, frame, new_value, _processing_context.get('current_time'))
+            apply_slider_value(
+                attr_full, frame, new_value,
+                _processing_context.get('current_time'), curve=curve,
+            )
             
         except Exception:
             continue
@@ -141,13 +122,19 @@ def reset():
         for cache_key, cache_data in _curve_data_cache.items():
             try:
                 attr_full = cache_data.get("attr_full")
+                curve = cache_data.get("curve")
                 frame = cache_data.get("frame")
                 
                 if not attr_full:
                     continue
                 
-                current_value = get_slider_value(attr_full, frame, _processing_context.get('current_time'))
-                finalize_slider_value(attr_full, frame, current_value, _processing_context.get('current_time'))
+                current_value = get_slider_value(
+                    attr_full, frame, _processing_context.get('current_time'), curve=curve
+                )
+                finalize_slider_value(
+                    attr_full, frame, current_value,
+                    _processing_context.get('current_time'), curve=curve,
+                )
             except Exception:
                 continue
     

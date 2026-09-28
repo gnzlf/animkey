@@ -23,6 +23,8 @@ from AnimKey.sliders.slider_utils import (
     get_slider_value,
     get_selection_guide_frames,
     get_processing_context,
+    get_slider_candidate_attributes,
+    get_slider_target_records,
     get_value_at_time,
     should_process_attribute,
     slider_attribute_is_editable,
@@ -76,9 +78,9 @@ def _bounded_lerp(original_value, target_value, amount):
     return max(lower, min(upper, value))
 
 
-def _capture_tangents(attr_full, frame):
+def _capture_tangents(attr_full, frame, curve=None):
     try:
-        target = get_curve_target(attr_full, frame)
+        target = curve or get_curve_target(attr_full, frame)
         return {
             "itt": (cmds.keyTangent(target, q=True, time=(frame, frame), itt=True) or [None])[0],
             "ott": (cmds.keyTangent(target, q=True, time=(frame, frame), ott=True) or [None])[0],
@@ -87,7 +89,7 @@ def _capture_tangents(attr_full, frame):
         return {}
 
 
-def _restore_tangents(attr_full, frame, tangent_data):
+def _restore_tangents(attr_full, frame, tangent_data, curve=None):
     if not tangent_data:
         return
     kwargs = {}
@@ -98,12 +100,12 @@ def _restore_tangents(attr_full, frame, tangent_data):
     if not kwargs:
         return
     try:
-        cmds.keyTangent(get_curve_target(attr_full, frame), edit=True, time=(frame, frame), **kwargs)
+        cmds.keyTangent(curve or get_curve_target(attr_full, frame), edit=True, time=(frame, frame), **kwargs)
     except Exception:
         pass
 
 
-def _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True):
+def _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True, curve=None):
     kwargs = {}
     if in_tangent:
         kwargs["itt"] = "plateau"
@@ -112,7 +114,7 @@ def _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True):
     if not kwargs:
         return
     try:
-        target = get_curve_target(attr_full, frame)
+        target = curve or get_curve_target(attr_full, frame)
         cmds.keyTangent(target, edit=True, time=(frame, frame), **kwargs)
     except Exception:
         try:
@@ -129,27 +131,29 @@ def _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True):
 def _apply_anti_overshoot_tangents(cache, direction):
     attr_full = cache.get("attr_full")
     frame = cache.get("frame")
+    curve = cache.get("curve")
     if not attr_full or frame is None:
         return
 
     if direction == "out":
-        _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True)
+        _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True, curve=curve)
         guide_frame = cache.get("easeOutGuideFrame")
         if guide_frame is not None:
-            _set_safe_tangent(attr_full, guide_frame, in_tangent=True, out_tangent=False)
+            _set_safe_tangent(attr_full, guide_frame, in_tangent=True, out_tangent=False, curve=curve)
     elif direction == "in":
-        _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True)
+        _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True, curve=curve)
         guide_frame = cache.get("easeInGuideFrame")
         if guide_frame is not None:
-            _set_safe_tangent(attr_full, guide_frame, in_tangent=False, out_tangent=True)
+            _set_safe_tangent(attr_full, guide_frame, in_tangent=False, out_tangent=True, curve=curve)
 
 
 def _restore_cached_tangents(cache):
     attr_full = cache.get("attr_full")
+    curve = cache.get("curve")
     if not attr_full:
         return
     for frame, tangent_data in cache.get("tangents", {}).items():
-        _restore_tangents(attr_full, frame, tangent_data)
+        _restore_tangents(attr_full, frame, tangent_data, curve=curve)
 
 
 def _proximity_for_frame_index(index, count, target_side):
@@ -166,79 +170,50 @@ def prepare_curve_data(objs=None, attrs=None):
     """Prepare curve data cache for ease in/out."""
     global _curve_data_cache, _processing_context
     _curve_data_cache = {}
-    
     _processing_context = get_processing_context(explicit_attributes=attrs is not None)
-    selected_channels = _processing_context.get('selected_channels')
-    
-    objects = objs if objs else cmds.ls(selection=True)
-    if not objects:
-        return _curve_data_cache
-
-    for obj in objects:
-        if not cmds.objExists(obj):
-            continue
-        
-        current_attrs = attrs if attrs else cmds.listAttr(obj, keyable=True)
-        if not current_attrs:
-            continue
-        
-        for attr in current_attrs:
-            if not should_process_attribute(obj, attr, selected_channels):
-                continue
-            
-            attr_full = f'{obj}.{attr}'
-            all_keyframes = get_keyframes_for_attribute(attr_full, attr, _processing_context)
-            
-            frames_to_process = get_frames_to_process(
-                attr_full, all_keyframes, attr, _processing_context
-            )
-            if not frames_to_process:
-                continue
-            
-            guide_start_frame, guide_end_frame = get_selection_guide_frames(
-                all_keyframes, frames_to_process
-            )
-            if guide_start_frame is None:
-                guide_start_frame = min(frames_to_process)
-            if guide_end_frame is None:
-                guide_end_frame = max(frames_to_process)
-            
-            start_value = get_value_at_time(attr_full, guide_start_frame)
-            end_value = get_value_at_time(attr_full, guide_end_frame)
-            
-            if isinstance(start_value, (list, tuple)):
-                start_value = start_value[0]
-            if isinstance(end_value, (list, tuple)):
-                end_value = end_value[0]
-            
-            sorted_frames = sorted(frames_to_process)
-            selected_count = len(sorted_frames)
-            
-            for frame_index, frame in enumerate(sorted_frames):
-                try:
-                    original_value = get_value_at_time(attr_full, frame)
-                    if isinstance(original_value, (list, tuple)):
-                        continue
-                    
-                    cache_key = f"{attr_full}@{frame}"
-                    _curve_data_cache[cache_key] = {
-                        "originalValue": original_value,
-                        "easeInTarget": start_value,
-                        "easeOutTarget": end_value,
-                        "easeInGuideFrame": guide_start_frame,
-                        "easeOutGuideFrame": guide_end_frame,
-                        "easeInProximity": _proximity_for_frame_index(frame_index, selected_count, "left"),
-                        "easeOutProximity": _proximity_for_frame_index(frame_index, selected_count, "right"),
-                        "attr_full": attr_full,
-                        "frame": frame,
-                        "tangents": {
-                            frame: _capture_tangents(attr_full, frame),
-                            guide_start_frame: _capture_tangents(attr_full, guide_start_frame),
-                            guide_end_frame: _capture_tangents(attr_full, guide_end_frame)
-                        }
-                    }
-                except Exception:
+    for target in get_slider_target_records(objs, attrs, _processing_context):
+        attr_full = target['attr_full']
+        curve = target['curve']
+        frames_to_process = target['frames']
+        guide_start_frame, guide_end_frame = get_selection_guide_frames(
+            target['keyframes'], frames_to_process
+        )
+        if guide_start_frame is None:
+            guide_start_frame = min(frames_to_process)
+        if guide_end_frame is None:
+            guide_end_frame = max(frames_to_process)
+        start_value = get_value_at_time(attr_full, guide_start_frame, curve=curve)
+        end_value = get_value_at_time(attr_full, guide_end_frame, curve=curve)
+        if isinstance(start_value, (list, tuple)):
+            start_value = start_value[0]
+        if isinstance(end_value, (list, tuple)):
+            end_value = end_value[0]
+        sorted_frames = sorted(frames_to_process)
+        for frame_index, frame in enumerate(sorted_frames):
+            try:
+                original_value = get_value_at_time(attr_full, frame, curve=curve)
+                if isinstance(original_value, (list, tuple)):
                     continue
+                cache_key = '{}@{}'.format(curve or attr_full, frame)
+                _curve_data_cache[cache_key] = {
+                    "originalValue": original_value,
+                    "easeInTarget": start_value,
+                    "easeOutTarget": end_value,
+                    "easeInGuideFrame": guide_start_frame,
+                    "easeOutGuideFrame": guide_end_frame,
+                    "easeInProximity": _proximity_for_frame_index(frame_index, len(sorted_frames), "left"),
+                    "easeOutProximity": _proximity_for_frame_index(frame_index, len(sorted_frames), "right"),
+                    "attr_full": attr_full,
+                    "curve": curve,
+                    "frame": frame,
+                    "tangents": {
+                        frame: _capture_tangents(attr_full, frame, curve=curve),
+                        guide_start_frame: _capture_tangents(attr_full, guide_start_frame, curve=curve),
+                        guide_end_frame: _capture_tangents(attr_full, guide_end_frame, curve=curve),
+                    },
+                }
+            except Exception:
+                continue
     
     return _curve_data_cache
 
@@ -261,6 +236,7 @@ def execute(percentage):
     
     for cache_key, cache in _curve_data_cache.items():
         attr_full = cache.get("attr_full")
+        curve = cache.get("curve")
         frame = cache.get("frame")
         
         if not attr_full:
@@ -294,7 +270,10 @@ def execute(percentage):
                 continue
 
             new_value = _bounded_lerp(original_value, target_value, key_amount)
-            apply_slider_value(attr_full, frame, new_value, _processing_context.get('current_time'))
+            apply_slider_value(
+                attr_full, frame, new_value,
+                _processing_context.get('current_time'), curve=curve,
+            )
             if tangent_direction:
                 _apply_anti_overshoot_tangents(cache, tangent_direction)
             else:
@@ -312,13 +291,19 @@ def reset():
         for cache_key, cache_data in _curve_data_cache.items():
             try:
                 attr_full = cache_data.get("attr_full")
+                curve = cache_data.get("curve")
                 frame = cache_data.get("frame")
                 
                 if not attr_full:
                     continue
                 
-                current_value = get_slider_value(attr_full, frame, _processing_context.get('current_time'))
-                finalize_slider_value(attr_full, frame, current_value, _processing_context.get('current_time'))
+                current_value = get_slider_value(
+                    attr_full, frame, _processing_context.get('current_time'), curve=curve
+                )
+                finalize_slider_value(
+                    attr_full, frame, current_value,
+                    _processing_context.get('current_time'), curve=curve,
+                )
             except Exception:
                 continue
     

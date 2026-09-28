@@ -321,12 +321,15 @@ def _layered_plug_for_attr(attr_full_name, layer_name):
         try:
             conns = cmds.listConnections(
                 attr_full_name,
-                type="animBlendNodeBase",
                 source=True,
                 destination=False,
             ) or []
         except Exception:
             conns = []
+        conns = [
+            node for node in conns
+            if (cmds.nodeType(node) or "").startswith("animBlendNode")
+        ]
         if not conns:
             return attr_full_name
 
@@ -335,12 +338,15 @@ def _layered_plug_for_attr(attr_full_name, layer_name):
             try:
                 upstream = cmds.listConnections(
                     blend_node,
-                    type="animBlendNodeBase",
                     source=True,
                     destination=False,
                 ) or []
             except Exception:
                 upstream = []
+            upstream = [
+                node for node in upstream
+                if (cmds.nodeType(node) or "").startswith("animBlendNode")
+            ]
             if not upstream:
                 break
             blend_node = upstream[0]
@@ -520,9 +526,13 @@ def resolve_target_curve_for_layer(attr_full_name, layer_name,
                     continue
         return curves[0] if curves else None
 
-    native_curve = _find_curve_for_layer_plug(attr_full_name, layer_name)
-    if native_curve:
-        return native_curve
+    # Maya's findCurveForPlug can return an animLayer input curve even when
+    # queried through BaseAnimation.  Resolve the base branch explicitly so
+    # copy/paste and sliders never confuse BaseAnimation with inputB.
+    if not _is_base_layer(layer_name):
+        native_curve = _find_curve_for_layer_plug(attr_full_name, layer_name)
+        if native_curve:
+            return native_curve
 
     plug = _layered_plug_for_attr(attr_full_name, layer_name)
     if not plug:

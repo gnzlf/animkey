@@ -17,6 +17,8 @@ from AnimKey.sliders.slider_utils import (
     get_slider_value,
     get_previous_next_keyframes,
     get_processing_context,
+    get_slider_candidate_attributes,
+    get_slider_target_records,
     get_value_at_time,
     should_process_attribute,
     slider_attribute_is_editable,
@@ -33,70 +35,41 @@ def prepare_curve_data(objs=None, attrs=None):
     _curve_data_cache = {}
     
     _processing_context = get_processing_context(explicit_attributes=attrs is not None)
-    selected_channels = _processing_context.get('selected_channels')
-    
-    objects = objs if objs else cmds.ls(selection=True)
-    if not objects:
-        return _curve_data_cache
-
-    for obj in objects:
-        if not cmds.objExists(obj):
-            continue
-        
-        current_attrs = attrs if attrs else cmds.listAttr(obj, keyable=True)
-        if not current_attrs:
-            continue
-        
-        for attr in current_attrs:
-            if not should_process_attribute(obj, attr, selected_channels):
-                continue
-            
-            attr_full = f'{obj}.{attr}'
-            all_keyframes = get_keyframes_for_attribute(attr_full, attr, _processing_context)
-            
-            frames_to_process = get_frames_to_process(
-                attr_full, all_keyframes, attr, _processing_context
+    for target in get_slider_target_records(objs, attrs, _processing_context):
+        attr_full = target['attr_full']
+        curve = target['curve']
+        frames_to_process = target['frames']
+        average_frames = list(frames_to_process)
+        if len(average_frames) == 1:
+            prev_frame, next_frame = get_previous_next_keyframes(
+                target['keyframes'], average_frames[0]
             )
-            if not frames_to_process:
-                continue
-            
-            average_frames = list(frames_to_process)
-            if len(average_frames) == 1:
-                prev_frame, next_frame = get_previous_next_keyframes(all_keyframes, average_frames[0])
-                if prev_frame is not None:
-                    average_frames.append(prev_frame)
-                if next_frame is not None:
-                    average_frames.append(next_frame)
-
-            values = []
-            for frame in average_frames:
-                try:
-                    val = get_value_at_time(attr_full, frame)
-                    if not isinstance(val, (list, tuple)):
-                        values.append(val)
-                except:
-                    pass
-            
-            if not values:
-                continue
-            
-            average_value = sum(values) / len(values)
-            
-            for frame in frames_to_process:
-                try:
-                    original_value = get_value_at_time(attr_full, frame)
-                    if isinstance(original_value, (list, tuple)):
-                        continue
-                    
-                    cache_key = f"{attr_full}@{frame}"
-                    _curve_data_cache[cache_key] = {
-                        "originalValue": original_value,
-                        "averageValue": average_value,
-                        "attr_full": attr_full,
-                        "frame": frame
-                    }
-                except Exception:
+            average_frames.extend(
+                frame for frame in (prev_frame, next_frame) if frame is not None
+            )
+        values = []
+        for frame in average_frames:
+            value = get_value_at_time(attr_full, frame, curve=curve)
+            if value is not None and not isinstance(value, (list, tuple)):
+                values.append(value)
+        if not values:
+            continue
+        average_value = sum(values) / len(values)
+        for frame in frames_to_process:
+            try:
+                original_value = get_value_at_time(attr_full, frame, curve=curve)
+                if isinstance(original_value, (list, tuple)):
                     continue
+                cache_key = '{}@{}'.format(curve or attr_full, frame)
+                _curve_data_cache[cache_key] = {
+                    "originalValue": original_value,
+                    "averageValue": average_value,
+                    "attr_full": attr_full,
+                    "curve": curve,
+                    "frame": frame,
+                }
+            except Exception:
+                continue
     
     return _curve_data_cache
 
@@ -118,6 +91,7 @@ def execute(percentage):
     
     for cache_key, cache in _curve_data_cache.items():
         attr_full = cache.get("attr_full")
+        curve = cache.get("curve")
         frame = cache.get("frame")
         
         if not attr_full:
@@ -136,7 +110,10 @@ def execute(percentage):
                 continue
             
             new_value = original_value + (average_value - original_value) * blend_factor
-            apply_slider_value(attr_full, frame, new_value, _processing_context.get('current_time'))
+            apply_slider_value(
+                attr_full, frame, new_value,
+                _processing_context.get('current_time'), curve=curve,
+            )
             
         except Exception:
             continue
@@ -149,13 +126,19 @@ def reset():
         for cache_key, cache_data in _curve_data_cache.items():
             try:
                 attr_full = cache_data.get("attr_full")
+                curve = cache_data.get("curve")
                 frame = cache_data.get("frame")
                 
                 if not attr_full:
                     continue
                 
-                current_value = get_slider_value(attr_full, frame, _processing_context.get('current_time'))
-                finalize_slider_value(attr_full, frame, current_value, _processing_context.get('current_time'))
+                current_value = get_slider_value(
+                    attr_full, frame, _processing_context.get('current_time'), curve=curve
+                )
+                finalize_slider_value(
+                    attr_full, frame, current_value,
+                    _processing_context.get('current_time'), curve=curve,
+                )
             except Exception:
                 continue
     
