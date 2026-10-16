@@ -469,6 +469,7 @@ def _capture_temp_pivot_state(objects):
         "objects": list(objects),
         "object_pivots": object_pivots,
         "activation_time": float(cmds.currentTime(query=True)),
+        "target_layer": _temp_pivot_target_layer(),
         "transform_curve_state": _capture_temp_pivot_curve_state(objects),
         "tool_context": cmds.currentCtx(),
         "manip_valid": manip_valid,
@@ -762,6 +763,7 @@ def _bake_temp_pivot_compensation(state):
         return None, 0
 
     times = _temp_pivot_sample_times(objects, state=state)
+    state["compensation_range"] = (min(times), max(times))
     world_samples = _sample_temp_pivot_world_matrices(objects, times)
     selected_layers = _capture_anim_layer_selection()
     current_time = cmds.currentTime(query=True)
@@ -779,7 +781,81 @@ def _bake_temp_pivot_compensation(state):
         key_count = _key_temp_bake_layer(
             layer, final_samples, base_samples, min(times), max(times)
         )
+        if not key_count:
+            cmds.delete(layer)
+            return None, 0
         return layer, key_count
+    finally:
+        cmds.currentTime(current_time, edit=True)
+        _restore_anim_layer_selection(selected_layers)
+
+
+def _temp_pivot_target_layer():
+    from AnimKey.core.animation_curve_transfer import active_animation_layer
+    return active_animation_layer() or "BaseAnimation"
+
+
+def _merge_temp_pivot_compensation(layer, state):
+    """Smart-bake only TEMP's interval into its original keying layer."""
+    from AnimKey.core import animation_curve_transfer as transfer
+    if not layer or not cmds.objExists(layer):
+        return layer
+    destination = state.get("target_layer") or "BaseAnimation"
+    if not cmds.objExists(destination) or cmds.getAttr(destination + ".lock"):
+        cmds.warning("Temp Pivot: destination unavailable; compensation layer retained.")
+        return layer
+    attributes = cmds.animLayer(layer, query=True, attribute=True) or []
+    if not attributes:
+        return layer
+    start, end = state["compensation_range"]
+    selected_layers = _capture_anim_layer_selection()
+    current_time = cmds.currentTime(query=True)
+    originals = {}
+    try:
+        # Include neutral boundary keys so the compensation cannot leak out
+        # through curve extrapolation. Other layers and their keys stay intact.
+        if destination != "BaseAnimation":
+            for plug in attributes:
+                cmds.animLayer(destination, edit=True, attribute=plug)
+        for plug in attributes:
+            curve = transfer.resolve_anim_curve(plug, layer_name=destination)
+            if curve:
+                for boundary in (start - 1.0, end + 1.0):
+                    cmds.setKeyframe(curve, time=boundary, insert=True)
+                originals[plug] = transfer.capture_curve(curve, layer_name=destination)
+        result = cmds.bakeResults(
+            attributes, time=(start - 1.0, end + 1.0),
+            simulation=False, disableImplicitControl=False,
+            destinationLayer=destination, resolveWithoutLayer=[destination, layer],
+            preserveOutsideKeys=True, removeBakedAttributeFromLayer=False,
+            sampleBy=1.0, oversamplingRate=1, smart=(True, 0.1),
+        )
+        if not result:
+            raise RuntimeError("Maya did not bake any channels")
+        for plug, original in originals.items():
+            if not original:
+                continue
+            baked = transfer.capture_curve(plug, time_range=(start - 1.0, end + 1.0),
+                                           layer_name=destination)
+            if not baked:
+                raise RuntimeError("Missing baked curve: " + plug)
+            # Maya's layered bake can replace the whole destination curve even
+            # with preserveOutsideKeys. Restore it, then splice only this clip.
+            for boundary, side in ((start - 1.0, "in"), (end + 1.0, "out")):
+                if boundary not in baked["keyframes"] or boundary not in original["keyframes"]:
+                    continue
+                i = baked["keyframes"].index(boundary)
+                j = original["keyframes"].index(boundary)
+                baked["tangents_locked"][i] = False
+                for suffix in ("types", "x", "y"):
+                    key = "tangent_{}_{}".format(side, suffix)
+                    baked[key][i] = original[key][j]
+            restored, _ = transfer.paste_curve(plug, original, layer_name=destination, clear_all=True)
+            pasted, _ = transfer.paste_curve(plug, baked, layer_name=destination)
+            if not restored or not pasted:
+                raise RuntimeError("Could not preserve destination keys: " + plug)
+        cmds.delete(layer)
+        return destination
     finally:
         cmds.currentTime(current_time, edit=True)
         _restore_anim_layer_selection(selected_layers)
@@ -1015,6 +1091,8 @@ def deactivate_temp_pivot():
             restore_state.get("objects", []), pivot_position
         )
         layer, keyed_channels = _bake_temp_pivot_compensation(restore_state)
+        if layer and keyed_channels:
+            layer = _merge_temp_pivot_compensation(layer, restore_state)
         restore_state["pivots_finalized"] = True
 
         cmds.manipPivot(pinPivot=False)
@@ -1265,6 +1343,17 @@ def _key_temp_bake_layer(layer, final_samples, base_samples, start_frame, end_fr
 
             previous_delta = None
             is_rotate = attr.startswith("rotate")
+            deltas = []
+            for frame, final_value in values:
+                if frame not in base_values:
+                    continue
+                delta = (_shortest_angle_delta(final_value, base_values[frame], previous_delta)
+                         if is_rotate else final_value - base_values[frame])
+                previous_delta = delta
+                deltas.append((frame, delta))
+            if not any(abs(delta) > 1e-8 for _, delta in deltas):
+                cmds.animLayer(layer, edit=True, removeAttribute=obj + "." + attr)
+                continue
 
             for guard_frame in guard_frames:
                 try:
@@ -1279,16 +1368,7 @@ def _key_temp_bake_layer(layer, final_samples, base_samples, start_frame, end_fr
                 except Exception:
                     pass
 
-            for frame, final_value in values:
-                if frame not in base_values:
-                    continue
-                base_value = base_values[frame]
-                if is_rotate:
-                    delta = _shortest_angle_delta(final_value, base_value, previous_delta)
-                    previous_delta = delta
-                else:
-                    delta = final_value - base_value
-
+            for frame, delta in deltas:
                 try:
                     cmds.setKeyframe(
                         obj,

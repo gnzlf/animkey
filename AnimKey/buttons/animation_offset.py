@@ -2364,7 +2364,8 @@ def _execute_session_v2(button=None):
     new_session = OffsetSession()
 
     try:
-        new_session.start(selection, time_range, target_layer=target_layer)
+        new_session.start(selection, time_range, target_layer=target_layer,
+                          follow_layer_selection=True)
     except RuntimeError:
         if _has_any_animation_layers():
             cmds.warning(

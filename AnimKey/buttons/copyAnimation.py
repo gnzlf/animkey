@@ -10,6 +10,7 @@ import maya.cmds as cmds
 import maya.mel as mel
 import os
 import json
+import copy
 import re
 import threading
 from datetime import datetime
@@ -230,18 +231,30 @@ def _capture_layer_state(layer_name):
     if curve_transfer.is_base_layer(layer_name):
         return {"name": "BaseAnimation", "base": True}
     state = {"name": layer_name, "base": False}
-    for flag in ("override", "weight", "mute", "solo", "lock"):
+    for flag in ("override", "weight", "mute", "solo", "lock", "parent", "passthrough"):
         try:
             state[flag] = cmds.animLayer(layer_name, query=True, **{flag: True})
         except Exception:
             pass
+    for attr in ("rotationAccumulationMode", "scaleAccumulationMode"):
+        if cmds.objExists(layer_name + "." + attr):
+            state[attr] = cmds.getAttr(layer_name + "." + attr)
+    weight_curves = cmds.listConnections(layer_name + ".weight", source=True,
+                                         destination=False, type="animCurve") or []
+    if weight_curves:
+        state["weight_curve"] = curve_transfer.capture_curve(
+            weight_curves[0], layer_name="BaseAnimation")
     return state
 
 
 def _remember_layer_state(layer_name):
     if not layer_name:
         layer_name = "BaseAnimation"
-    _anim_layer_metadata[layer_name] = _capture_layer_state(layer_name)
+    if layer_name not in _anim_layer_metadata:
+        _anim_layer_metadata[layer_name] = _capture_layer_state(layer_name)
+        parent = _anim_layer_metadata[layer_name].get("parent")
+        if parent and parent != layer_name:
+            _remember_layer_state(parent)
 
 
 def _ensure_target_layer(layer_name):
@@ -258,6 +271,12 @@ def _ensure_target_layer(layer_name):
                 cmds.animLayer(layer_name)
             except Exception:
                 return None
+        parent = state.get("parent")
+        if parent and parent != layer_name and not curve_transfer.is_base_layer(parent):
+            # The child already exists, so even malformed cyclic metadata
+            # cannot recurse forever. Maya rejects an invalid parent change.
+            if _ensure_target_layer(parent):
+                cmds.animLayer(layer_name, edit=True, parent=parent)
     # A locked copied layer cannot receive curves. Restore its lock only once
     # transfers are complete.
     try:
@@ -267,17 +286,32 @@ def _ensure_target_layer(layer_name):
     return layer_name
 
 
-def _restore_layer_state(layer_name):
+def _restore_layer_state(layer_name, time_offset=0.0, _seen=None):
     if curve_transfer.is_base_layer(layer_name):
         return
+    _seen = set() if _seen is None else _seen
+    if layer_name in _seen:
+        return
+    _seen.add(layer_name)
     state = _anim_layer_metadata.get(layer_name, {})
-    for flag in ("weight", "mute", "solo", "lock"):
+    for flag in ("override", "weight", "mute", "solo", "passthrough"):
         if flag not in state:
             continue
         try:
             cmds.animLayer(layer_name, edit=True, **{flag: state[flag]})
         except Exception:
             pass
+    for attr in ("rotationAccumulationMode", "scaleAccumulationMode"):
+        if attr in state and cmds.objExists(layer_name + "." + attr):
+            cmds.setAttr(layer_name + "." + attr, state[attr])
+    if state.get("weight_curve"):
+        curve_transfer.paste_curve(layer_name + ".weight", state["weight_curve"],
+                                   layer_name="BaseAnimation", time_offset=time_offset)
+    if "lock" in state:
+        cmds.animLayer(layer_name, edit=True, lock=state["lock"])
+    parent = state.get("parent")
+    if parent and not curve_transfer.is_base_layer(parent) and cmds.objExists(parent):
+        _restore_layer_state(parent, time_offset=time_offset, _seen=_seen)
 
 
 def _build_animation_transfers(assignments, animation_data):
@@ -779,9 +813,16 @@ def collect_animation_for_controls(controls, time_range=None, layer_name=None,
                                    all_layers=False):
     """Capture selected controls with one curve query instead of per-attribute scans."""
     controls = list_selected_transform_targets(controls)
+    controls = cmds.ls(controls, long=True, type="transform") if controls else []
     if not controls:
         return {}, {}
     layer_name = curve_transfer.active_animation_layer() if layer_name is None else layer_name
+    layer_by_curve = {}
+    for candidate_layer in cmds.ls(type="animLayer") or []:
+        if curve_transfer.is_base_layer(candidate_layer):
+            continue
+        for curve in cmds.animLayer(candidate_layer, query=True, animCurves=True) or []:
+            layer_by_curve[curve] = candidate_layer
     try:
         candidate_curves = cmds.keyframe(controls, query=True, name=True) or []
     except Exception:
@@ -790,15 +831,7 @@ def collect_animation_for_controls(controls, time_range=None, layer_name=None,
         # Maya's attribute query often exposes only the currently composed
         # layer curve.  Include concrete curves owned by every layer, then
         # resolve the BaseAnimation counterpart from their driven plug below.
-        for candidate_layer in cmds.ls(type="animLayer") or []:
-            if curve_transfer.is_base_layer(candidate_layer):
-                continue
-            try:
-                candidate_curves.extend(
-                    cmds.animLayer(candidate_layer, query=True, animCurves=True) or []
-                )
-            except Exception:
-                pass
+        candidate_curves.extend(layer_by_curve)
     curves = list(dict.fromkeys(candidate_curves)) if all_layers else _curves_on_layer(
         candidate_curves, layer_name
     )
@@ -810,6 +843,7 @@ def collect_animation_for_controls(controls, time_range=None, layer_name=None,
     source_controls = {}
     curve_index = 0
     seen_curves = set()
+    captured_layers = set()
     while curve_index < len(curves):
         curve = curves[curve_index]
         curve_index += 1
@@ -831,10 +865,7 @@ def collect_animation_for_controls(controls, time_range=None, layer_name=None,
             attr_path = "{}.{}".format(control, channel)
             if not cmds.objExists(attr_path):
                 continue
-            source_layer = (
-                curve_transfer.animation_layer_for_curve(attr_path, curve)
-                or "BaseAnimation"
-            )
+            source_layer = layer_by_curve.get(curve, "BaseAnimation")
             requested_layer = layer_name or "BaseAnimation"
             if not all_layers and source_layer != requested_layer:
                 continue
@@ -853,7 +884,14 @@ def collect_animation_for_controls(controls, time_range=None, layer_name=None,
                 continue
             ctrl_key = get_control_storage_key(control)
             _store_curve_payload(animation_data, ctrl_key, channel, snapshot)
-            _remember_layer_state(source_layer)
+            if source_layer not in captured_layers:
+                _anim_layer_metadata[source_layer] = _capture_layer_state(source_layer)
+                captured_layers.add(source_layer)
+                parent = _anim_layer_metadata[source_layer].get("parent")
+                while parent and parent not in captured_layers:
+                    _anim_layer_metadata[parent] = _capture_layer_state(parent)
+                    captured_layers.add(parent)
+                    parent = _anim_layer_metadata[parent].get("parent")
             source_controls[ctrl_key] = control
             break
     return animation_data, source_controls
@@ -1500,7 +1538,7 @@ def apply_animation_data_to_scene(
             )
             applied += sum(1 for result in results if result)
             skipped += sum(1 for result in results if not result)
-            _restore_layer_state(target_layer)
+            _restore_layer_state(target_layer, time_offset=float(time_offset or 0.0))
     finally:
         if refresh_suspended:
             try:
@@ -1514,7 +1552,7 @@ def apply_animation_data_to_scene(
 
 def load_animation_file(file_path):
     """Load an animation file and return meta and animation payload."""
-    with open(file_path, "r") as f:
+    with open(file_path, "r", encoding="utf-8-sig") as f:
         data = json.load(f)
     meta = data.get("meta", {})
     animation_data = data.get("animation", data)
@@ -1641,23 +1679,32 @@ def list_animation_library_entries():
     return entries
 
 
+_pending_json_writes = {}
+
+
 def _schedule_json_write(file_path, data, indent=None, on_written=None):
     """Persist pure Python data off Maya's UI thread, keeping newest-write wins."""
     global _json_write_generation
     generation = _json_write_generation.get(file_path, 0) + 1
     _json_write_generation[file_path] = generation
+    _pending_json_writes[file_path] = generation
+    # The clipboard dictionaries are cleared/reused by the next copy.
+    data = copy.deepcopy(data)
 
     def _writer():
         with _json_write_lock:
-            if generation < _json_write_generation.get(file_path, 0):
-                return
             try:
+                if generation < _json_write_generation.get(file_path, 0):
+                    return
                 atomic_write_json(file_path, data, indent=indent)
                 mtime = os.path.getmtime(file_path)
                 if on_written:
                     on_written(mtime)
             except Exception:
                 pass
+            finally:
+                if _pending_json_writes.get(file_path) == generation:
+                    _pending_json_writes.pop(file_path, None)
 
     worker = threading.Thread(
         target=_writer,
@@ -1674,8 +1721,11 @@ def _export_buffer_to_disk(save_to_library=False):
         _buffer_is_current = True
         json_path = get_copy_paste_animation_file()
         try:
-            if os.path.exists(json_path):
-                os.remove(json_path)
+            with _json_write_lock:
+                _json_write_generation[json_path] = _json_write_generation.get(json_path, 0) + 1
+                _pending_json_writes.pop(json_path, None)
+                if os.path.exists(json_path):
+                    os.remove(json_path)
         except Exception:
             pass
         return
@@ -1700,16 +1750,19 @@ def _export_buffer_to_disk(save_to_library=False):
     os.makedirs(os.path.dirname(json_path), exist_ok=True)
     try:
         if save_to_library:
-            atomic_write_json(json_path, animation_data, indent=None)
-            _last_disk_mtime = os.path.getmtime(json_path)
+            with _json_write_lock:
+                _json_write_generation[json_path] = _json_write_generation.get(json_path, 0) + 1
+                atomic_write_json(json_path, animation_data, indent=None)
+                _last_disk_mtime = os.path.getmtime(json_path)
+                _pending_json_writes.pop(json_path, None)
             # Also save to library/backup folder
             backup_folder = get_animation_backup_folder()
             latest_backup = get_latest_animation_backup_file()
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             snapshot_backup = os.path.join(backup_folder, f"anim_backup_{timestamp}.animkey_anim")
 
-            atomic_write_json(latest_backup, animation_data, indent=2)
-            atomic_write_json(snapshot_backup, animation_data, indent=2)
+            atomic_write_json(latest_backup, animation_data, indent=None)
+            atomic_write_json(snapshot_backup, animation_data, indent=None)
             
             # If library window is open, refresh it
             global _library_window
@@ -1741,12 +1794,12 @@ def _sync_buffer_from_disk():
         
     try:
         mtime = os.path.getmtime(json_path)
-        if _buffer_is_current and not _last_disk_mtime:
+        if _buffer_is_current and (json_path in _pending_json_writes or not _last_disk_mtime):
             return
         if _anim_buffer and _last_disk_mtime and mtime <= _last_disk_mtime:
             return
             
-        with open(json_path, "r") as f:
+        with open(json_path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
             
         animation_data = data.get("animation", data)
@@ -2270,11 +2323,16 @@ def _do_save_to_library(file_name, start_frame, end_frame, capture_gif=False, an
 
     # Collect animation data from the scene (no buffer nodes needed)
     time_range = (start_frame, end_frame)
-    animation_payload, _ = collect_animation_for_controls(
-        selected,
-        time_range=time_range,
-        layer_name=curve_transfer.active_animation_layer(),
-    )
+    clipboard_metadata = dict(_anim_layer_metadata)
+    try:
+        _anim_layer_metadata.clear()
+        animation_payload, _ = collect_animation_for_controls(
+            selected, time_range=time_range, all_layers=True,
+        )
+        saved_metadata = copy.deepcopy(_anim_layer_metadata)
+    finally:
+        _anim_layer_metadata.clear()
+        _anim_layer_metadata.update(clipboard_metadata)
 
     if not animation_payload:
         cmds.warning("AnimKey: No animation found on selected controls in the given range.")
@@ -2288,7 +2346,8 @@ def _do_save_to_library(file_name, start_frame, end_frame, capture_gif=False, an
             "controls_count": len(animation_payload),
             "scene": cmds.file(query=True, sceneName=True, shortName=True) or "untitled",
             "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "format_version": 3,
+            "format_version": 4,
+            "layers": saved_metadata,
             "source_layer": curve_transfer.active_animation_layer(),
             "source_controls": {
                 ctrl_key: {
@@ -2311,7 +2370,7 @@ def _do_save_to_library(file_name, start_frame, end_frame, capture_gif=False, an
         timestamp = datetime.now().strftime("%H%M%S")
         file_path = os.path.join(backup_folder, f"{file_name}_{timestamp}.animkey_anim")
 
-    atomic_write_json(file_path, save_data, indent=2)
+    atomic_write_json(file_path, save_data, indent=None)
 
     # Optionally capture GIF preview
     gif_path = None
@@ -3114,7 +3173,7 @@ def _paste_clip_to_targets(target_map, time_offset=0.0, clear_existing=True):
         )
         pasted_count += sum(1 for result in results if result)
         skipped_count += sum(1 for result in results if not result)
-        _restore_layer_state(target_layer)
+        _restore_layer_state(target_layer, time_offset=time_offset)
     return pasted_count, skipped_count
 
 

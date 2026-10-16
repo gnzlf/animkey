@@ -2878,6 +2878,7 @@ class FlowContainer(QtWidgets.QWidget):
     def clear_all(self):
         had_selection = bool(self.selected_buttons())
         for b in self.buttons[:]:
+            b.hide()
             b.deleteLater()
         self.buttons = []
         self.active_color_filters = []
@@ -3768,6 +3769,7 @@ class TabPage(QtWidgets.QWidget):
         }
         
     def load_data(self, data):
+        self.container.clear_all()
         self.namespace_dynamic = bool(data.get("namespace_dynamic", False))
         self._update_namespace_lock_button()
         self.set_namespace(data.get("namespace", ""))
@@ -3800,8 +3802,9 @@ class TabPage(QtWidgets.QWidget):
                 board_shape=s.get("board_shape", "rounded"),
                 board_locked=s.get("board_locked", False),
             )
-            self.container.add_button(btn)
+            self.container.add_button(btn, reflow=False, notify_colors=False)
         self.container.reflow()
+        self.container.colors_changed.emit()
 
 
 # ============================================================================
@@ -3990,6 +3993,7 @@ class TabBarWidget(QtWidgets.QWidget):
         """Remove all tab widgets so imported data can rebuild the UI cleanly."""
         for button in self.tab_buttons:
             self.tabs_layout.removeWidget(button)
+            button.hide()
             button.deleteLater()
         self.tab_buttons = []
         self.current_index = -1
@@ -4315,6 +4319,8 @@ class SetManagerWindow(QtWidgets.QWidget):
         
     def save_data(self):
         """Save sets data to the scene's animkey_sets container"""
+        if getattr(self, '_loading_data', False):
+            return
         _save_to_scene(self.serialized_data())
 
     def serialized_data(self):
@@ -4350,6 +4356,7 @@ class SetManagerWindow(QtWidgets.QWidget):
             except Exception:
                 pass
             self.stack.removeWidget(page)
+            page.hide()
             page.deleteLater()
         self.pages = []
         self.tab_bar.clear_tabs()
@@ -4360,10 +4367,6 @@ class SetManagerWindow(QtWidgets.QWidget):
             page.refresh_layout()
         self.updateGeometry()
         self.update()
-        try:
-            QtWidgets.QApplication.processEvents()
-        except Exception:
-            pass
 
     def replace_data(self, data):
         """Replace tabs from serialized data without closing the Qt window."""
@@ -4376,18 +4379,27 @@ class SetManagerWindow(QtWidgets.QWidget):
         if not tabs_data:
             return False
 
-        self._clear_loaded_pages()
-        self._sort_mode = data.get("sort_mode", "Manual")
-
-        geometry = data.get("geometry", {})
-        if isinstance(geometry, dict) and geometry:
-            self.move(geometry.get("x", 100), geometry.get("y", 100))
-            self.resize(geometry.get("width", 360), geometry.get("height", 300))
-
-        for tab_info in tabs_data:
-            page = self.add_new_tab(tab_info.get("name", "Tab"))
-            page.load_data(tab_info["data"])
-            page.container.manual_mode = (self._sort_mode == "Manual")
+        self._loading_data = True
+        self.setUpdatesEnabled(False)
+        try:
+            self._clear_loaded_pages()
+            self._sort_mode = data.get("sort_mode", "Manual")
+            geometry = data.get("geometry", {})
+            if isinstance(geometry, dict) and geometry:
+                screen = screen_available_geometry(self)
+                width = min(screen.width(), max(300, int(geometry.get("width", 360))))
+                height = min(screen.height(), max(200, int(geometry.get("height", 300))))
+                x = max(screen.left(), min(int(geometry.get("x", 100)), screen.right() - width))
+                y = max(screen.top(), min(int(geometry.get("y", 100)), screen.bottom() - height))
+                self.resize(width, height)
+                self.move(x, y)
+            for tab_info in tabs_data:
+                page = self.add_new_tab(tab_info.get("name", "Tab"))
+                page.load_data(tab_info["data"])
+                page.container.manual_mode = (self._sort_mode == "Manual")
+        finally:
+            self._loading_data = False
+            self.setUpdatesEnabled(True)
 
         try:
             current = int(data.get("current_tab", 0))
@@ -4395,6 +4407,7 @@ class SetManagerWindow(QtWidgets.QWidget):
             current = 0
         current = max(0, min(current, self.tab_bar.count() - 1))
         self.tab_bar.set_current_index(current)
+        self.stack.setCurrentIndex(current)
         self._refresh_loaded_pages()
         QtCore.QTimer.singleShot(0, self._refresh_loaded_pages)
         return True
@@ -4438,11 +4451,17 @@ class SetManagerWindow(QtWidgets.QWidget):
             self._sort_mode = data.get("sort_mode", "Manual")
 
         added_pages = []
-        for tab_info in tabs_data:
-            page = self.add_new_tab(self._unique_tab_name(tab_info.get("name")))
-            page.load_data(tab_info["data"])
-            page.container.manual_mode = (self._sort_mode == "Manual")
-            added_pages.append(page)
+        self._loading_data = True
+        self.setUpdatesEnabled(False)
+        try:
+            for tab_info in tabs_data:
+                page = self.add_new_tab(self._unique_tab_name(tab_info.get("name")))
+                page.load_data(tab_info["data"])
+                page.container.manual_mode = (self._sort_mode == "Manual")
+                added_pages.append(page)
+        finally:
+            self._loading_data = False
+            self.setUpdatesEnabled(True)
 
         try:
             imported_current = int(data.get("current_tab", 0))
@@ -4451,6 +4470,7 @@ class SetManagerWindow(QtWidgets.QWidget):
         imported_current = max(0, min(imported_current, len(added_pages) - 1))
         target_index = self.pages.index(added_pages[imported_current])
         self.tab_bar.set_current_index(target_index)
+        self.stack.setCurrentIndex(target_index)
         self._refresh_loaded_pages()
         QtCore.QTimer.singleShot(0, self._refresh_loaded_pages)
         return added_pages
@@ -4698,6 +4718,7 @@ def import_sets_data(data):
         active_window = None
 
     if active_window is not None and hasattr(active_window, "append_data"):
+        previous_data = active_window.serialized_data()
         try:
             if not active_window.append_data(import_data):
                 raise RuntimeError("The Set Manager could not load the imported tabs.")
@@ -4708,14 +4729,8 @@ def import_sets_data(data):
             _win = active_window
             return active_window
         except Exception:
-            try:
-                if hasattr(active_window, "save_data"):
-                    active_window.save_data()
-                active_window._skip_save = True
-                active_window.close()
-                active_window.deleteLater()
-            except Exception:
-                pass
+            active_window.replace_data(previous_data)
+            raise
     elif active_window is not None:
         try:
             if hasattr(active_window, "save_data"):
@@ -4757,7 +4772,7 @@ def import_sets(*args):
         return
     
     try:
-        with open(file_path, 'r') as f:
+        with open(file_path, 'r', encoding='utf-8-sig') as f:
             data = json.load(f)
     except Exception as e:
         cmds.warning(f"Import failed: {e}")

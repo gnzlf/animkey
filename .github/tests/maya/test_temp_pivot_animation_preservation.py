@@ -151,6 +151,28 @@ class TempPivotAnimationPreservationTests(unittest.TestCase):
         self.assertIsNone(layer)
         self.assertEqual(keyed_channels, 0)
 
+    def test_merge_compensation_preserves_motion_and_outside_keys(self):
+        for use_layer in (False, True):
+            cmds.file(new=True, force=True)
+            control = self._create_control()
+            destination = "BaseAnimation"
+            if use_layer:
+                destination = cmds.animLayer("Action", override=False)
+                cmds.animLayer(destination, edit=True, attribute=control + ".rotateY")
+                cmds.animLayer(destination, edit=True, selected=True, preferred=True)
+                cmds.setKeyframe(control, attribute="rotateY", time=1,
+                                 value=0.0, animLayer=destination)
+            state = self._edit_pivot(control)
+            expected = self._matrices(control)
+            outside = self._expected_without_temp_pivot(control, state)
+            layer, count = tempPivot._bake_temp_pivot_compensation(state)
+            self.assertGreater(count, 0)
+            target = tempPivot._merge_temp_pivot_compensation(layer, state)
+            self.assertEqual(target, destination)
+            self.assertFalse(cmds.objExists(layer))
+            self._assert_matrices_match(expected, control, range(6, 13))
+            self._assert_matrices_match(outside, control, range(1, 6))
+
     def test_range_detection_survives_switching_to_a_new_animation_layer(self):
         control = self._create_control()
         state = tempPivot._capture_temp_pivot_state([control])

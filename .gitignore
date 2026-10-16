@@ -16,6 +16,8 @@ Thumbs.db
 
 # Temporary/log files
 dist/
+/AnimKey-*.zip
+/AnimKey-*.zip.sha256
 *.log
 *.tmp
 *.bak

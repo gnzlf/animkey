@@ -33,7 +33,7 @@ from AnimKey.core.animation_offset_math import (
 
 LOGGER = logging.getLogger("AnimKey.AnimationOffset")
 
-ANIMATION_OFFSET_ENGINE_REVISION = 5
+ANIMATION_OFFSET_ENGINE_REVISION = 6
 
 SUPPORTED_TYPES = {
     "double",
@@ -625,8 +625,13 @@ class _OffsetNavigationFilter(QtCore.QObject):
             self._qt_event_type("ShortcutOverride"),
             self._qt_event_type("KeyPress"),
         }
+        self._mouse_press_type = self._qt_event_type("MouseButtonPress")
         self._mouse_release_type = self._qt_event_type("MouseButtonRelease")
+        self._tablet_press_type = self._qt_event_type("TabletPress")
+        self._tablet_release_type = self._qt_event_type("TabletRelease")
         self._ctrl_modifier = self._qt_keyboard_modifier("ControlModifier")
+        self._left_button = self._qt_mouse_button("LeftButton")
+        self._middle_button = self._qt_mouse_button("MiddleButton")
         self._nav_keys = {
             self._qt_key("Key_Comma"),
             self._qt_key("Key_Period"),
@@ -653,9 +658,12 @@ class _OffsetNavigationFilter(QtCore.QObject):
                 elif self._ctrl_modifier is not None and event.modifiers() & self._ctrl_modifier:
                     if key in self._undo_keys:
                         self.session.begin_undo_guard()
-            elif event_type == self._mouse_release_type:
-                self.session.flush_now(reason="mouse_release")
-                self.session.close_undo_chunk()
+            elif event_type in (self._mouse_press_type, self._tablet_press_type):
+                if self._is_left_mouse_button(event):
+                    self.session.begin_pointer_gesture()
+            elif event_type in (self._mouse_release_type, self._tablet_release_type):
+                if self._is_left_mouse_button(event):
+                    self.session.release_timer.start()
         except Exception:
             LOGGER.debug("Animation Offset navigation filter failed", exc_info=True)
         return False
@@ -681,6 +689,21 @@ class _OffsetNavigationFilter(QtCore.QObject):
             return getattr(modifier_enum, name)
         return getattr(QtCore.Qt, name, None)
 
+    @staticmethod
+    def _qt_mouse_button(name):
+        button_enum = getattr(QtCore.Qt, "MouseButton", None)
+        if button_enum is not None and hasattr(button_enum, name):
+            return getattr(button_enum, name)
+        return getattr(QtCore.Qt, name, None)
+
+    def _is_left_mouse_button(self, event):
+        if self._left_button is None:
+            return False
+        try:
+            return event.button() in (self._left_button, self._middle_button)
+        except Exception:
+            return False
+
 
 class OffsetSession(QtCore.QObject):
     _active_instance = None
@@ -705,6 +728,7 @@ class OffsetSession(QtCore.QObject):
         self.internal_edit_depth = 0
         self.undo_guard = False
         self.undo_chunk_open = False
+        self.pointer_gesture_active = False
         self.generation = 0
         self.max_pending_flushes = 0
         self._navigation_filter = None
@@ -719,6 +743,12 @@ class OffsetSession(QtCore.QObject):
         self.undo_close_timer.setSingleShot(True)
         self.undo_close_timer.setInterval(150)
         self.undo_close_timer.timeout.connect(self.close_undo_chunk)
+        self.release_timer = QtCore.QTimer(self)
+        self.release_timer.setSingleShot(True)
+        self.release_timer.timeout.connect(self.end_pointer_gesture)
+        self.undo_guard_timer = QtCore.QTimer(self)
+        self.undo_guard_timer.setSingleShot(True)
+        self.undo_guard_timer.timeout.connect(self.finish_undo_guard)
 
     @classmethod
     def active_instance(cls):
@@ -730,7 +760,7 @@ class OffsetSession(QtCore.QObject):
     def is_active(self):
         return self.phase in {SessionPhase.ACTIVE, SessionPhase.COMMITTING}
 
-    def start(self, objects, time_range, target_layer=None):
+    def start(self, objects, time_range, target_layer=None, follow_layer_selection=False):
         existing = OffsetSession.active_instance()
         if existing is not None and existing is not self:
             existing.stop(commit=True)
@@ -739,6 +769,8 @@ class OffsetSession(QtCore.QObject):
         self.generation += 1
         self.time_range = normalize_inclusive_time_range(time_range)
         self.target_layer = target_layer
+        self.follow_layer_selection = follow_layer_selection
+        self._layer_memberships = {}
         self.current_time = _current_ui_time()
         self.has_animation_layers = _has_any_animation_layers()
 
@@ -777,6 +809,8 @@ class OffsetSession(QtCore.QObject):
                 self.commit_dirty(reason="stop", allow_while_stopping=True)
         finally:
             self.flush_timer.stop()
+            self.release_timer.stop()
+            self.undo_guard_timer.stop()
             self.undo_close_timer.stop()
             self.close_undo_chunk()
             self._remove_navigation_filter()
@@ -815,7 +849,7 @@ class OffsetSession(QtCore.QObject):
         return added_any
 
     def schedule_flush(self):
-        if self.phase is not SessionPhase.ACTIVE:
+        if self.phase is not SessionPhase.ACTIVE or self.undo_guard:
             return
         if not self.flush_timer.isActive():
             self.flush_timer.start()
@@ -824,6 +858,8 @@ class OffsetSession(QtCore.QObject):
         return self.commit_dirty(reason=reason)
 
     def commit_dirty(self, reason, allow_while_stopping=False, scan_changed_keys=False):
+        if self.undo_guard:
+            return False
         valid_phase = self.phase is SessionPhase.ACTIVE
         if allow_while_stopping:
             valid_phase = valid_phase or self.phase is SessionPhase.STOPPING
@@ -875,13 +911,14 @@ class OffsetSession(QtCore.QObject):
                 self.phase = previous_phase
 
         if applied_any:
-            self.undo_close_timer.start()
-        elif not chunk_was_open:
+            if not self.pointer_gesture_active:
+                self.undo_close_timer.start()
+        elif not chunk_was_open and not self.pointer_gesture_active:
             self.close_undo_chunk()
         return applied_any
 
     def apply_slider_changes(self, changes):
-        if self.phase is not SessionPhase.ACTIVE or not changes:
+        if self.phase is not SessionPhase.ACTIVE or self.undo_guard or not changes:
             return False
 
         grouped = defaultdict(list)
@@ -900,9 +937,62 @@ class OffsetSession(QtCore.QObject):
                 if self._apply_slider_group(plug, plug_changes):
                     applied_any = True
 
-        if applied_any:
+        if applied_any and not self.pointer_gesture_active:
             self.undo_close_timer.start()
         return applied_any
+
+    def begin_pointer_gesture(self):
+        """Start one undo transaction before a viewport/Graph Editor drag."""
+        if self.phase is not SessionPhase.ACTIVE:
+            return
+        if self.undo_guard:
+            self.finish_undo_guard()
+        if self.release_timer.isActive():
+            self.end_pointer_gesture()
+        self._sync_keying_layer()
+        self.pointer_gesture_active = True
+        self.undo_close_timer.stop()
+        # Opening before Maya edits the control puts the manual key move and
+        # all propagated keys in the same undo item.
+        self.open_undo_chunk()
+
+    def _sync_keying_layer(self):
+        if not getattr(self, "follow_layer_selection", False):
+            return
+        layer = get_selected_animation_layer()
+        if layer == self.target_layer:
+            return
+        self.commit_dirty(reason="layer_change", scan_changed_keys=True)
+        self.close_undo_chunk()
+        nodes = list(dict.fromkeys(track.node_path for track in self.tracks.values()))
+        nodes.extend(node for node in _selected_objects_long() if node not in nodes)
+        self._remove_callbacks()
+        self.tracks.clear()
+        self.track_ids_by_plug.clear()
+        self.track_ids_by_node_uuid.clear()
+        self.track_ids_by_curve_uuid.clear()
+        self.dirty_track_ids.clear()
+        self.attribute_dirty_track_ids.clear()
+        self.curve_dirty_track_ids.clear()
+        self.target_layer = layer
+        self._layer_memberships = {}
+        self.has_animation_layers = _has_any_animation_layers()
+        for node in nodes:
+            self.register_object(node)
+        self._install_anim_curve_callback()
+        self._anchor_current_time_for_selected_tracks()
+
+    def end_pointer_gesture(self):
+        """Commit the final drag sample and finish its single undo transaction."""
+        self.release_timer.stop()
+        if not self.pointer_gesture_active:
+            return
+        try:
+            self.commit_dirty(reason="mouse_release", scan_changed_keys=True)
+        finally:
+            self.undo_close_timer.stop()
+            self.close_undo_chunk()
+            self.pointer_gesture_active = False
 
     def mark_dirty_for_test(self, node, attr, frame=None):
         attr = _normalize_attr_name(node, attr)
@@ -926,6 +1016,7 @@ class OffsetSession(QtCore.QObject):
             "curve_dirty_count": len(self.curve_dirty_track_ids),
             "script_job_count": len(self.script_jobs),
             "undo_chunk_open": self.undo_chunk_open,
+            "pointer_gesture_active": self.pointer_gesture_active,
             "time_range": self.time_range,
             "target_layer": self.target_layer,
         }
@@ -952,6 +1043,8 @@ class OffsetSession(QtCore.QObject):
     def begin_undo_guard(self):
         self.undo_guard = True
         self.flush_timer.stop()
+        self.undo_close_timer.stop()
+        self.pointer_gesture_active = False
         self.close_undo_chunk()
         self.dirty_track_ids.clear()
         self.attribute_dirty_track_ids.clear()
@@ -960,9 +1053,11 @@ class OffsetSession(QtCore.QObject):
             track.dirty = False
             track.dirty_time = None
             track.pending_key_values.clear()
-        QtCore.QTimer.singleShot(350, self.finish_undo_guard)
+        self.release_timer.stop()
+        self.undo_guard_timer.start(0)
 
     def finish_undo_guard(self):
+        self.undo_guard_timer.stop()
         self.flush_timer.stop()
         self.dirty_track_ids.clear()
         self.attribute_dirty_track_ids.clear()
@@ -1002,14 +1097,41 @@ class OffsetSession(QtCore.QObject):
             )
         except Exception:
             key_count = 0
-        if not key_count:
+        if not key_count and not self.has_animation_layers:
             return None
 
+        track_layer = self.target_layer
+        if self.has_animation_layers and not _is_base_layer(track_layer):
+            members = self._layer_memberships.get(track_layer)
+            if members is None:
+                members = set()
+                for member in cmds.animLayer(track_layer, query=True, attribute=True) or []:
+                    member_node, member_attr = _split_plug(member)
+                    if member_node and member_attr:
+                        members.add(member_node.split("|")[-1] + "." + member_attr)
+                self._layer_memberships[track_layer] = members
+            if node_path.split("|")[-1] + "." + attr not in members:
+                track_layer = cmds.animLayer(plug, query=True, bestLayer=True) or "BaseAnimation"
+                if isinstance(track_layer, (tuple, list)):
+                    track_layer = track_layer[-1] if track_layer else "BaseAnimation"
         curve = resolve_target_curve_for_layer(
             plug,
-            self.target_layer,
+            track_layer,
             has_animation_layers=self.has_animation_layers,
         )
+        if curve is None and self.has_animation_layers:
+            # A preferred layer is not necessarily a member of this channel.
+            # Follow Maya's per-plug keying destination instead of dropping it.
+            try:
+                best_layer = cmds.animLayer(plug, query=True, bestLayer=True) or "BaseAnimation"
+                if isinstance(best_layer, (list, tuple)):
+                    best_layer = best_layer[-1] if best_layer else None
+                if best_layer and best_layer != track_layer and not _layer_is_locked(best_layer):
+                    track_layer = best_layer
+                    curve = resolve_target_curve_for_layer(
+                        plug, track_layer, has_animation_layers=True)
+            except Exception:
+                pass
         if curve is None:
             if _has_any_animation_layers():
                 return None
@@ -1036,7 +1158,7 @@ class OffsetSession(QtCore.QObject):
             attr=attr,
             attr_type=cmds.getAttr(plug, type=True),
             curve=curve,
-            target_layer=self.target_layer,
+            target_layer=track_layer,
             key_times=key_times,
             key_values=key_values,
             key_indices=key_indices,
@@ -1235,6 +1357,7 @@ class OffsetSession(QtCore.QObject):
         self.current_time = None
         self.internal_edit_depth = 0
         self.undo_guard = False
+        self.pointer_gesture_active = False
         self.has_animation_layers = False
 
     def _index_track_plug(self, track):
@@ -1333,7 +1456,7 @@ class OffsetSession(QtCore.QObject):
 
     def _flush_scheduled(self):
         generation = self.generation
-        if self.phase is not SessionPhase.ACTIVE:
+        if self.phase is not SessionPhase.ACTIVE or self.undo_guard:
             return
         self.commit_dirty(reason="scheduled")
         if generation != self.generation:
@@ -1498,7 +1621,7 @@ class OffsetSession(QtCore.QObject):
         return None
 
     def _capture_layered_driver_key(self, track, frame, baseline):
-        layer_name = self.target_layer or "BaseAnimation"
+        layer_name = track.target_layer or "BaseAnimation"
         try:
             if not cmds.animLayer(layer_name, query=True, exists=True):
                 return None
@@ -1639,10 +1762,15 @@ class OffsetSession(QtCore.QObject):
         for _index, key_time, current_value in key_data:
             baseline, found = value_at_frame(track.key_values, key_time)
             if not found:
-                track.key_values[float(key_time)] = (
-                    float(current_value) - float(track.applied_delta)
-                )
-                continue
+                baseline, found = value_at_frame(track.evaluated_baselines, key_time)
+                if not found:
+                    track.key_values[float(key_time)] = (
+                        float(current_value) - float(track.applied_delta)
+                    )
+                    continue
+                # A new auto-key must be compared with the value BEFORE the
+                # drag, not accepted as its own baseline.
+                track.key_values[float(key_time)] = float(baseline)
 
             if track.is_rotation:
                 observed_delta = rotation_delta_from_observation(

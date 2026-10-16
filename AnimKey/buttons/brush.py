@@ -2,6 +2,7 @@ import math
 import json
 import os
 import copy
+import ctypes
 import zipfile
 import base64
 import shutil
@@ -96,23 +97,106 @@ def get_event_global_pos(event) -> Optional[QPointF]:
 
 
 def get_tablet_tilt_x(event):
-    return event.tiltX() if hasattr(event, 'tiltX') else event.xTilt()
+    for method_name in ("tiltX", "xTilt"):
+        method = getattr(event, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            return float(method())
+        except Exception:
+            continue
+    return 0.0
 
 def get_tablet_tilt_y(event):
-    return event.tiltY() if hasattr(event, 'tiltY') else event.yTilt()
+    for method_name in ("tiltY", "yTilt"):
+        method = getattr(event, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            return float(method())
+        except Exception:
+            continue
+    return 0.0
+
+
+def _event_numeric_value(event, names):
+    """Read a numeric Qt event property regardless of binding/version spelling."""
+    for name in names:
+        value = getattr(event, name, None)
+        try:
+            value = value() if callable(value) else value
+            value = float(value)
+        except Exception:
+            continue
+        if math.isfinite(value):
+            return value
+    return None
+
+
+def _tablet_pressure_maximum(event):
+    """Return a driver supplied raw pressure maximum when one is exposed."""
+    sources = [event]
+    device = getattr(event, "device", None)
+    try:
+        device = device() if callable(device) else device
+    except Exception:
+        device = None
+    if device is not None:
+        sources.append(device)
+
+    for source in sources:
+        maximum = _event_numeric_value(
+            source,
+            ("maximumPressure", "maxPressure", "pressureMaximum"),
+        )
+        if maximum is not None and maximum > 1.0:
+            return maximum
+        pressure_range = getattr(source, "pressureRange", None)
+        try:
+            pressure_range = pressure_range() if callable(pressure_range) else pressure_range
+            if len(pressure_range) >= 2:
+                maximum = float(pressure_range[1])
+                if math.isfinite(maximum) and maximum > 1.0:
+                    return maximum
+        except Exception:
+            pass
+    return None
+
+
+def _normalize_pressure(value, default=1.0, maximum=None, raw_default_maximum=1024.0):
+    """Normalize Qt or Windows Pointer pressure without flattening raw input.
+
+    Qt tablet events normally expose 0..1.  A few Windows tablet driver paths
+    expose their native 0..1024 pressure instead; clipping those values made
+    every Huion sample full width.  Windows Pointer documents 1024 as its
+    fallback pressure range, while a driver-provided maximum takes priority.
+    """
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = float(default)
+    if not math.isfinite(value):
+        value = float(default)
+    if value > 1.0:
+        scale = maximum if maximum and maximum > 1.0 else raw_default_maximum
+        value /= float(scale)
+    # A pen lift can report zero; retain a visible but properly thin endpoint.
+    return max(0.02, min(1.0, value))
 
 
 def get_tablet_pressure(event, default: float = 1.0) -> float:
     """Return a stable normalized pressure for Qt 5/6 tablet drivers."""
-    try:
-        pressure = float(event.pressure())
-    except Exception:
-        pressure = float(default)
-    if not math.isfinite(pressure):
-        pressure = float(default)
-    # Some Windows tablet drivers briefly report zero on TabletPress. Preserve
-    # a light stroke instead of dropping the first sample completely.
-    return max(0.02, min(1.0, pressure))
+    pressure = _event_numeric_value(
+        event,
+        ("pressure", "pressureF", "normalizedPressure", "rawPressure"),
+    )
+    if pressure is None:
+        pressure = default
+    return _normalize_pressure(
+        pressure,
+        default=default,
+        maximum=_tablet_pressure_maximum(event),
+    )
 
 
 def get_tablet_rotation(event) -> float:
@@ -120,6 +204,207 @@ def get_tablet_rotation(event) -> float:
         return float(event.rotation())
     except Exception:
         return 0.0
+
+
+# Qt normally translates Windows Pointer input into QTabletEvent. Some Huion
+# driver configurations instead reach Maya as synthesized mouse events, while
+# keeping the pressure available in the original WM_POINTER message. Keep this
+# bridge never consumes Maya's native messages; rendering runs on a queued Qt
+# timer, outside the native input callback.
+_NATIVE_EVENT_FILTER_BASE = getattr(QtCore, "QAbstractNativeEventFilter", object)
+
+
+if os.name == "nt":
+    class _WinPoint(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+    class _WinMessage(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", ctypes.c_void_p),
+            ("message", ctypes.c_uint32),
+            ("wParam", ctypes.c_size_t),
+            ("lParam", ctypes.c_ssize_t),
+            ("time", ctypes.c_uint32),
+            ("pt", _WinPoint),
+            ("lPrivate", ctypes.c_uint32),
+        ]
+
+
+    class _WinPointerInfo(ctypes.Structure):
+        _fields_ = [
+            ("pointerType", ctypes.c_uint32),
+            ("pointerId", ctypes.c_uint32),
+            ("frameId", ctypes.c_uint32),
+            ("pointerFlags", ctypes.c_uint32),
+            ("sourceDevice", ctypes.c_void_p),
+            ("hwndTarget", ctypes.c_void_p),
+            ("ptPixelLocation", _WinPoint),
+            ("ptHimetricLocation", _WinPoint),
+            ("ptPixelLocationRaw", _WinPoint),
+            ("ptHimetricLocationRaw", _WinPoint),
+            ("dwTime", ctypes.c_uint32),
+            ("historyCount", ctypes.c_uint32),
+            ("inputData", ctypes.c_int32),
+            ("dwKeyStates", ctypes.c_uint32),
+            ("performanceCount", ctypes.c_uint64),
+            ("buttonChangeType", ctypes.c_uint32),
+        ]
+
+
+    class _WinPointerPenInfo(ctypes.Structure):
+        _fields_ = [
+            ("pointerInfo", _WinPointerInfo),
+            ("penFlags", ctypes.c_uint32),
+            ("penMask", ctypes.c_uint32),
+            ("pressure", ctypes.c_uint32),
+            ("rotation", ctypes.c_uint32),
+            ("tiltX", ctypes.c_int32),
+            ("tiltY", ctypes.c_int32),
+        ]
+
+
+    _user32 = ctypes.windll.user32
+    _user32.GetPointerType.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+    _user32.GetPointerType.restype = ctypes.c_bool
+    _user32.GetPointerPenInfo.argtypes = [ctypes.c_uint32, ctypes.POINTER(_WinPointerPenInfo)]
+    _user32.GetPointerPenInfo.restype = ctypes.c_bool
+    _user32.ScreenToClient.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WinPoint)]
+    _user32.ScreenToClient.restype = ctypes.c_bool
+
+
+class _NativeTabletSample:
+    """Qt-compatible sample; pressure is already normalized by Windows Ink."""
+
+    def __init__(self, kind, pressure, tilt_x, tilt_y, rotation):
+        self.kind, self.value = kind, pressure
+        self.tilt_x, self.tilt_y, self.angle = tilt_x, tilt_y, rotation
+        self.keys = QtWidgets.QApplication.keyboardModifiers()
+
+    def type(self):
+        return {"press": QtCore.QEvent.TabletPress, "move": QtCore.QEvent.TabletMove,
+                "release": QtCore.QEvent.TabletRelease}[self.kind]
+
+    def pressure(self):
+        return self.value
+
+    def tiltX(self):
+        return self.tilt_x
+
+    def tiltY(self):
+        return self.tilt_y
+
+    def rotation(self):
+        return self.angle
+
+    def button(self):
+        return Qt.LeftButton
+
+    def modifiers(self):
+        return self.keys
+
+
+class WindowsPenInputBridge(_NATIVE_EVENT_FILTER_BASE):
+    """Queue complete Ink samples, without drawing inside the native message pump."""
+
+    _WM_POINTERUPDATE = 0x0245
+    _WM_POINTERDOWN = 0x0246
+    _WM_POINTERUP = 0x0247
+    _PT_PEN = 3
+    _PEN_MASK_PRESSURE = 0x00000001
+
+    def __init__(self, canvas):
+        try:
+            super().__init__()
+        except TypeError:
+            pass
+        self._canvas = canvas
+        self._pointer_id = None
+        self._samples = deque()
+        self._timer = QTimer(canvas)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._drain)
+
+    def _drain(self):
+        while self._samples:
+            sample, position = self._samples.popleft()
+            self._canvas._handle_tablet_event(sample, position)
+
+    def close(self):
+        self._timer.stop()
+        self._timer.deleteLater()
+        self._samples.clear()
+        self._canvas._ink_pointer_active = False
+
+    def nativeEventFilter(self, event_type, message):
+        if os.name != "nt":
+            return False, 0
+        try:
+            native_type = bytes(event_type).decode("ascii", "ignore").lower()
+            if "windows" not in native_type:
+                return False, 0
+            address = int(message)
+            native_message = ctypes.cast(
+                address, ctypes.POINTER(_WinMessage)
+            ).contents
+            message_type = int(native_message.message)
+            if message_type not in (
+                self._WM_POINTERDOWN,
+                self._WM_POINTERUPDATE,
+                self._WM_POINTERUP,
+            ):
+                return False, 0
+            pointer_id = int(native_message.wParam) & 0xFFFF
+            pointer_type = ctypes.c_uint32()
+            if not _user32.GetPointerType(pointer_id, ctypes.byref(pointer_type)):
+                return False, 0
+            if int(pointer_type.value) != self._PT_PEN:
+                return False, 0
+            pen_info = _WinPointerPenInfo()
+            if not _user32.GetPointerPenInfo(pointer_id, ctypes.byref(pen_info)):
+                return False, 0
+            if not (int(pen_info.penMask) & self._PEN_MASK_PRESSURE):
+                return False, 0
+            kind = {
+                self._WM_POINTERDOWN: "press",
+                self._WM_POINTERUPDATE: "move",
+                self._WM_POINTERUP: "release",
+            }[message_type]
+            canvas = self._canvas
+            window = canvas.window()
+            point = _WinPoint(pen_info.pointerInfo.ptPixelLocation.x,
+                              pen_info.pointerInfo.ptPixelLocation.y)
+            if not _user32.ScreenToClient(int(window.winId()), ctypes.byref(point)):
+                return False, 0
+            ratio = max(1.0, window.devicePixelRatioF())
+            window_pos = QPoint(round(point.x / ratio), round(point.y / ratio))
+            position = QPointF(canvas.mapFrom(window, window_pos))
+            if kind == "press":
+                if (not canvas.isVisible() or not canvas.isEnabled()
+                        or canvas.testAttribute(Qt.WA_TransparentForMouseEvents)
+                        or window.childAt(window_pos) is not canvas
+                        or QtWidgets.QApplication.keyboardModifiers() & Qt.AltModifier
+                        or int(pen_info.penFlags) & 1):
+                    return False, 0
+                self._pointer_id = pointer_id
+                canvas._ink_pointer_active = True
+            if pointer_id != self._pointer_id:
+                return False, 0
+            pressure = max(0.02, min(1.0, float(pen_info.pressure) / 1024.0))
+            self._samples.append((_NativeTabletSample(
+                kind, pressure, pen_info.tiltX, pen_info.tiltY, pen_info.rotation
+            ), position))
+            if kind == "release":
+                self._pointer_id = None
+                canvas._ink_pointer_active = False
+                canvas._ink_suppress_until = time.monotonic() + 0.05
+            if not self._timer.isActive():
+                self._timer.start(0)
+        except Exception:
+            # Native event filters run inside Maya's message pump. A driver
+            # quirk must never prevent the original event from reaching Maya.
+            pass
+        return False, 0
 
 
 def _animkey_package_dir():
@@ -715,8 +1000,13 @@ class DrawingCanvas(QWidget):
         self.last_pressure: float = 1.0
         self.has_tablet = False
         self._tablet_stroke_active = False
+        self._native_pen_stroke_active = False
+        self._ink_pointer_active = False
+        self._ink_suppress_until = 0.0
         self._last_tablet_pressure = 1.0
         self._last_tablet_event_time = 0.0
+        self._last_native_pen_pressure = 1.0
+        self._native_pen_samples = deque(maxlen=24)
         self._last_input_pos: Optional[QPointF] = None
         self._drawing_view_transform = (1.0, 1.0, 0.0, 0.0)
         self._drawing_uniform_transform = None
@@ -828,6 +1118,20 @@ class DrawingCanvas(QWidget):
         self._ensure_pixmap_size()
         self.update()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Allocate and warm the renderer before the first pen-down.
+        QTimer.singleShot(0, self._warm_drawing_surface)
+
+    def _warm_drawing_surface(self):
+        if not self.isVisible() or self.drawing:
+            return
+        self._ensure_pixmap_size()
+        self._ensure_view_render_current()
+        if self.onion_enabled and not self._playback_mode and self._cache_dirty:
+            self._onion_cache[self.current_frame] = self._build_onion_skin(self.current_frame)
+            self._cache_dirty = False
+
     def wheelEvent(self, event):
         event.ignore()
 
@@ -838,10 +1142,53 @@ class DrawingCanvas(QWidget):
         return self.tool == "free_transform"
 
     def tabletEvent(self, event: QTabletEvent):
+        if self._ink_owns_input():
+            event.accept()
+            return
         if self._handle_tablet_event(event, get_event_pos(event)):
             event.accept()
         else:
             event.ignore()
+
+    def _record_native_pen_sample(self, kind, pressure, pointer_id=None):
+        """Store a Windows Pointer sample until its synthesized mouse event arrives."""
+        normalized = _normalize_pressure(pressure)
+        now = time.monotonic()
+        self._native_pen_samples.append((str(kind), normalized, pointer_id, now))
+        self._last_native_pen_pressure = normalized
+
+    def _ink_owns_input(self):
+        return self._ink_pointer_active or time.monotonic() < self._ink_suppress_until
+
+    def _consume_native_pen_pressure(self, kind, max_age=0.12):
+        """Return the freshest matching WM_POINTER sample, if it is current."""
+        now = time.monotonic()
+        for sample_kind, pressure, _pointer_id, timestamp in reversed(self._native_pen_samples):
+            if sample_kind == kind and now - timestamp <= max_age:
+                return pressure
+        return None
+
+    def _finish_pressure_stroke(self, epos, pressure, tilt_x=0.0, tilt_y=0.0, rotation=0.0):
+        """Append a thin lift sample before committing a pressure-sensitive stroke."""
+        if self.drawing and self.current_points:
+            release_pressure = self._persistent_pressure(pressure)
+            nx, ny = self._to_normalized(
+                epos.x(), epos.y(), self._drawing_view_transform,
+                self._drawing_uniform_transform,
+            )
+            last = self.current_points[-1]
+            last_px, last_py = self._point_to_pixel(
+                last, self._drawing_view_transform,
+                self._drawing_uniform_transform,
+            )
+            if math.hypot(epos.x() - last_px, epos.y() - last_py) > 0.35:
+                self.current_points.append(StrokePoint(
+                    x=nx, y=ny, pressure=release_pressure,
+                    tilt_x=tilt_x, tilt_y=tilt_y, rotation=rotation,
+                ))
+            else:
+                last.pressure = min(last.pressure, release_pressure)
+        self._end_stroke()
 
     def handle_external_tablet_event(self, event, global_pos: QPointF) -> bool:
         """Handle a tablet event received by Maya instead of the overlay canvas.
@@ -851,6 +1198,8 @@ class DrawingCanvas(QWidget):
         it.  Converting the global tablet location here keeps pressure samples
         on the same path as native canvas events.
         """
+        if self._ink_owns_input():
+            return True
         if global_pos is None:
             return False
         local_pos = self.mapFromGlobal(QPoint(
@@ -879,7 +1228,9 @@ class DrawingCanvas(QWidget):
                 return True
             if not is_pan_modifier and event.button() != Qt.MiddleButton:
                 self._tablet_stroke_active = True
-                self._begin_stroke(epos, raw_pressure, tilt_x, tilt_y, rotation)
+                self._native_pen_stroke_active = False
+                if not self.drawing:
+                    self._begin_stroke(epos, raw_pressure, tilt_x, tilt_y, rotation)
                 return True
             return False
         elif ev_type == int(QtCore.QEvent.TabletMove):
@@ -894,6 +1245,8 @@ class DrawingCanvas(QWidget):
                 self._transform_mouse_move(epos, event.modifiers())
                 return True
             if self.drawing:
+                self._tablet_stroke_active = True
+                self._native_pen_stroke_active = False
                 self._add_point(epos, raw_pressure, tilt_x, tilt_y, rotation)
             else:
                 self.last_draw_pos = epos
@@ -910,34 +1263,20 @@ class DrawingCanvas(QWidget):
             if self._is_transform_tool():
                 self._transform_mouse_release()
                 self._tablet_stroke_active = False
+                self._native_pen_stroke_active = False
                 return True
-            if self.drawing and self.current_points:
-                # Qt reports the final lift pressure on TabletRelease.  Keep
-                # it instead of ending on the last full-pressure move sample.
-                # This is what gives the clean outline its natural thin tail.
-                release_pressure = self._persistent_pressure(raw_pressure)
-                nx, ny = self._to_normalized(
-                    epos.x(), epos.y(), self._drawing_view_transform,
-                    self._drawing_uniform_transform,
-                )
-                last = self.current_points[-1]
-                last_px, last_py = self._point_to_pixel(
-                    last, self._drawing_view_transform,
-                    self._drawing_uniform_transform,
-                )
-                if math.hypot(epos.x() - last_px, epos.y() - last_py) > 0.35:
-                    self.current_points.append(StrokePoint(
-                        x=nx, y=ny, pressure=release_pressure,
-                        tilt_x=tilt_x, tilt_y=tilt_y, rotation=rotation,
-                    ))
-                else:
-                    last.pressure = min(last.pressure, release_pressure)
-            self._end_stroke()
+            self._finish_pressure_stroke(
+                epos, raw_pressure, tilt_x, tilt_y, rotation
+            )
             self._tablet_stroke_active = False
+            self._native_pen_stroke_active = False
             return True
         return False
 
     def mousePressEvent(self, event):
+        if self._ink_owns_input():
+            event.accept()
+            return
         epos = get_event_pos(event)
         if self.tool == "lasso" and event.button() == Qt.LeftButton:
             self._lasso_mouse_press(epos, event.button(), event.modifiers())
@@ -948,10 +1287,18 @@ class DrawingCanvas(QWidget):
             event.accept()
             return
         if not self._tablet_stroke_active and event.button() == Qt.LeftButton:
-            self._begin_stroke(epos, 1.0)
+            native_pressure = self._consume_native_pen_pressure("press")
+            if native_pressure is not None:
+                self._native_pen_stroke_active = True
+                self._begin_stroke(epos, native_pressure)
+            elif not self._native_pen_stroke_active:
+                self._begin_stroke(epos, 1.0)
             event.accept()
 
     def mouseMoveEvent(self, event):
+        if self._ink_owns_input():
+            event.accept()
+            return
         epos = get_event_pos(event)
         self.last_cursor_pos = epos
         if self.tool == "lasso":
@@ -965,7 +1312,19 @@ class DrawingCanvas(QWidget):
             self._transform_mouse_move(epos, event.modifiers())
             event.accept()
             return
-        if not self._tablet_stroke_active and self.drawing:
+        if self._native_pen_stroke_active and self.drawing:
+            native_pressure = self._consume_native_pen_pressure("move")
+            if native_pressure is not None:
+                self._add_point(epos, native_pressure)
+                event.accept()
+                return
+            if time.monotonic() - self._last_tablet_event_time > 0.02:
+                self._add_point(epos, self._last_native_pen_pressure)
+                event.accept()
+                return
+            self.last_draw_pos = epos
+            self.update()
+        elif not self._tablet_stroke_active and self.drawing:
             self._add_point(epos, 1.0)
             event.accept()
         elif self._tablet_stroke_active and self.drawing:
@@ -983,6 +1342,10 @@ class DrawingCanvas(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, event):
+        if self._ink_owns_input():
+            event.accept()
+            return
+        epos = get_event_pos(event)
         if self.tool == "lasso" and event.button() == Qt.LeftButton:
             if self._transform_drag_mode:
                 self._transform_mouse_release()
@@ -992,6 +1355,15 @@ class DrawingCanvas(QWidget):
             return
         if self._is_transform_tool() and event.button() == Qt.LeftButton:
             self._transform_mouse_release()
+            event.accept()
+            return
+        if self._native_pen_stroke_active and event.button() == Qt.LeftButton:
+            native_pressure = self._consume_native_pen_pressure("release")
+            self._finish_pressure_stroke(
+                epos,
+                native_pressure if native_pressure is not None else self._last_native_pen_pressure,
+            )
+            self._native_pen_stroke_active = False
             event.accept()
             return
         if not self._tablet_stroke_active and event.button() == Qt.LeftButton:
@@ -2184,6 +2556,7 @@ class DrawingCanvas(QWidget):
         painter.restore()
 
     def _begin_stroke(self, pos: QPointF, pressure: float, tilt_x: float = 0, tilt_y: float = 0, rotation: float = 0):
+        self._ensure_pixmap_size()
         self._ensure_view_render_current()
         self.drawing = True
         self.kalman.reset(pressure)
@@ -2216,6 +2589,8 @@ class DrawingCanvas(QWidget):
         self._stroke_base_pixmap = (
             self.canvas_pixmap.copy() if self.tool == "eraser" else None
         )
+        self._render_incremental(0.0, persistent_pressure, tilt_x)
+        self.update()
 
     def _add_point(self, pos: QPointF, pressure: float, tilt_x: float = 0, tilt_y: float = 0, rotation: float = 0):
         if not self.drawing: return
@@ -2293,6 +2668,23 @@ class DrawingCanvas(QWidget):
         painter.setRenderHint(QPainter.Antialiasing, True)
         n = len(self.current_points)
 
+        if n == 1:
+            point = self.current_points[0]
+            x, y = self._point_to_pixel(point, self._drawing_view_transform,
+                                        self._drawing_uniform_transform)
+            radius = max(0.25, compute_stroke_width(
+                self.brush_size * self._drawing_pixel_scale, point.pressure, 0.0,
+                velocity_sensitivity=self.velocity_sensitivity) / 2.0)
+            color = QColor(self.brush_color)
+            color.setAlphaF(color.alphaF() * self.brush_opacity)
+            if is_eraser:
+                painter.setCompositionMode(QPainter.CompositionMode_DestinationOut)
+                color = QColor(0, 0, 0, 255)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            painter.drawEllipse(QPointF(x, y), radius, radius)
+            painter.end()
+            return
         if n < 2:
             painter.end()
             return
@@ -2483,7 +2875,7 @@ class DrawingCanvas(QWidget):
 
         # Onion skins can require three extra full-frame rasterizations.  They
         # are useful while posing, but must not compete with Maya playback.
-        if self.onion_enabled and not self._playback_mode and self._cache_dirty:
+        if self.onion_enabled and not self._playback_mode and self._cache_dirty and not self.drawing:
             self._onion_cache[self.current_frame] = self._build_onion_skin(self.current_frame)
             self._cache_dirty = False
 
@@ -3365,6 +3757,7 @@ class SketchboardWindow(QWidget):
         self._sidebar_full_height = 0
         self._hud_width_hint = 0
         self._tablet_event_filter_installed = False
+        self._native_pen_event_filter = None
         self._last_polled_frame = None
         self._timeline_keys_dirty = False
         self._scene_commit_timer = QTimer(self)
@@ -3379,6 +3772,7 @@ class SketchboardWindow(QWidget):
 
         if self.is_overlay:
             self._install_tablet_event_filter()
+            self._install_native_pen_event_filter()
         
         if self.is_overlay and self.viewport_parent:
             self.sync_timer = QTimer(self)
@@ -3409,6 +3803,35 @@ class SketchboardWindow(QWidget):
         except (RuntimeError, AttributeError):
             pass
         self._tablet_event_filter_installed = False
+
+    def _install_native_pen_event_filter(self):
+        """Keep Huion pressure when Windows turns pen input into mouse input."""
+        if os.name != "nt" or self._native_pen_event_filter is not None:
+            return
+        app = QtWidgets.QApplication.instance()
+        install_filter = getattr(app, "installNativeEventFilter", None) if app else None
+        if not callable(install_filter):
+            return
+        try:
+            input_filter = WindowsPenInputBridge(self.canvas)
+            install_filter(input_filter)
+            self._native_pen_event_filter = input_filter
+        except Exception:
+            self._native_pen_event_filter = None
+
+    def _remove_native_pen_event_filter(self):
+        input_filter = self._native_pen_event_filter
+        if input_filter is None:
+            return
+        try:
+            input_filter.close()
+            app = QtWidgets.QApplication.instance()
+            remove_filter = getattr(app, "removeNativeEventFilter", None) if app else None
+            if callable(remove_filter):
+                remove_filter(input_filter)
+        except Exception:
+            pass
+        self._native_pen_event_filter = None
 
     def _is_canvas_widget(self, widget):
         """Whether *widget* is the canvas or one of its children."""
@@ -4479,6 +4902,7 @@ class SketchboardWindow(QWidget):
     def closeEvent(self, event):
         global _instance
         self._remove_tablet_event_filter()
+        self._remove_native_pen_event_filter()
         try:
             if self._scene_commit_timer.isActive():
                 self._scene_commit_timer.stop()

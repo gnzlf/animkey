@@ -1,6 +1,8 @@
 import unittest
 from unittest import mock
 import math
+import os
+import ctypes
 
 import maya.standalone
 from AnimKey.mods.maya_compat import QtWidgets
@@ -26,6 +28,8 @@ from AnimKey.buttons.brush import (
     Stroke,
     StrokePoint,
     SketchboardData,
+    WindowsPenInputBridge,
+    get_tablet_pressure,
     get_active_model_panel,
 )
 import maya.cmds as cmds
@@ -63,6 +67,41 @@ class _TabletEvent:
 
     def button(self):
         return Qt.LeftButton
+
+
+class _RawPressureTabletEvent:
+    """Qt-driver stand-in for the 0..1024 pressure values some tablets emit."""
+
+    def __init__(self, pressure, maximum):
+        self._pressure = pressure
+        self._maximum = maximum
+
+    def pressure(self):
+        return self._pressure
+
+    def maximumPressure(self):
+        return self._maximum
+
+
+class _MouseEvent:
+    """Small synthesized mouse event used by Windows Pointer fallback tests."""
+
+    def __init__(self, position, button=Qt.LeftButton):
+        self._position = QPointF(position)
+        self._button = button
+        self.accepted = False
+
+    def position(self):
+        return QPointF(self._position)
+
+    def button(self):
+        return self._button
+
+    def modifiers(self):
+        return Qt.NoModifier
+
+    def accept(self):
+        self.accepted = True
 
 
 class BrushRenderingTests(unittest.TestCase):
@@ -128,6 +167,97 @@ class BrushRenderingTests(unittest.TestCase):
         self.assertGreater(max(pressures) - min(pressures), 0.25)
         self.assertLess(pressures[0], pressures[-2])
         self.assertLess(pressures[-1], pressures[-2])
+
+    def test_raw_driver_pressure_is_normalized_instead_of_clipped_full(self):
+        self.assertAlmostEqual(
+            get_tablet_pressure(_RawPressureTabletEvent(512, 1024)),
+            0.5,
+        )
+        self.assertAlmostEqual(
+            get_tablet_pressure(_RawPressureTabletEvent(8192, 8192)),
+            1.0,
+        )
+
+    def test_windows_pointer_pressure_survives_synthesized_mouse_events(self):
+        canvas = DrawingCanvas()
+        canvas.resize(240, 120)
+        canvas._ensure_pixmap_size()
+
+        canvas._record_native_pen_sample("press", 0.12, pointer_id=7)
+        canvas.mousePressEvent(_MouseEvent(QPointF(20, 30)))
+        canvas._record_native_pen_sample("move", 0.82, pointer_id=7)
+        canvas.mouseMoveEvent(_MouseEvent(QPointF(110, 30)))
+        canvas._record_native_pen_sample("move", 0.96, pointer_id=7)
+        canvas.mouseMoveEvent(_MouseEvent(QPointF(185, 30)))
+        canvas._record_native_pen_sample("release", 0.06, pointer_id=7)
+        canvas.mouseReleaseEvent(_MouseEvent(QPointF(220, 30)))
+
+        stroke = canvas.data.frames[canvas.current_frame].strokes[0]
+        pressures = [point.pressure for point in stroke.points]
+        self.assertGreater(max(pressures) - min(pressures), 0.35)
+        self.assertLess(pressures[0], pressures[-2])
+        self.assertLess(pressures[-1], pressures[-2])
+
+    @unittest.skipUnless(os.name == "nt", "Windows Pointer is only available on Windows")
+    def test_windows_pointer_filter_installs_and_removes_cleanly(self):
+        canvas = DrawingCanvas()
+        bridge = WindowsPenInputBridge(canvas)
+        self.qt_app.installNativeEventFilter(bridge)
+        self.qt_app.removeNativeEventFilter(bridge)
+
+    @unittest.skipUnless(os.name == "nt", "Windows Ink")
+    def test_native_messages_draw_with_pressure_without_mouse_events(self):
+        from AnimKey.buttons import brush
+        window = QtWidgets.QWidget()
+        window.setAttribute(Qt.WA_DontShowOnScreen)
+        canvas = DrawingCanvas(window)
+        canvas.setGeometry(0, 0, 240, 120)
+        window.resize(240, 120)
+        window.show()
+        self.qt_app.processEvents()
+        bridge = WindowsPenInputBridge(canvas)
+        pressure, x = 1, 20
+
+        def pointer_type(_id, result):
+            ctypes.cast(result, ctypes.POINTER(ctypes.c_uint32))[0] = 3
+            return True
+
+        def pen_info(_id, result):
+            info = ctypes.cast(result, ctypes.POINTER(brush._WinPointerPenInfo)).contents
+            info.penMask = 1
+            info.pressure = pressure
+            info.pointerInfo.ptPixelLocation.x = x
+            info.pointerInfo.ptPixelLocation.y = 40
+            return True
+
+        try:
+            with mock.patch.object(brush, "_user32") as user32:
+                user32.GetPointerType.side_effect = pointer_type
+                user32.GetPointerPenInfo.side_effect = pen_info
+                user32.ScreenToClient.return_value = True
+                for message_type, pressure, x in ((0x246, 1, 20), (0x245, 512, 90),
+                                                   (0x245, 1024, 170), (0x247, 0, 220)):
+                    message = brush._WinMessage()
+                    message.message, message.wParam = message_type, 7
+                    bridge.nativeEventFilter(b"windows_generic_MSG", ctypes.addressof(message))
+                    self.qt_app.processEvents()
+            strokes = canvas.data.frames[canvas.current_frame].strokes
+            self.assertEqual(len(strokes), 1)
+            pressures = [point.pressure for point in strokes[0].points]
+            self.assertLess(pressures[0], 0.2)
+            self.assertGreater(max(pressures) - min(pressures), 0.35)
+        finally:
+            bridge.close()
+            window.close()
+
+    def test_pen_down_is_visible_before_first_move(self):
+        canvas = DrawingCanvas()
+        canvas.resize(240, 120)
+        canvas._ensure_pixmap_size()
+        canvas._begin_stroke(QPointF(30, 40), 0.7)
+        self.assertGreater(canvas.overlay_pixmap.toImage().pixelColor(30, 40).alpha(), 0)
+        canvas._end_stroke()
+        canvas.close()
 
     def test_external_tablet_events_convert_global_position_to_canvas(self):
         canvas = DrawingCanvas()

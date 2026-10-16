@@ -1,5 +1,6 @@
 import shutil
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -56,6 +57,55 @@ class OffsetAndCopyAnimoRegressionTests(unittest.TestCase):
             kwargs["animLayer"] = layer
         cmds.setKeyframe(control, **kwargs)
 
+    @staticmethod
+    def _process_events(seconds=0.0):
+        deadline = time.monotonic() + seconds
+        while True:
+            _APP.processEvents()
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+
+    def test_offset_pointer_drag_is_one_undo_and_does_not_reapply(self):
+        control = cmds.createNode("transform", name="offset_undo_ctrl")
+        for frame, value in ((1.0, 0.0), (5.0, 4.0), (10.0, 8.0)):
+            self._key(control, "translateX", frame, value)
+
+        cmds.currentTime(5.0)
+        session = OffsetSession()
+        try:
+            session.start([control], (1.0, 10.0))
+            cmds.flushUndo()
+
+            session.begin_pointer_gesture()
+            for value in (5.0, 6.0, 7.0):
+                cmds.keyframe(
+                    control,
+                    attribute="translateX",
+                    edit=True,
+                    time=(5.0, 5.0),
+                    valueChange=value,
+                )
+                self._process_events(0.22)
+                self.assertTrue(session.undo_chunk_open)
+
+            session.end_pointer_gesture()
+            self.assertFalse(session.undo_chunk_open)
+            self.assertEqual(
+                cmds.keyframe(control + ".translateX", query=True, valueChange=True),
+                [3.0, 7.0, 11.0],
+            )
+
+            cmds.undo()
+            self._process_events(0.45)
+            self.assertEqual(
+                cmds.keyframe(control + ".translateX", query=True, valueChange=True),
+                [0.0, 4.0, 8.0],
+            )
+            self.assertTrue(cmds.undoInfo(query=True, undoQueueEmpty=True))
+        finally:
+            session.stop(commit=False)
+
     def test_offset_graph_key_range_has_priority(self):
         control = cmds.createNode("transform", name="offset_graph_ctrl")
         for frame in (1.0, 5.0, 10.0):
@@ -73,6 +123,79 @@ class OffsetAndCopyAnimoRegressionTests(unittest.TestCase):
                 animation_offset._selected_offset_time_range(),
                 [5.0, 10.0],
             )
+
+    def test_offset_new_key_between_existing_keys_uses_pre_edit_baseline(self):
+        for layered in (False, True):
+            cmds.file(new=True, force=True)
+            control = cmds.createNode("transform", name="between_keys")
+            for frame in (1, 5, 10):
+                self._key(control, "translateX", frame, float(frame))
+            layer = None
+            if layered:
+                layer = cmds.animLayer("Action")
+                cmds.animLayer(layer, edit=True, attribute=control + ".translateX")
+                for frame in (1, 5, 10):
+                    self._key(control, "translateX", frame, float(frame), layer)
+            curve = resolve_target_curve_for_layer(control + ".translateX", layer)
+            before = cmds.keyframe(curve, query=True, valueChange=True)
+            cmds.currentTime(7)
+            cmds.select(control)
+            baseline = cmds.keyframe(curve, query=True, eval=True, time=(7, 7))[0]
+            session = OffsetSession()
+            try:
+                session.start([control], (1, 10), target_layer=layer)
+                session.begin_pointer_gesture()
+                cmds.setKeyframe(curve, time=7, value=baseline + 2.0)
+                session.end_pointer_gesture()
+                for frame, value in zip((1, 5, 10), before):
+                    self.assertAlmostEqual(cmds.keyframe(curve, query=True, time=(frame, frame),
+                                                        valueChange=True)[0], value + 2.0)
+            finally:
+                session.stop(commit=False)
+
+    def test_offset_unrelated_preferred_layer_does_not_drop_base_channel(self):
+        control = cmds.createNode("transform", name="unlayered_ctrl")
+        for frame in (1, 5, 10):
+            self._key(control, "translateX", frame, float(frame))
+        other = cmds.animLayer("OtherRigLayer")
+        cmds.animLayer(other, edit=True, selected=True, preferred=True)
+        session = OffsetSession()
+        try:
+            session.start([control], (1, 10), target_layer=other)
+            track = session._track_for_node_attr(control, "translateX")
+            self.assertEqual(track.target_layer, "BaseAnimation")
+        finally:
+            session.stop(commit=False)
+
+    def test_active_offset_rebinds_when_keying_layer_changes(self):
+        control = cmds.createNode("transform", name="switch_layer_ctrl")
+        for frame in (1, 5, 10):
+            self._key(control, "translateX", frame, float(frame))
+        action = cmds.animLayer("Action")
+        cmds.animLayer(action, edit=True, attribute=control + ".translateX")
+        for frame in (1, 5, 10):
+            self._key(control, "translateX", frame, 0., action)
+        cmds.currentTime(5)
+        cmds.select(control)
+        for layer in ("BaseAnimation", action):
+            cmds.animLayer(layer, edit=True, preferred=False, selected=False)
+        cmds.animLayer("BaseAnimation", edit=True, preferred=True, selected=True)
+        session = OffsetSession()
+        try:
+            session.start([control], (1, 10), target_layer="BaseAnimation", follow_layer_selection=True)
+            cmds.animLayer("BaseAnimation", edit=True, preferred=False, selected=False)
+            cmds.animLayer(action, edit=True, preferred=True, selected=True)
+            session.begin_pointer_gesture()
+            self.assertEqual(session.target_layer, action)
+            curve = resolve_target_curve_for_layer(control + ".translateX", action)
+            before = cmds.keyframe(curve, query=True, valueChange=True)
+            cmds.keyframe(curve, edit=True, time=(5, 5), relative=True, valueChange=2.)
+            session.end_pointer_gesture()
+            self.assertEqual(cmds.keyframe(curve, query=True, valueChange=True), [v+2 for v in before])
+            base = resolve_target_curve_for_layer(control + ".translateX", "BaseAnimation")
+            self.assertEqual(cmds.keyframe(base, query=True, valueChange=True), [1., 5., 10.])
+        finally:
+            session.stop(commit=False)
 
     def test_preferred_animation_layer_wins_over_stale_selection(self):
         first = cmds.animLayer("OldSelectedLayer")

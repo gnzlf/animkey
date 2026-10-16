@@ -43,7 +43,10 @@ def _load_isolate_objects(panel, objects):
     try:
         cmds.select(valid_objects, replace=True)
         cmds.isolateSelect(panel, state=1)
-        cmds.isolateSelect(panel, addSelected=True)
+        # ``addSelected`` retains members from Maya's prior isolate set.  A
+        # fresh AnimKey isolate must replace that set so another rig cannot
+        # remain visible from an earlier isolation.
+        cmds.isolateSelect(panel, loadSelected=True)
     except Exception:
         try:
             cmds.select(valid_objects, replace=True)
@@ -504,5 +507,4 @@ def get_info():
         "icon": "isolate.svg",
         "shortcut": "Shift+I",
     }
-
 

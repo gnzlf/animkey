@@ -1779,7 +1779,8 @@ class AnimKeyToolbar:
         
         if cmds.workspaceControl(WORKSPACE_NAME, query=True, exists=True):
             try:
-                cmds.workspaceControl(WORKSPACE_NAME, edit=True, restore=True)
+                cmds.workspaceControl(WORKSPACE_NAME, edit=True, restore=True,
+                                      actLikeMayaUIElement=True)
             except Exception:
                 cmds.workspaceControl(WORKSPACE_NAME, edit=True, visible=True)
             QtCore.QTimer.singleShot(0, self._refresh_toolbar_scroll_area)
@@ -1789,6 +1790,7 @@ class AnimKeyToolbar:
         cmds.workspaceControl(
             WORKSPACE_NAME,
             label="AnimKey",
+            actLikeMayaUIElement=True,
             minimumWidth=220,
             initialWidth=220,
             heightProperty="fixed",
@@ -2461,16 +2463,20 @@ class AnimKeyToolbar:
 
             w_anim = QtCore.QPropertyAnimation(btn, b"maximumWidth")
             op_anim = QtCore.QPropertyAnimation(effect, b"opacity")
-            w_anim.valueChanged.connect(lambda *_: self._refresh_toolbar_scroll_area())
+            # One geometry refresh per animation tick for the whole group.
+            if not group.animationCount():
+                w_anim.valueChanged.connect(
+                    lambda *_: self.toolbar_scroll_area._update_content_width()
+                )
 
             if collapsed:
                 btn.setMinimumWidth(0)
                 effect.setOpacity(1.0)
-                w_anim.setDuration(260)
+                w_anim.setDuration(120)
                 w_anim.setStartValue(btn.maximumWidth() if btn.maximumWidth() > 0 else icon_size)
                 w_anim.setEndValue(0)
                 w_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
-                op_anim.setDuration(180)
+                op_anim.setDuration(100)
                 op_anim.setStartValue(1.0)
                 op_anim.setEndValue(0.0)
                 op_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
@@ -2478,11 +2484,11 @@ class AnimKeyToolbar:
                 btn.setMinimumWidth(0)
                 btn.setMaximumWidth(0)
                 effect.setOpacity(0.0)
-                w_anim.setDuration(290)
+                w_anim.setDuration(120)
                 w_anim.setStartValue(0)
                 w_anim.setEndValue(icon_size)
                 w_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
-                op_anim.setDuration(220)
+                op_anim.setDuration(100)
                 op_anim.setStartValue(0.0)
                 op_anim.setEndValue(1.0)
                 op_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
