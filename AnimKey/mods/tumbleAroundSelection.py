@@ -1,8 +1,8 @@
-"""Use Maya's native tumble-around-selection context without moving cameras.
+"""Use Maya's selection pivot, with stable Frame Selection navigation when off.
 
-Earlier versions also wrote camera tumblePivot and centerOfInterest on every
-selection/time change. That fought Maya's own auto-pivot and could make the
-viewport jump or tumble around an old point, especially with several panels.
+objectTumble is Maya's cursor-hit pivot, despite the flag's name. Keep it off
+in both modes so starting a drag cannot replace the pivot established by F.
+Only native context preferences are edited; cameras are never repositioned.
 """
 
 import maya.cmds as cmds
@@ -12,11 +12,12 @@ from AnimKey.mods import configMod as config
 
 
 SETTING_KEY = "tumble_around_selection_enabled"
-_active = False
-_context_name = None
-_original_settings = None
+# Retain ownership when the module is reloaded in a running Maya session.
+if "_active" not in globals():
+    _active = False
+if "_script_jobs" not in globals():
+    _script_jobs = []
 _pending = False
-_script_jobs = []
 
 
 def is_enabled():
@@ -66,31 +67,23 @@ def _set_setting(context, flag, value):
 
 
 def refresh():
-    """Reapply preferences if Maya recreated its tumble context."""
-    global _pending, _context_name, _original_settings
+    """Apply the current mode, including repair of settings left by old versions."""
+    global _pending
     _pending = False
-    if not _active:
-        return False
     context = _tumble_context()
     if not context:
         return False
-    if context != _context_name:
-        _context_name = context
-        _original_settings = {
-            flag: _query_setting(context, flag)
-            for flag in ("objectTumble", "autoSetPivot", "localTumble")
-        }
     results = (
-        _set_setting(context, "localTumble", 0),
-        _set_setting(context, "objectTumble", True),
-        _set_setting(context, "autoSetPivot", True),
+        _set_setting(context, "objectTumble", False),
+        _set_setting(context, "localTumble", 0 if _active else 1),
+        _set_setting(context, "autoSetPivot", _active),
     )
     return all(results)
 
 
 def _refresh_deferred():
     global _pending
-    if _pending or not _active:
+    if _pending:
         return
     _pending = True
     try:
@@ -112,7 +105,7 @@ def _install_script_jobs():
     global _script_jobs
     if _script_jobs:
         return
-    for event_name in ("ToolChanged", "SceneOpened"):
+    for event_name in ("ToolChanged", "SceneOpened", "NewSceneOpened"):
         try:
             _script_jobs.append(cmds.scriptJob(
                 event=(event_name, _refresh_deferred), protected=True
@@ -133,24 +126,21 @@ def _kill_script_jobs():
 
 
 def apply(enabled=None):
-    global _active, _pending, _context_name, _original_settings
+    global _active, _pending
     if enabled is None:
         enabled = is_enabled()
-    if enabled:
-        _active = True
+    _active = bool(enabled)
+    _pending = False
+    if _active:
         _install_script_jobs()
-        if not refresh():
-            _refresh_deferred()
     else:
-        _active = False
-        _pending = False
         _kill_script_jobs()
-        if _context_name and _original_settings:
-            for flag, value in _original_settings.items():
-                if value is not None:
-                    _set_setting(_context_name, flag, value)
-        _context_name = None
-        _original_settings = None
+
+    # Disabled means normal center-of-interest navigation. Restoring a saved
+    # cursor-pivot setting could reproduce the jump even with the box unchecked;
+    # after a restart there may be no saved snapshot to restore at all.
+    if not refresh():
+        _refresh_deferred()
 
 
 def is_active():

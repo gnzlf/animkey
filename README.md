@@ -63,6 +63,17 @@ source checkout was loaded instead, Update locates the existing Maya installatio
 and reloads that installed copy after upgrading or downgrading. The source
 checkout is kept untouched.
 
+### AnimKey 1.2.0
+
+- Bake Animation resamples channels on the active animation layer, preserving
+  additive and Override layer values, layer weights, other layers, and keys
+  outside the bake range. The bake remains a single Undo operation.
+- Tumble Around Selection uses Maya's selection pivot without switching the
+  orbit center to the object under the mouse. Disabling it restores normal
+  center-of-interest navigation so framing with F remains stable when tumbling.
+- Navigation settings left by earlier versions are repaired even when Tumble
+  Around Selection is disabled, and callbacks are cleaned up after reloading.
+
 ### AnimKey 1.1.2
 
 - Draw now keeps sketch strokes aligned when Maya viewports are resized,

@@ -957,7 +957,8 @@ class SettingsWindow(QtWidgets.QWidget):
             "Tumble Around Selection"
         )
         self.tumble_around_selection_checkbox.setToolTip(
-            "Automatically moves the active camera tumble pivot to the selected objects."
+            "Orbit around the center of the selection. Disable to use the view's "
+            "center of interest (F to frame)."
         )
         self.tumble_around_selection_checkbox.setChecked(
             bool(config.get_setting("tumble_around_selection_enabled", False))

@@ -9,6 +9,7 @@
     - Bake with customizable step interval
     - Bake current timeslider or selected time range
     - Bake specific channels (if selected in Channel Box)
+    - Bake channels on the active animation layer
     - Preserve Blend Parent keys
 """
 
@@ -58,125 +59,147 @@ def get_time_range():
     return min_time, max_time
 
 
-def constrain_save():
+def _bake_targets(selected, selected_channels, layer):
+    """Resolve channels to the active layer's inputs, before layer blending."""
+    from AnimKey.core.animation_offset_session import _layered_plug_for_attr
+
+    targets = []
+    blend_parents = []
+    for obj in selected:
+        if selected_channels:
+            plugs = []
+            for channel in selected_channels:
+                if not cmds.attributeQuery(channel, node=obj, exists=True):
+                    continue
+                children = cmds.attributeQuery(channel, node=obj, listChildren=True)
+                plugs.extend(obj + '.' + attr for attr in (children or [channel]))
+        else:
+            plugs = cmds.listAnimatable(obj) or []
+
+        for plug in plugs:
+            if cmds.getAttr(plug, lock=True):
+                continue
+            target = _layered_plug_for_attr(plug, layer) if layer else plug
+            if not target:
+                continue
+            targets.append(target)
+            if plug.rsplit('.', 1)[-1] == 'blendParent1':
+                blend_parents.append(target)
+
+    return list(dict.fromkeys(targets)), list(dict.fromkeys(blend_parents))
+
+
+def constrain_save(targets):
     """Template (lock) blendParent attributes to preserve during bake"""
-    selected = cmds.ls(sl=True)
-    for obj in selected:
-        if cmds.attributeQuery('blendParent1', node=obj, exists=True):
-            cmds.selectKey(add=True, keyframe=True, attribute='blendParent1')
-            try:
-                mel.eval('doTemplateChannel graphEditor1FromOutliner 1')
-            except:
-                pass
+    for target in targets:
+        cmds.selectKey(target, add=True, keyframe=True)
+        try:
+            mel.eval('doTemplateChannel graphEditor1FromOutliner 1')
+        except Exception:
+            pass
 
 
-def constrain_load():
+def constrain_load(targets):
     """Untemplate (unlock) blendParent attributes after bake"""
-    selected = cmds.ls(sl=True)
-    for obj in selected:
-        if cmds.attributeQuery('blendParent1', node=obj, exists=True):
-            cmds.selectKey(add=True, keyframe=True, attribute='blendParent1')
-            try:
-                mel.eval('doTemplateChannel graphEditor1FromOutliner 0')
-            except:
-                pass
+    for target in targets:
+        cmds.selectKey(target, add=True, keyframe=True)
+        try:
+            mel.eval('doTemplateChannel graphEditor1FromOutliner 0')
+        except Exception:
+            pass
 
 
-def blend_parent_fix(bake_step):
+def blend_parent_fix(bake_step, targets, time_range):
     """Fix blendParent keys to align with bake step"""
-    selected = cmds.ls(sl=True)
-    start_time, end_time = get_time_range()
+    if not targets:
+        return
+    start_time, end_time = time_range
     
     # Snap keys to integers
     try:
-        cmds.snapKey(attribute='blendParent1', time=(start_time, end_time), timeMultiple=1.1)
-        cmds.snapKey(attribute='blendParent1', time=(start_time, end_time), timeMultiple=1)
+        cmds.snapKey(targets, time=(start_time, end_time), timeMultiple=1.1)
+        cmds.snapKey(targets, time=(start_time, end_time), timeMultiple=1)
     except:
         pass
     
-    for obj in selected:
-        if cmds.attributeQuery('blendParent1', node=obj, exists=True):
-            # Ensure at least one key exists
-            key_count = cmds.keyframe(obj, attribute='blendParent1', query=True, keyframeCount=True) or 0
-            if key_count < 1:
-                cmds.setKeyframe(obj, attribute='blendParent1')
-            
-            # Get blendParent keys in range
-            blend_keys = cmds.keyframe(obj, attribute='blendParent1', 
-                                       time=(start_time, end_time), query=True) or []
-            
-            for i, key_time in enumerate(blend_keys):
-                diff = (key_time - start_time) % bake_step
-                if diff > 0:
-                    if i > 0:
-                        if (key_time - blend_keys[i-1]) <= bake_step:
-                            # Too close, remove
-                            cmds.cutKey(obj, attribute='blendParent1', time=(key_time, key_time))
-                        else:
-                            # Shift to align
-                            cmds.keyframe(obj, attribute='blendParent1', 
-                                         time=(key_time, key_time), 
-                                         timeChange=key_time - diff)
+    for target in targets:
+        # Ensure at least one key exists
+        key_count = cmds.keyframe(target, query=True, keyframeCount=True) or 0
+        if key_count < 1:
+            cmds.setKeyframe(target)
+
+        # Get blendParent keys in range
+        blend_keys = cmds.keyframe(
+            target, time=(start_time, end_time), query=True,
+        ) or []
+
+        for i, key_time in enumerate(blend_keys):
+            diff = (key_time - start_time) % bake_step
+            if diff > 0:
+                if i > 0:
+                    if (key_time - blend_keys[i-1]) <= bake_step:
+                        # Too close, remove
+                        cmds.cutKey(target, time=(key_time, key_time))
                     else:
-                        cmds.keyframe(obj, attribute='blendParent1', 
-                                     time=(key_time, key_time), 
-                                     timeChange=key_time - diff)
+                        # Shift to align
+                        cmds.keyframe(
+                            target, time=(key_time, key_time),
+                            timeChange=key_time - diff,
+                        )
                 else:
-                    pass
+                    cmds.keyframe(
+                        target, time=(key_time, key_time),
+                        timeChange=key_time - diff,
+                    )
 
 
 def bake_factory_math(bake_step):
     """Main bake function - equivalent to BakeFactoryMath()"""
+    from AnimKey.core.animation_offset_session import get_selected_animation_layer
+
     selected = cmds.ls(sl=True)
     if not selected:
         cmds.warning("Please select at least one object.")
         return False
     
     start_time, end_time = get_time_range()
+    layer = get_selected_animation_layer()
+    if layer and cmds.getAttr(layer + '.lock'):
+        cmds.warning(f"Animation layer '{layer}' is locked. Unlock it before baking.")
+        return False
+
+    selected_channels = cmds.channelBox(
+        'mainChannelBox', query=True, selectedMainAttributes=True,
+    ) or []
+    targets, blend_parents = _bake_targets(selected, selected_channels, layer)
+    if not targets:
+        cmds.warning("No bakeable channels on the active animation layer for the selected objects.")
+        return False
     
     cmds.undoInfo(openChunk=True)
     
     try:
         # Fix blendParent keys
-        blend_parent_fix(bake_step)
+        blend_parent_fix(bake_step, blend_parents, (start_time, end_time))
         
         # Save constraints (template blendParent)
-        constrain_save()
+        constrain_save(blend_parents)
         
         # Clear selection
         cmds.selectKey(clear=True)
         
-        # Check for selected channels in Channel Box
-        selected_channels = cmds.channelBox('mainChannelBox', query=True, selectedMainAttributes=True) or []
-        
-        if selected_channels:
-            # Bake only selected channels
-            for channel in selected_channels:
-                cmds.bakeResults(
-                    selected,
-                    preserveOutsideKeys=True,
-                    time=(start_time, end_time),
-                    sampleBy=bake_step,
-                    attribute=channel
-                )
-        else:
-            # Bake all channels
-            cmds.bakeResults(
-                selected,
-                preserveOutsideKeys=True,
-                time=(start_time, end_time),
-                sampleBy=bake_step
-            )
-        
-        # Load constraints (untemplate blendParent)
-        constrain_load()
-        
-        # Clear key selection
-        cmds.selectKey(clear=True)
-        
-        # Delete unsnapped keys
-        cmds.selectKey(unsnappedKeys=True)
-        cmds.cutKey(animation='keys', clear=True)
+        # Bake the layer inputs directly. Baking the composed object values
+        # into an additive/weighted layer would apply its contribution twice.
+        cmds.bakeResults(
+            targets,
+            preserveOutsideKeys=True,
+            time=(start_time, end_time),
+            sampleBy=bake_step,
+        )
+
+        # bakeResults already replaces the keys inside the requested interval.
+        # A global unsnapped-key cut would also erase other layers and keys
+        # outside the bake range (including valid fractional-frame samples).
         cmds.selectKey(clear=True)
         
         cmds.select(selected)
@@ -188,7 +211,11 @@ def bake_factory_math(bake_step):
         return False
         
     finally:
-        cmds.undoInfo(closeChunk=True)
+        try:
+            constrain_load(blend_parents)
+            cmds.selectKey(clear=True)
+        finally:
+            cmds.undoInfo(closeChunk=True)
 
 
 class BakeFactoryWindow(ContextPopupWindow):
