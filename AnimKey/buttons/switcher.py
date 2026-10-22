@@ -1220,7 +1220,7 @@ class SwitcherWindow(ContextPopupWindow):
         self.setObjectName(WINDOW_OBJECT)
         self.setWindowTitle(TOOL_NAME)
         self.setFixedSize(350, 390)
-        self._base_opacity = 0.94
+        self._base_opacity = 1.0
         self._hover_opacity = 1.0
         self._opacity_anim = None
         self._build_ui()

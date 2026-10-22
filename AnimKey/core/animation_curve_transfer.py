@@ -248,11 +248,22 @@ def resolve_anim_curve(attr_or_curve, layer_name=None,
         pass
     if layer_name and not is_base_layer(layer_name):
         return None
+    # A missing BaseAnimation curve is a valid result. A generic keyframe
+    # query through an animBlend network can return inputB from another layer.
+    # Exclude concrete non-base curves from the legacy fallback, while still
+    # allowing a base curve behind a pairBlend/constraint utility network.
+    if has_animation_layers is None:
+        has_animation_layers = bool(cmds.ls(type="animLayer"))
+    non_base_curves = set()
+    if has_animation_layers:
+        for layer in cmds.ls(type="animLayer") or []:
+            if not is_base_layer(layer):
+                non_base_curves.update(cmds.animLayer(layer, query=True, animCurves=True) or [])
 
     try:
         curves = cmds.keyframe(attr_or_curve, query=True, name=True) or []
         for curve in curves:
-            if _is_anim_curve(curve):
+            if _is_anim_curve(curve) and curve not in non_base_curves:
                 return curve
     except Exception:
         pass
@@ -265,7 +276,7 @@ def resolve_anim_curve(attr_or_curve, layer_name=None,
             skipConversionNodes=True,
         ) or []
         for curve in curves:
-            if _is_anim_curve(curve):
+            if _is_anim_curve(curve) and curve not in non_base_curves:
                 return curve
     except Exception:
         pass
@@ -339,24 +350,20 @@ def _infinity_name(infinity_id):
     return INFINITY_NAMES.get(int(infinity_id))
 
 
-def capture_curve(attr_or_curve, time_range=None, layer_name=None, key_times=None):
-    """Capture one timed animation curve without touching Maya's key clipboard."""
-    curve = resolve_anim_curve(attr_or_curve, layer_name=layer_name)
-    if not curve:
-        return None
+def _api_value_in_ui_units(fn_curve, value):
+    curve_type = fn_curve.animCurveType
+    if curve_type == oma.MFnAnimCurve.kAnimCurveTA:
+        return om.MAngle(value).asUnits(om.MAngle.uiUnit())
+    if curve_type == oma.MFnAnimCurve.kAnimCurveTL:
+        return om.MDistance(value).asUnits(om.MDistance.uiUnit())
+    if curve_type == oma.MFnAnimCurve.kAnimCurveTT:
+        return om.MTime(value, om.MTime.kSeconds).asUnits(om.MTime.uiUnit())
+    return float(value)
 
-    try:
-        fn_curve = _anim_curve_fn(curve)
-    except Exception:
-        return None
-    if not fn_curve.isTimeInput:
-        return None
 
-    indexes = _key_indexes_in_range(fn_curve, time_range, key_times=key_times)
-    if not indexes:
-        return None
-
-    all_ui_values = _query_curve_values_ui(curve)
+def _capture_curve_payload(fn_curve, indexes, curve_node_type, source_layer,
+                           all_ui_values=None):
+    all_ui_values = all_ui_values or []
     keyframes = []
     api_values = []
     values = []
@@ -376,7 +383,7 @@ def capture_curve(attr_or_curve, time_range=None, layer_name=None, key_times=Non
         values.append(
             float(all_ui_values[index])
             if index < len(all_ui_values)
-            else float(fn_curve.value(index))
+            else _api_value_in_ui_units(fn_curve, fn_curve.value(index))
         )
         tangent_in_types.append(int(fn_curve.inTangentType(index)))
         tangent_out_types.append(int(fn_curve.outTangentType(index)))
@@ -390,10 +397,9 @@ def capture_curve(attr_or_curve, time_range=None, layer_name=None, key_times=Non
         weights_locked.append(bool(fn_curve.weightsLocked(index)))
         breakdowns.append(bool(fn_curve.isBreakdown(index)))
 
-    source_layer = active_animation_layer() if layer_name is None else layer_name
     payload = {
         "curve_payload_version": CURVE_PAYLOAD_VERSION,
-        "curve_node_type": cmds.nodeType(curve),
+        "curve_node_type": curve_node_type,
         "keyframes": keyframes,
         "values": values,
         "api_values": api_values,
@@ -414,13 +420,138 @@ def capture_curve(attr_or_curve, time_range=None, layer_name=None, key_times=Non
         "full_curve": len(indexes) == fn_curve.numKeys,
         "source_layer": source_layer,
     }
+    return payload
+
+
+def _freeze_curve_boundary(fn_curve, index):
+    """Keep boundary derivatives when omitted neighbors no longer drive auto tangents."""
+    in_xy = fn_curve.getTangentXY(index, True)
+    out_xy = fn_curve.getTangentXY(index, False)
+    in_type = fn_curve.inTangentType(index)
+    out_type = fn_curve.outTangentType(index)
+    tangent_lock = fn_curve.tangentsLocked(index)
+    weight_lock = fn_curve.weightsLocked(index)
+    fn_curve.setTangentsLocked(index, False)
+    fn_curve.setWeightsLocked(index, False)
+    # A step remains a step; converting it to a Bezier tangent changes its shape.
+    stepped = {oma.MFnAnimCurve.kTangentStep, oma.MFnAnimCurve.kTangentStepNext}
+    if in_type not in stepped:
+        fn_curve.setInTangentType(index, oma.MFnAnimCurve.kTangentFixed)
+        fn_curve.setTangent(index, *in_xy, True, convertUnits=False)
+    if out_type not in stepped:
+        fn_curve.setOutTangentType(index, oma.MFnAnimCurve.kTangentFixed)
+        fn_curve.setTangent(index, *out_xy, False, convertUnits=False)
+    fn_curve.setTangentsLocked(index, tangent_lock)
+    fn_curve.setWeightsLocked(index, weight_lock)
+
+
+def _clip_api_curve_data(curve_data, start_frame, end_frame):
+    """Split native segments on a detached allocation, including constant/linear padding.
+
+    Infinity settings are retained; repeated cycles outside the original key
+    interval are not expanded into additional curve segments here.
+    """
+    start, end = sorted((float(start_frame), float(end_frame)))
+    was_modified = bool(cmds.file(query=True, modified=True))
+    # createNode allocates an MObject, but without doIt this node never enters
+    # the scene. Native insertKey preserves weighted Bezier segments exactly.
+    modifier = om.MDGModifier()
+    curve_object = modifier.createNode(curve_data["curve_node_type"])
+    fn_curve = oma.MFnAnimCurve(curve_object)
+    try:
+        if not _populate_api_curve(fn_curve, curve_data):
+            return None
+        first = fn_curve.input(0).asUnits(om.MTime.uiUnit())
+        last = fn_curve.input(fn_curve.numKeys - 1).asUnits(om.MTime.uiUnit())
+        simple_infinity = {oma.MFnAnimCurve.kConstant, oma.MFnAnimCurve.kLinear}
+        extend_before = start < first and fn_curve.preInfinityType in simple_infinity
+        extend_after = end > last and fn_curve.postInfinityType in simple_infinity
+        # Evaluate before adding endpoints: new first/last keys change infinity's
+        # origin. Explicit linear extension also keeps a nonzero endpoint slope.
+        edge_values = {
+            frame: fn_curve.evaluate(om.MTime(frame, om.MTime.uiUnit()))
+            for frame in dict.fromkeys((start, end))
+        }
+        if extend_before:
+            _freeze_curve_boundary(fn_curve, 0)
+        if extend_after:
+            _freeze_curve_boundary(fn_curve, fn_curve.numKeys - 1)
+        for frame in dict.fromkeys((start, end)):
+            time = om.MTime(frame, om.MTime.uiUnit())
+            if fn_curve.find(time) is None:
+                if ((frame < first and extend_before) or
+                        (frame > last and extend_after)):
+                    fn_curve.addKey(time, edge_values[frame],
+                                    oma.MFnAnimCurve.kTangentLinear,
+                                    oma.MFnAnimCurve.kTangentLinear)
+                else:
+                    fn_curve.insertKey(time)
+        for frame, is_in, extend in ((first, True, extend_before),
+                                     (last, False, extend_after)):
+            if not extend:
+                continue
+            index = fn_curve.find(om.MTime(frame, om.MTime.uiUnit()))
+            locked = fn_curve.tangentsLocked(index)
+            fn_curve.setTangentsLocked(index, False)
+            if is_in:
+                fn_curve.setInTangentType(index, oma.MFnAnimCurve.kTangentLinear)
+            else:
+                fn_curve.setOutTangentType(index, oma.MFnAnimCurve.kTangentLinear)
+            fn_curve.setTangentsLocked(index, locked)
+        indexes = _key_indexes_in_range(fn_curve, (start, end))
+        if not indexes:
+            return None
+        for index in set((indexes[0], indexes[-1])):
+            _freeze_curve_boundary(fn_curve, index)
+        result = copy.deepcopy(curve_data)
+        result.update(_capture_curve_payload(
+            fn_curve, indexes, curve_data["curve_node_type"],
+            curve_data.get("source_layer", "BaseAnimation"),
+        ))
+        result["clip_range"] = [start, end]
+        result["full_curve"] = bool(curve_data.get("full_curve")) and all(
+            start - FRAME_EPSILON <= frame <= end + FRAME_EPSILON
+            for frame in curve_data["keyframes"]
+        )
+        return result
+    finally:
+        # API population dirties Maya's global file flag even for detached data.
+        # No command enters undo and the source and dependency graph stay intact.
+        del fn_curve, curve_object, modifier
+        if not was_modified:
+            cmds.file(modified=False)
+
+
+def capture_curve(attr_or_curve, time_range=None, layer_name=None, key_times=None):
+    """Capture a timed curve, including exact range boundaries between source keys."""
+    curve = resolve_anim_curve(attr_or_curve, layer_name=layer_name)
+    if not curve:
+        return None
+    try:
+        fn_curve = _anim_curve_fn(curve)
+    except Exception:
+        return None
+    if not fn_curve.isTimeInput or not fn_curve.numKeys:
+        return None
+    # Graph Editor key selections remain sparse; timeline clips include the
+    # interpolation at their endpoints, even when neither endpoint has a key.
+    if time_range and not key_times:
+        indexes = list(range(fn_curve.numKeys))
+    else:
+        indexes = _key_indexes_in_range(fn_curve, time_range, key_times=key_times)
+    if not indexes:
+        return None
+    source_layer = active_animation_layer() if layer_name is None else layer_name
+    payload = _capture_curve_payload(
+        fn_curve, indexes, cmds.nodeType(curve), source_layer,
+        all_ui_values=_query_curve_values_ui(curve),
+    )
+    if time_range and not key_times:
+        return _clip_api_curve_data(payload, *time_range)
     if time_range:
         payload["clip_range"] = [float(time_range[0]), float(time_range[1])]
     elif key_times:
-        payload["clip_range"] = [
-            min(float(frame) for frame in key_times),
-            max(float(frame) for frame in key_times),
-        ]
+        payload["clip_range"] = [min(map(float, key_times)), max(map(float, key_times))]
     return payload
 
 
@@ -463,6 +594,9 @@ def offset_curve_data(curve_data, time_offset):
 
 
 def trim_curve_data(curve_data, start_frame, end_frame):
+    if (isinstance(curve_data, dict) and curve_data.get("api_values")
+            and curve_data.get("curve_node_type") in ANIM_CURVE_TYPES):
+        return _clip_api_curve_data(curve_data, start_frame, end_frame)
     frames = curve_data.get("keyframes", []) if isinstance(curve_data, dict) else []
     keep = [
         index
@@ -494,7 +628,7 @@ def _array(values, array_type):
 
 
 def _populate_api_curve(curve, curve_data):
-    fn_curve = _anim_curve_fn(curve)
+    fn_curve = curve if isinstance(curve, oma.MFnAnimCurve) else _anim_curve_fn(curve)
     keyframes = [float(value) for value in curve_data.get("keyframes", [])]
     values = [float(value) for value in curve_data.get("api_values", [])]
     count = min(len(keyframes), len(values))
@@ -661,20 +795,28 @@ def create_temp_curve(curve_data, name="ANIMKEY_TEMP_CURVE"):
     node_type = curve_data.get("curve_node_type") or "animCurveTU"
     if node_type not in ANIM_CURVE_TYPES:
         node_type = "animCurveTU"
-    curve = None
-    if curve_data.get("api_values"):
-        try:
-            curve_type = getattr(oma.MFnAnimCurve, "kAnimCurve{}".format(node_type[-2:]))
-            fn_curve = oma.MFnAnimCurve()
-            curve_object = fn_curve.create(curve_type)
-            dependency_fn = om.MFnDependencyNode(curve_object)
-            curve = dependency_fn.setName(name) or dependency_fn.name()
-        except Exception:
-            curve = None
-    if not curve:
-        curve = cmds.createNode(node_type, name=name)
+    # API key population is fast, but node creation must enter Maya's undo
+    # queue; otherwise undoing the later delete resurrects an orphan curve.
+    curve = cmds.createNode(node_type, name=name)
     try:
-        if curve_data.get("api_values") and _populate_api_curve(curve, curve_data):
+        # Automatic endpoint tangents depend on neighbouring keys. Pasting a
+        # clip among existing keys otherwise changes its shape even when key
+        # times and values match. Freeze the captured endpoint handles in the
+        # temporary payload; keep the original clipboard and source untouched.
+        temp_data = curve_data
+        if len(curve_data.get("keyframes", [])) > 1 and curve_data.get("api_values"):
+            temp_data = dict(curve_data)
+            stable_types = {oma.MFnAnimCurve.kTangentFixed, oma.MFnAnimCurve.kTangentLinear,
+                            oma.MFnAnimCurve.kTangentFlat, oma.MFnAnimCurve.kTangentStep,
+                            oma.MFnAnimCurve.kTangentStepNext}
+            for field in ("tangent_in_types", "tangent_out_types"):
+                types = list(curve_data.get(field, []))
+                if len(types) == len(curve_data["keyframes"]):
+                    for index in (0, len(types) - 1):
+                        if types[index] not in stable_types:
+                            types[index] = oma.MFnAnimCurve.kTangentFixed
+                    temp_data[field] = types
+        if temp_data.get("api_values") and _populate_api_curve(curve, temp_data):
             return curve
         if _populate_legacy_curve(curve, curve_data):
             return curve

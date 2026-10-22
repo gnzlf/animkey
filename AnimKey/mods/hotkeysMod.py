@@ -204,7 +204,8 @@ def get_action_function(action_name):
         "TRL": "import AnimKey.buttons.trail as mod; mod.execute()",
         "OFF": "import AnimKey.buttons.animation_offset as mod; mod.execute()",
         "RST": "import AnimKey.buttons.resetValues as mod; mod.execute_shortcut()",
-        "TMP": "import AnimKey.buttons.tempPivot as mod; mod.execute()",
+        "TMP": "import AnimKey.buttons.tempControls as mod; mod.execute()",
+        "TMC": "import AnimKey.buttons.tempControls as mod; mod.execute()",
         "HIR": "import AnimKey.buttons.select_hierarchy as mod; mod.execute()",
         "SEL": "import AnimKey.core.toolbar as mod; toolbar = mod.AnimKeyToolbar(); toolbar._open_selector_window()",
         "MIR": "import AnimKey.buttons.mirror as mod; mod.execute()",
@@ -276,11 +277,15 @@ def get_action_function(action_name):
         # COPY ANIMATION SUBMENU
         # ─────────────────────────────────────────────────────────────────────
         "Copy Animation": "from AnimKey.buttons.copyAnimation import copy_animation; copy_animation()",
+        "Save Animation": "from AnimKey.buttons.copyAnimation import save_animation; save_animation()",
+        "Load Animation": "from AnimKey.buttons.copyAnimation import load_animation; load_animation()",
         "Paste Animation": "from AnimKey.buttons.copyAnimation import paste_animation; paste_animation()",
         "Paste Insert": "from AnimKey.buttons.copyAnimation import paste_insert_animation; paste_insert_animation()",
         "Paste Opposite": "from AnimKey.buttons.copyAnimation import paste_opposite_animation; paste_opposite_animation()",
         "Copy Pose": "from AnimKey.buttons.copyAnimation import copy_pose; copy_pose()",
         "Paste Pose": "from AnimKey.buttons.copyAnimation import paste_pose; paste_pose()",
+        "Save Pose": "from AnimKey.buttons.copyAnimation import save_pose; save_pose()",
+        "Load Pose": "from AnimKey.buttons.copyAnimation import load_pose; load_pose()",
         
         # ─────────────────────────────────────────────────────────────────────
         # FOLLOW CAM SUBMENU
@@ -294,6 +299,11 @@ def get_action_function(action_name):
         # LINK OBJECTS SUBMENU
         # ─────────────────────────────────────────────────────────────────────
         "Copy Link Frame": "from AnimKey.buttons.linkObjects import copy_link_frame; copy_link_frame()",
+        "Copy Link All Animation": "from AnimKey.buttons.linkObjects import copy_link_all_animation; copy_link_all_animation()",
+        "Copy Link Selected Range": "from AnimKey.buttons.linkObjects import copy_link_selected_range; copy_link_selected_range()",
+        "Paste Link All Animation": "from AnimKey.buttons.linkObjects import paste_link_all_animation; paste_link_all_animation()",
+        "Paste Link Selected Range": "from AnimKey.buttons.linkObjects import paste_link_selected_range; paste_link_selected_range()",
+        "Paste Link Playback Range": "from AnimKey.buttons.linkObjects import paste_link_playback_range; paste_link_playback_range()",
         "Copy Link Playback Range": "from AnimKey.buttons.linkObjects import copy_link_playback_range; copy_link_playback_range()",
         "Paste Link Frame": "from AnimKey.buttons.linkObjects import paste_link_frame; paste_link_frame()",
         "Paste Link Next Frame": "from AnimKey.buttons.linkObjects import paste_link_next_frame; paste_link_next_frame()",

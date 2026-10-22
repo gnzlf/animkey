@@ -1,18 +1,17 @@
 """
-    AnimKey Button: Mirror  (Calibrated Delta Engine)
+    AnimKey Button: Mirror  (Calibrated Channel Engine)
 
     Sistema de mirror calibrado por snapshot: detecta el plano del rig,
-    aprende los ejes reales de cada par y aplica deltas locales estables.
+    aprende los ejes reales de cada par y transfiere sus canales locales.
     
     Filosofía central:
         1.  Snapshot: en T-Pose, captura la world matrix de cada control
             y calcula el plano de simetría REAL del rig.
         2.  Mirror: para cada control seleccionado...
-            a. Calcula su world matrix ACTUAL.
-            b. La refleja a través del plano de simetría detectado.
-            c. Usa la jerarquía del rig para convertir esa world matrix
-               en valores de atributos locales correctos.
-            d. Aplica esos valores — NUNCA toca scale para corregir rotación.
+            a. Lee todos los canales antes de modificar el rig.
+            b. Aplica los ejes y signos aprendidos en el snapshot.
+            c. Copia los valores sin resolver otra vez las matrices IK.
+            d. Usa el mismo mapa para pose y animacion.
         
     Compatible con:
         - Rigs propios / custom riggers
@@ -42,6 +41,7 @@ import math
 import itertools
 import time
 import hashlib
+from collections import deque
 
 from AnimKey.core import animation_curve_transfer as curve_transfer
 from AnimKey.buttons import selectOpposite as side_resolver
@@ -85,6 +85,7 @@ ROTATION_ORDER_MAP = {
 }
 
 SNAPSHOT_SCHEMA_VERSION = 11
+CALIBRATION_VERSION = 2
 MIN_SUPPORTED_SNAPSHOT_VERSION = 10
 SNAPSHOT_FOLDER_NAME = "snapshots"
 LEGACY_SNAPSHOT_FOLDER_NAME = "snapshots_v10"
@@ -930,6 +931,15 @@ def _has_keyable_transform_attrs(node):
         return False
 
 
+def _is_rig_setup_shape(node):
+    parts = _namespace_free_parts(node)
+    # Advanced Skeleton fit guides and facial panel frames are curve shapes,
+    # but are not animation controls. Never gather them from a rig root.
+    return (any(part.lower() in ("fitskeleton", "facefitskeleton",
+                                "deformationsystem", "facedeformationsystem") for part in parts)
+            or bool(parts and parts[-1].lower().startswith("ctrlbox")))
+
+
 def _control_candidates_under(root):
     candidates = []
     if not root or not cmds.objExists(root):
@@ -941,7 +951,8 @@ def _control_candidates_under(root):
     except:
         descendants = []
     for node in [root] + descendants:
-        if (_has_animkey_control_shape(node) and _has_keyable_transform_attrs(node)):
+        if (not _is_rig_setup_shape(node) and _has_animkey_control_shape(node)
+                and _has_keyable_transform_attrs(node)):
             candidates.append(node)
     return candidates
 
@@ -955,7 +966,8 @@ def _control_candidates_in_namespace(namespace):
     except:
         transforms = []
     for node in transforms:
-        if (_has_animkey_control_shape(node) and _has_keyable_transform_attrs(node)):
+        if (not _is_rig_setup_shape(node) and _has_animkey_control_shape(node)
+                and _has_keyable_transform_attrs(node)):
             candidates.append(node)
     return candidates
 
@@ -1083,6 +1095,12 @@ def _set_scalar_attr_cached(node, attr, value, snapshot_cache=None):
 
 def _attrs_allow_scale(attrs_filter):
     return bool(attrs_filter and any(attr in SCALE_ATTRS for attr in attrs_filter))
+
+
+def _snapshot_uses_channel_values(snapshot):
+    return bool(snapshot and (
+        snapshot.get("profile_kind") == "quick"
+        or snapshot.get("calibration_version", 0) >= CALIBRATION_VERSION))
 
 
 def _attrs_to_apply(local_vals, attrs_filter=None, include_scale=False):
@@ -1225,14 +1243,89 @@ def _sub3(a, b):
 
 
 def _matrix_delta_error(base_a, test_a, base_b, test_b):
-    """Compare what changed from base->test, ignoring absolute rest mismatch."""
+    """Compare world-space motion, not differently oriented rest axes."""
     err = _dist3(_sub3(test_a.translation(), base_a.translation()),
                  _sub3(test_b.translation(), base_b.translation())) * 10.0
-    for axis_getter in (Mat4.x_axis, Mat4.y_axis, Mat4.z_axis):
-        da = _sub3(_normalize3(axis_getter(test_a)), _normalize3(axis_getter(base_a)))
-        db = _sub3(_normalize3(axis_getter(test_b)), _normalize3(axis_getter(base_b)))
-        err += _dist3(da, db)
+    rotations = []
+    for base, test in ((base_a, test_a), (base_b, test_b)):
+        base_rot = _normalize_rotation_in_matrix(base)
+        test_rot = _normalize_rotation_in_matrix(test)
+        base_rot._m[12:15] = [0.0, 0.0, 0.0]
+        test_rot._m[12:15] = [0.0, 0.0, 0.0]
+        rotations.append(base_rot.inverse() * test_rot)
+    for row in range(3):
+        err += _dist3(rotations[0].row(row)[:3], rotations[1].row(row)[:3])
     return err
+
+
+def _calibration_reflected_matrix(mat, sym_plane):
+    # Keep the reflection's negative determinant. Correcting an arbitrary local
+    # axis changes the measured rotation, especially in mirrored finger spaces.
+    return mat * Mat4.reflection_plane(sym_plane.normal, sym_plane.point)
+
+
+def _custom_attr_probe_pairs(source, attr):
+    """Find a bounded set of paired downstream transforms, including IK joints."""
+    pending = deque(cmds.listConnections(
+        source + "." + attr, source=False, destination=True,
+        skipConversionNodes=True) or [])
+    visited = {source}
+    pairs = []
+    joints = []
+    while pending and len(visited) < 256 and len(joints) < 6:
+        node = pending.popleft()
+        if node in visited:
+            continue
+        visited.add(node)
+        node_type = cmds.nodeType(node)
+        if node_type in ("transform", "joint"):
+            opposite = find_opposite_by_name(node)
+            if opposite and opposite != node:
+                (joints if node_type == "joint" else pairs).append((node, opposite))
+        if node_type == "ikHandle":
+            pending.extendleft(cmds.ikHandle(node, query=True, jointList=True) or [])
+        if node_type not in ("mesh", "nurbsCurve", "nurbsSurface", "skinCluster"):
+            pending.extend(cmds.listConnections(
+                node, source=False, destination=True,
+                skipConversionNodes=True) or [])
+    return (joints + pairs)[:6]
+
+
+def _calibrate_driven_custom_attr(source, target, attr, sym_plane,
+                                  source_rest, target_rest, snapshot_cache):
+    pairs = _custom_attr_probe_pairs(source, attr)
+    if not pairs or not _cached_is_modifiable(target, attr, snapshot_cache):
+        return None
+    source_base = [_mat4_from_maya(node) for node, _ in pairs]
+    target_base = [_mat4_from_maya(node) for _, node in pairs]
+    delta = _calibration_delta(attr)
+    source_value = source_rest.get(attr, 0.0)
+    target_value = target_rest.get(attr, 0.0)
+    try:
+        if not _set_scalar_attr_cached(source, attr, source_value + delta, snapshot_cache):
+            return None
+        source_test = [_mat4_from_maya(node) for node, _ in pairs]
+        _restore_attr(source, attr, source_value, snapshot_cache)
+        active = [index for index, (base, test) in enumerate(zip(source_base, source_test))
+                  if _matrix_error(base, test) > 1e-6]
+        if not active:
+            return None
+        scores = {}
+        for sign in (1.0, -1.0):
+            if not _set_scalar_attr_cached(target, attr, target_value + sign * delta, snapshot_cache):
+                continue
+            scores[sign] = sum(_matrix_delta_error(
+                _calibration_reflected_matrix(source_base[index], sym_plane),
+                _calibration_reflected_matrix(source_test[index], sym_plane),
+                target_base[index], _mat4_from_maya(pairs[index][1]))
+                for index in active)
+            _restore_attr(target, attr, target_value, snapshot_cache)
+        if len(scores) == 2 and abs(scores[1.0] - scores[-1.0]) > 1e-6:
+            return min(scores, key=scores.get)
+        return None
+    finally:
+        _restore_attr(source, attr, source_value, snapshot_cache)
+        _restore_attr(target, attr, target_value, snapshot_cache)
 
 
 def _capture_rest_attrs(node):
@@ -1301,6 +1394,91 @@ def _snapshot_rest_values(control_cache):
         for attr, value in data.get("rest_attrs", {}).items():
             values[f'{control}.{attr}'] = value
     return values
+
+
+def _saved_animbot_calibration_file():
+    return os.path.join(cmds.internalVar(userAppDir=True), "scripts",
+                        "animBot_data", "mirror_settings_snapshot.anb")
+
+
+def _apply_saved_channel_calibration(snapshot, controls, calibration_file):
+    """Reuse user-authored signs only for matching namespace, path and pair."""
+    if not calibration_file or not os.path.isfile(calibration_file):
+        return 0
+    try:
+        if os.path.getsize(calibration_file) > 32 * 1024 * 1024:
+            return 0
+        with open(calibration_file, "rb") as stream:
+            payload = stream.read()
+        profiles = json.loads(payload.decode("utf-8"))
+        namespaces = {_namespace(node) for node in controls}
+        if len(namespaces) != 1 or not isinstance(profiles, dict):
+            return 0
+        namespace = next(iter(namespaces))
+        profile = profiles.get(namespace)
+        if not isinstance(profile, dict):
+            return 0
+    except (OSError, UnicodeError, ValueError):
+        return 0
+
+    signs = {}
+    ambiguous = set()
+    for plug, sign in profile.items():
+        if (not isinstance(plug, str) or "." not in plug
+                or isinstance(sign, bool) or not isinstance(sign, (int, float))
+                or sign not in (-1.0, 1.0)):
+            continue
+        node, attr = plug.rsplit(".", 1)
+        key = (tuple(_namespace_free_parts(node)), attr)
+        if key in signs:
+            ambiguous.add(key)
+        signs[key] = float(sign)
+
+    nodes_by_id = {_profile_key_for_control(node, snapshot): node for node in controls}
+    path_lengths = {len(path) for path, _ in signs if len(path) >= 2}
+    path_index = {}
+    for node in controls:
+        parts = tuple(_namespace_free_parts(node))
+        for length in path_lengths:
+            if length <= len(parts):
+                path_index.setdefault((length, parts[-length:]), []).append(node)
+    resolved_signs = {}
+    for (path, attr), sign in signs.items():
+        # AnimBot stores parent|control paths, not full DAG paths. Match a
+        # suffix only when it identifies exactly one control in this rig.
+        if len(path) < 2 or (path, attr) in ambiguous:
+            continue
+        matches = path_index.get((len(path), path), [])
+        if len(matches) == 1:
+            key = (matches[0], attr)
+            if key in resolved_signs:
+                resolved_signs[key] = None
+            else:
+                resolved_signs[key] = sign
+    copied = 0
+    for control_id, node in nodes_by_id.items():
+        data = snapshot.get("controls", {}).get(control_id, {})
+        opposite_id = data.get("opposite")
+        target = nodes_by_id.get(opposite_id) if opposite_id else node
+        if not target or data.get("type") == "unpaired":
+            continue
+        for attr, spec in data.get("attr_map", {}).items():
+            if spec.get("target", attr) != attr or attr in ATTRIBUTES_TO_IGNORE:
+                continue
+            key = (node, attr)
+            opposite_key = (target, attr)
+            sign = resolved_signs.get(key)
+            if sign is None or resolved_signs.get(opposite_key) != sign:
+                continue
+            spec.update(mult=sign, mode="copy_value")
+            copied += 1
+    if copied:
+        snapshot["saved_calibration"] = {
+            "source": "animbot_user_snapshot", "namespace": namespace,
+            "file": os.path.abspath(calibration_file),
+            "sha256": hashlib.sha256(payload).hexdigest(), "channels": copied,
+        }
+    return copied
 
 
 def _matrix_attr_values(node, attr):
@@ -1460,7 +1638,7 @@ def _calibrate_axis_group(source, target, sym_plane, source_attrs, target_attrs,
 
     source_rest_mat = source_rest_mat or _mat4_from_maya(source)
     target_rest_mat = target_rest_mat or _mat4_from_maya(target)
-    desired_base = sym_plane.reflect_mat4(source_rest_mat)
+    desired_base = _calibration_reflected_matrix(source_rest_mat, sym_plane)
     source_effects = {}
 
     for source_attr in src_group:
@@ -1468,7 +1646,7 @@ def _calibrate_axis_group(source, target, sym_plane, source_attrs, target_attrs,
         source_value = source_rest.get(source_attr, 0.0)
         if not _set_scalar_attr_cached(source, source_attr, source_value + delta, snapshot_cache):
             continue
-        source_effects[source_attr] = (desired_base, sym_plane.reflect_mat4(_mat4_from_maya(source)), delta)
+        source_effects[source_attr] = (desired_base, _calibration_reflected_matrix(_mat4_from_maya(source), sym_plane), delta)
         _restore_attr(source, source_attr, source_value, snapshot_cache)
 
     if len(source_effects) != len(src_group):
@@ -1527,12 +1705,6 @@ def _build_calibrated_attr_map(source, target, sym_plane, snapshot_cache=None,
             and not allow_finger_calibration):
         return _legacy_finger_attr_map(source, attr_map)
 
-    if _is_bend_like_control(source):
-        return _same_value_attr_map(
-            source, target, include_translate=True, skip_zero_delta=True,
-            snapshot_cache=snapshot_cache
-        )
-
     source_rest = _cached_rest_attrs(source, snapshot_cache)
     target_rest = _cached_rest_attrs(target, snapshot_cache)
     source_rest_mat = _cached_world_mat(source, snapshot_cache)
@@ -1550,7 +1722,7 @@ def _build_calibrated_attr_map(source, target, sym_plane, snapshot_cache=None,
             snapshot_cache=snapshot_cache,
         ))
 
-    desired_base = sym_plane.reflect_mat4(source_rest_mat)
+    desired_base = _calibration_reflected_matrix(source_rest_mat, sym_plane)
 
     for source_attr in source_attrs:
         if source_attr in SCALE_ATTRS or source_attr in TRANSFORM_ATTRS:
@@ -1566,7 +1738,7 @@ def _build_calibrated_attr_map(source, target, sym_plane, snapshot_cache=None,
         if not _set_scalar_attr_cached(source, source_attr, source_value + delta, snapshot_cache):
             continue
 
-        desired = sym_plane.reflect_mat4(_mat4_from_maya(source))
+        desired = _calibration_reflected_matrix(_mat4_from_maya(source), sym_plane)
         _restore_attr(source, source_attr, source_value, snapshot_cache)
 
         # Most custom attributes are switches or scalar settings that do not
@@ -1587,6 +1759,12 @@ def _build_calibrated_attr_map(source, target, sym_plane, snapshot_cache=None,
             if attr_type in ("bool", "enum", "byte", "char", "short", "long"):
                 spec["mode"] = "copy_value"
                 spec["mult"] = 1.0
+            else:
+                driven_sign = _calibrate_driven_custom_attr(
+                    source, target, source_attr, sym_plane,
+                    source_rest, target_rest, snapshot_cache)
+                if driven_sign is not None:
+                    spec["mult"] = driven_sign
             attr_map[source_attr] = spec
             continue
 
@@ -1607,6 +1785,8 @@ def _build_calibrated_attr_map(source, target, sym_plane, snapshot_cache=None,
 
     _restore_attrs(source, source_rest, snapshot_cache)
     _restore_attrs(target, target_rest, snapshot_cache)
+    for spec in attr_map.values():
+        spec["mode"] = "copy_value"
     return attr_map
 
 
@@ -1942,6 +2122,24 @@ def _snapshot_mirror_space(controls):
         return {}
 
 
+def _reference_asset_for_control(control):
+    try:
+        if cmds.referenceQuery(control, isNodeReferenced=True):
+            path = cmds.referenceQuery(control, filename=True, withoutCopyNumber=True)
+            return os.path.normcase(os.path.normpath(path))
+    except (RuntimeError, TypeError):
+        pass
+    return None
+
+
+def _snapshot_reference_asset(snapshot):
+    asset = snapshot.get("reference_asset")
+    if asset:
+        return os.path.normcase(os.path.normpath(asset))
+    anchor = snapshot.get("mirror_space", {}).get("anchor_path")
+    return _reference_asset_for_control(anchor) if anchor and cmds.objExists(anchor) else None
+
+
 def get_rig_label(controls):
     if not controls:
         return "Scene"
@@ -2241,7 +2439,10 @@ def _create_default_pose_mirror_snapshot(selected_controls, rig_name=None,
                                          rig_label=None, show_message=True,
                                          expand_controls=True, persist=True,
                                          return_snapshot=False,
-                                         print_report=True, force_reset=False):
+                                         print_report=True, force_reset=False,
+                                         calibration_file=None):
+    if calibration_file is None:
+        calibration_file = _saved_animbot_calibration_file()
     controls = (_expand_to_candidate_controls(selected_controls)
                 if expand_controls else list(selected_controls or []))
     controls = list(dict.fromkeys(ctrl for ctrl in controls if cmds.objExists(ctrl)))
@@ -2271,6 +2472,7 @@ def _create_default_pose_mirror_snapshot(selected_controls, rig_name=None,
                 persist=persist,
                 return_snapshot=return_snapshot,
                 print_report=print_report,
+                calibration_file=calibration_file,
             )
         finally:
             _restore_scalar_attr_values(default_values)
@@ -2338,6 +2540,7 @@ def _create_default_pose_mirror_snapshot(selected_controls, rig_name=None,
                 persist=persist,
                 return_snapshot=return_snapshot,
                 print_report=print_report,
+                calibration_file=calibration_file,
             )
         finally:
             if undo_open:
@@ -2391,7 +2594,7 @@ def _create_default_pose_mirror_snapshot(selected_controls, rig_name=None,
 def _create_mirror_snapshot(selected_controls, rig_name=None, rig_label=None,
                             show_message=True, allow_finger_calibration=False,
                             persist=True, return_snapshot=False,
-                            print_report=True):
+                            print_report=True, calibration_file=None):
     """
     Create mirror snapshot from T-Pose / default pose.
 
@@ -2501,9 +2704,11 @@ def _create_mirror_snapshot(selected_controls, rig_name=None, rig_label=None,
     snapshot_data = {
         "version"       : SNAPSHOT_SCHEMA_VERSION,
         "profile_kind"  : "precise",
+        "calibration_version": CALIBRATION_VERSION if allow_finger_calibration else 0,
         "created_at"    : time.time(),
         "rig_name"      : rig_name,
         "rig_label"     : rig_label,
+        "reference_asset": _reference_asset_for_control(selected_controls[0]),
         "symmetry_plane": sym_plane.to_dict(),
         "finger_mapping_version": FINGER_MAPPING_VERSION,
         "calibrated_fingers": bool(allow_finger_calibration),
@@ -2638,6 +2843,11 @@ def _create_mirror_snapshot(selected_controls, rig_name=None, rig_label=None,
 
         processed.add(ctrl_id)
 
+    imported_channels = _apply_saved_channel_calibration(
+        snapshot_data, selected_controls, calibration_file)
+    if imported_channels:
+        print(f"  Reused saved user calibration: {imported_channels} channels")
+
     # ── Save ─────────────────────────────────────────────────────────────────
     calibrate_elapsed = time.time() - calibrate_started
     snapshot_data["validation"] = {
@@ -2721,6 +2931,7 @@ def snapshot_mirror_settings(*args):
             rig_label=info["label"],
             show_message=(len(grouped) == 1),
             expand_controls=False,
+            calibration_file=_saved_animbot_calibration_file(),
         )
         if result:
             results.append(result)
@@ -2770,6 +2981,10 @@ def load_snapshot(rig_name=None):
                 if controls and not any("rest_attrs" in c for c in controls.values()):
                     continue
                 data.setdefault("profile_kind", "precise")
+                if (data.get("profile_kind") == "precise"
+                        and data.get("calibration_version", 0) < CALIBRATION_VERSION):
+                    cmds.warning("AnimKey Mirror: Rebuild Snapshot to use the corrected calibration.")
+                    continue
                 _missing_snapshot_cache.discard(missing_key)
                 return data
         except:
@@ -3395,6 +3610,12 @@ def _snapshot_covers_controls(snapshot, controls):
         return False
     if snapshot.get("version", 1) < MIN_SUPPORTED_SNAPSHOT_VERSION:
         return False
+    if (snapshot.get("profile_kind") == "precise"
+            and snapshot.get("calibration_version", 0) < CALIBRATION_VERSION):
+        return False
+    if snapshot.get("reference_asset") and controls:
+        if _snapshot_reference_asset(snapshot) != _reference_asset_for_control(controls[0]):
+            return False
     snapshot_controls = snapshot.get("controls", {}) or {}
     for control in controls or []:
         if not cmds.objExists(control):
@@ -3403,7 +3624,7 @@ def _snapshot_covers_controls(snapshot, controls):
         data = snapshot_controls.get(control_id) if control_id else None
         if not data:
             return False
-        if not data.get("attr_map"):
+        if not data.get("attr_map") and _scalar_keyable_attrs(control):
             return False
         if "rest_world_mat" not in data or "rest_attrs" not in data:
             return False
@@ -3414,6 +3635,45 @@ def _snapshot_covers_controls(snapshot, controls):
     return True
 
 
+def _shared_reference_snapshot(controls, rig_name, rig_label):
+    asset = _reference_asset_for_control(controls[0]) if controls else None
+    if not asset:
+        return None
+    folder = os.path.dirname(get_mirror_snapshot_file(rig_name))
+    try:
+        filenames = sorted(os.listdir(folder))
+    except OSError:
+        return None
+    for filename in filenames:
+        if not filename.endswith("_mirror.json"):
+            continue
+        source_name = filename[:-len("_mirror.json")]
+        if source_name == rig_name:
+            continue
+        candidate = load_snapshot(source_name)
+        if (not candidate or candidate.get("profile_kind") != "precise"
+                or _snapshot_reference_asset(candidate) != asset
+                or not _snapshot_covers_controls(candidate, controls)):
+            continue
+        snapshot = copy.deepcopy(candidate)
+        snapshot.update(rig_name=rig_name, rig_label=rig_label,
+                        reference_asset=asset, shared_from=source_name)
+        space = snapshot.get("mirror_space", {})
+        anchor = space.get("anchor_path")
+        if anchor:
+            rebound = _resolve_control_like(controls[0], _strip_namespace(anchor))
+            if cmds.objExists(rebound):
+                space["anchor_path"] = _long_name(rebound)
+                space["anchor_parts"] = _dag_parts(space["anchor_path"])
+        try:
+            _write_snapshot_file(get_mirror_snapshot_file(rig_name), snapshot)
+            _missing_snapshot_cache.discard((get_user_data_folder(), str(rig_name)))
+        except OSError:
+            pass
+        return snapshot
+    return None
+
+
 def _load_or_build_basic_snapshot(controls, rig_name=None, rig_label=None):
     """Return a saved precise profile, otherwise an instant quick profile."""
     rig_name = rig_name or get_rig_identifier(controls)
@@ -3421,6 +3681,10 @@ def _load_or_build_basic_snapshot(controls, rig_name=None, rig_label=None):
     snapshot = load_snapshot(rig_name)
     if _snapshot_covers_controls(snapshot, controls):
         return snapshot, False
+
+    shared = _shared_reference_snapshot(controls, rig_name, rig_label)
+    if shared:
+        return shared, False
 
     return _get_quick_profile(
         controls, rig_name=rig_name, rig_label=rig_label
@@ -3451,6 +3715,14 @@ def _get_quick_profile(controls, rig_name=None, rig_label=None):
 
 
 def _prepared_snapshot_groups(controls, force_quick=False):
+    expanded = []
+    for control in controls or []:
+        if not cmds.objExists(control) or _is_rig_setup_shape(control):
+            continue
+        children = (_control_candidates_under(control)
+                    if not _has_animkey_control_shape(control) else [])
+        expanded.extend(children or [control])
+    controls = list(dict.fromkeys(expanded))
     prepared = []
     for rig_name, info in _group_controls_by_rig(controls).items():
         if force_quick:
@@ -3711,7 +3983,7 @@ def _has_unit_local_scale(control):
 
 
 def _can_apply_world_mirror(source, target, attrs_filter=None, snapshot=None):
-    if snapshot and snapshot.get("profile_kind") == "quick":
+    if _snapshot_uses_channel_values(snapshot):
         return False
     if (_is_fk_copy_control(source) or _is_fk_copy_control(target)
             or _is_hand_or_finger_copy_control(source)
@@ -3870,6 +4142,9 @@ def _sanitize_mirror_values(ctrl, target, snapshot, values):
     """Reject values that are likely to explode a rig."""
     if not values:
         return {}
+    if snapshot.get("calibration_version", 0) >= CALIBRATION_VERSION:
+        return {attr: float(value) for attr, value in values.items()
+                if isinstance(value, (int, float)) and math.isfinite(value)}
     pair_width = _mirror_pair_width(ctrl, target, snapshot)
     source_delta = _source_world_delta(ctrl, snapshot)
     max_translate_delta = max(10.0, pair_width * 2.5, source_delta * 4.0)
@@ -3925,9 +4200,7 @@ def compute_mirror_values(ctrl, target=None, snapshot=None, sym_plane=None,
 
     ctrl_data = _snap_ctrl_data(ctrl, snapshot)
     target_data = _snap_ctrl_data(target, snapshot)
-    include_default_scale = bool(
-        snapshot and snapshot.get("profile_kind") == "quick"
-    )
+    include_default_scale = _snapshot_uses_channel_values(snapshot)
     values = {}
 
     if ctrl_data and target_data and (
@@ -3952,13 +4225,15 @@ def compute_mirror_values(ctrl, target=None, snapshot=None, sym_plane=None,
                 continue
             current = _safe_scalar_attr(ctrl, source_attr, source_rest.get(source_attr, 0.0))
             source_base = source_rest.get(source_attr, 0.0)
-            target_base = target_rest.get(target_attr, _safe_scalar_attr(target, target_attr))
             mult = float(spec.get("mult", 1.0))
             if spec.get("skip_zero_delta") and abs(current - source_base) <= 0.0001:
                 continue
             if spec.get("mode") == "copy_value":
                 values[target_attr] = current * mult
             else:
+                target_base = target_rest.get(target_attr)
+                if target_base is None:
+                    target_base = _safe_scalar_attr(target, target_attr)
                 values[target_attr] = target_base + ((current - source_base) * mult)
         values = _sanitize_mirror_values(ctrl, target, snapshot, values)
         return _solve_dynamic_transform_values(
@@ -4415,10 +4690,13 @@ def _mirror_selected_pose_two_phase(controls, snapshot, sym_plane, attrs_filter=
     if not directions:
         return 0, {}
     pending = []
-    runtime_plane = _runtime_symmetry_plane(snapshot, sym_plane, selected)
+    world_sources = {source for source, target, _ in directions
+                     if _can_apply_world_mirror(source, target, attrs_filter, snapshot=snapshot)}
+    runtime_plane = (_runtime_symmetry_plane(snapshot, sym_plane, selected)
+                     if world_sources else None)
     source_matrices = {
         source: _mat4_from_maya(source)
-        for source, _, _ in directions
+        for source in world_sources
     }
 
     def add_pending(source, target, is_central=False):
@@ -4427,8 +4705,7 @@ def _mirror_selected_pose_two_phase(controls, snapshot, sym_plane, attrs_filter=
             attrs_filter=attrs_filter, is_central=is_central
         )
         desired_world = None
-        if _can_apply_world_mirror(
-                source, target, attrs_filter, snapshot=snapshot):
+        if source in source_matrices:
             desired_world = runtime_plane.reflect_mat4(source_matrices[source])
         pending.append((target, values, desired_world))
 
@@ -4438,7 +4715,7 @@ def _mirror_selected_pose_two_phase(controls, snapshot, sym_plane, attrs_filter=
     return _apply_pending_mirror(
         pending,
         attrs_filter,
-        include_scale=bool(snapshot and snapshot.get("profile_kind") == "quick"),
+        include_scale=_snapshot_uses_channel_values(snapshot),
     )
 
 
@@ -4643,7 +4920,8 @@ def _animation_channel_jobs_for_direction(source, target, snapshot, sym_plane,
         target_attr = spec.get("target", source_attr)
         if attrs_filter and source_attr not in attrs_filter and target_attr not in attrs_filter:
             continue
-        if target_attr in SCALE_ATTRS and not _attrs_allow_scale(attrs_filter):
+        if (target_attr in SCALE_ATTRS and not _attrs_allow_scale(attrs_filter)
+                and not _snapshot_uses_channel_values(snapshot)):
             continue
         if not _attr_exists(source, source_attr) or not _attr_exists(target, target_attr):
             continue
@@ -4740,17 +5018,21 @@ def _transfer_animation_jobs(jobs, time_range=None, clear_empty_sources=False):
         float(cmds.playbackOptions(query=True, min=True)),
         float(cmds.playbackOptions(query=True, max=True)),
     )
+    paths = list(dict.fromkeys(
+        f"{job[node]}.{job[attr]}"
+        for job in jobs for node, attr in (("source", "source_attr"), ("target", "target_attr"))
+    ))
+    curves = curve_transfer.existing_curve_map(paths, layer_name=layer_name)
     captures = []
     capture_cache = {}
     destinations = set()
     for job in jobs:
         cache_key = (job["source"], job["source_attr"])
         if cache_key not in capture_cache:
-            capture_cache[cache_key] = curve_transfer.capture_curve(
-                f"{job['source']}.{job['source_attr']}",
-                time_range=effective_range,
-                layer_name=layer_name,
-            )
+            curve = curves.get(f"{job['source']}.{job['source_attr']}")
+            capture_cache[cache_key] = (curve_transfer.capture_curve(
+                curve, time_range=effective_range, layer_name=layer_name,
+            ) if curve else None)
         curve_data = capture_cache.get(cache_key)
         if not curve_data:
             if clear_empty_sources:
@@ -4778,15 +5060,32 @@ def _transfer_animation_jobs(jobs, time_range=None, clear_empty_sources=False):
             value_offset,
         ))
 
-    for target, attr in destinations:
-        curve_transfer.clear_attr_range(
-            f"{target}.{attr}",
-            effective_range,
-            layer_name=layer_name,
-        )
+    clear_curves = sorted({curves[f"{target}.{attr}"] for target, attr in destinations
+                           if curves.get(f"{target}.{attr}")})
+    if clear_curves:
+        cmds.cutKey(clear_curves, time=effective_range, option="keys", clear=True)
 
     total = 0
+    batch = []
+    fallback = []
     for target, attr, curve_data, multiplier, value_offset in captures:
+        if (curve_data.get("api_values") and value_offset == 0.0
+                and multiplier in (-1.0, 1.0)):
+            payload = curve_data
+            if multiplier == -1.0:
+                payload = dict(curve_data)
+                for field in ("values", "api_values", "tangent_in_y", "tangent_out_y",
+                              "in_angle", "out_angle"):
+                    if field in payload:
+                        payload[field] = [-float(value) for value in payload[field]]
+            batch.append((f"{target}.{attr}", payload))
+        else:
+            fallback.append((target, attr, curve_data, multiplier, value_offset))
+    pasted = curve_transfer.paste_curves_batch(
+        batch, layer_name=layer_name, clear_existing=False)
+    total += sum(len(payload.get("keyframes", []))
+                 for (_, payload), success in zip(batch, pasted) if success)
+    for target, attr, curve_data, multiplier, value_offset in fallback:
         pasted, key_count = curve_transfer.paste_curve(
             f"{target}.{attr}",
             curve_data,
@@ -4805,25 +5104,14 @@ def _animation_jobs_have_keys(jobs, time_range):
     if not jobs:
         return False
     layer_name = curve_transfer.active_animation_layer()
-    checked = set()
-    for job in jobs:
-        key = (job["source"], job["source_attr"])
-        if key in checked:
-            continue
-        checked.add(key)
-        curve = curve_transfer.resolve_anim_curve(
-            f"{job['source']}.{job['source_attr']}",
-            layer_name=layer_name,
-        )
-        if not curve:
-            continue
-        try:
-            if cmds.keyframe(
-                    curve, query=True, time=time_range, timeChange=True):
-                return True
-        except Exception:
-            pass
-    return False
+    paths = list(dict.fromkeys(f"{job['source']}.{job['source_attr']}" for job in jobs))
+    curves = sorted(set(curve_transfer.existing_curve_map(paths, layer_name=layer_name).values()))
+    if not curves:
+        return False
+    try:
+        return bool(cmds.keyframe(curves, query=True, time=time_range, timeChange=True))
+    except (RuntimeError, TypeError):
+        return False
 
 
 def _attr_variants(node, attr):

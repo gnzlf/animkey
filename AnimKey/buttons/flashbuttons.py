@@ -23,7 +23,6 @@ QApplication = QtWidgets.QApplication
 QAbstractItemView = QtWidgets.QAbstractItemView
 QComboBox = QtWidgets.QComboBox
 QDialog = QtWidgets.QDialog
-QGraphicsOpacityEffect = QtWidgets.QGraphicsOpacityEffect
 QGroupBox = QtWidgets.QGroupBox
 QHBoxLayout = QtWidgets.QHBoxLayout
 QLabel = QtWidgets.QLabel
@@ -92,13 +91,21 @@ def get_available_actions():
         "Mirror Pose": ("AnimKey.buttons.mirror", "mirror_pose"),
         "Mirror Animation": ("AnimKey.buttons.mirror", "mirror_animation"),
         "Copy Animation": ("AnimKey.buttons.copyAnimation", "execute"),
-        "Paste Animation": ("AnimKey.buttons.copyAnimation", "paste"),
-        "Paste Flipped": ("AnimKey.buttons.copyAnimation", "paste_flipped"),
+        "Paste Animation": ("AnimKey.buttons.copyAnimation", "paste_animation"),
+        "Paste Insert": ("AnimKey.buttons.copyAnimation", "paste_insert_animation"),
+        "Paste Flipped": ("AnimKey.buttons.copyAnimation", "paste_opposite_animation"),
+        "Copy Pose": ("AnimKey.buttons.copyAnimation", "copy_pose"),
+        "Paste Pose": ("AnimKey.buttons.copyAnimation", "paste_pose"),
+        "Save Animation": ("AnimKey.buttons.copyAnimation", "save_animation"),
+        "Load Animation": ("AnimKey.buttons.copyAnimation", "load_animation"),
+        "Save Pose": ("AnimKey.buttons.copyAnimation", "save_pose"),
+        "Load Pose": ("AnimKey.buttons.copyAnimation", "load_pose"),
         "Micro Move": ("AnimKey.buttons.microMove", "execute"),
         "Follow Cam": ("AnimKey.buttons.followCam", "execute"),
         "Link Objects": ("AnimKey.buttons.linkObjects", "execute"),
         "Copy Worldspace": ("AnimKey.buttons.copyWorldspace", "execute"),
-        "Temp Control": ("AnimKey.buttons.tempPivot", "execute"),
+        "Temp Control": ("AnimKey.buttons.tempControls", "execute"),
+        "Temp Pivot": ("AnimKey.buttons.tempPivot", "execute_temp_pivot"),
         "Animation Offset": ("AnimKey.buttons.animation_offset", "execute"),
         "Select Hierarchy": ("AnimKey.buttons.select_hierarchy", "execute"),
         # Tangents
@@ -141,7 +148,8 @@ FLASH_ACTION_ICON_KEYS = {
     "Follow Cam": "CAM",
     "Link Objects": "LKN",
     "Copy Worldspace": "WS",
-    "Temp Control": "PIV",
+    "Temp Control": "TMC",
+    "Temp Pivot": "PIV",
     "Animation Offset": "OFF",
     "Select Hierarchy": "HIR",
     "Plateau Tangent": "PLT",
@@ -193,7 +201,8 @@ FLASH_LABEL_ICON_KEYS = {
     "COPYWORLDSPACE": "WS",
     "PIV": "PIV",
     "PIVOT": "PIV",
-    "TEMPCONTROL": "PIV",
+    "TEMPCONTROL": "TMC",
+    "TMC": "TMC",
     "RUL": "RUL",
     "MICROMOVE": "RUL",
     "PLT": "PLT",
@@ -847,6 +856,8 @@ class ButtonEditDialog(QDialog):
         
         self.setup_ui()
         self.load_data()
+        from AnimKey.core.window_style import apply_window_style
+        apply_window_style(self)
     
     def setup_ui(self):
         """Configura la interfaz del diálogo"""
@@ -1034,6 +1045,7 @@ class ButtonEditDialog(QDialog):
                 ("Link Objects", "Link Objects"),
                 ("Copy Worldspace", "Copy Worldspace"),
                 ("Temp Control", "Temp Control"),
+                ("Temp Pivot", "Temp Pivot"),
                 ("Select Hierarchy", "Select Hierarchy"),
             ],
             "── Extra Tools ──": [
@@ -1173,32 +1185,36 @@ class FlashButtonsPanel(QWidget):
         self.center_on_screen()
         
         # Efecto de opacidad
-        self.opacity_effect = QGraphicsOpacityEffect(self)
-        self.setGraphicsEffect(self.opacity_effect)
-        self.opacity_effect.setOpacity(0.0)
+        # Fade the native surface directly; a graphics effect would render the
+        # entire panel and all its buttons into an extra offscreen texture.
+        self.setWindowOpacity(0.0)
         
         self.setMouseTracking(True)
+
+        from AnimKey.core.window_style import apply_window_style
+        apply_window_style(self)
     
     def setup_ui(self):
         """Configura la interfaz de usuario"""
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(50, 50, 50, 50)  # Reduced margins
+        layout.setContentsMargins(24, 18, 24, 18)
+        layout.setSpacing(8)
         
         # Widget central para los botones
         self.button_container = QWidget()
         self.button_container.setStyleSheet("background: transparent;")
         self.button_container.setMouseTracking(True)
-        layout.addWidget(self.button_container)
+        layout.addWidget(self.button_container, 0, Qt.AlignHCenter)
         
         # Botones de control (candado y agregar)
         self.create_control_buttons()
+
+        self.update_panel_size()
         
         # Si no hay config guardada, crear un solo botón inicial
         if not self.buttons:
             self.create_initial_button()
         
-        # Ajustar tamaño
-        self.update_panel_size()
     
     def create_control_buttons(self):
         """Crea los botones de control (candado, agregar)"""
@@ -1291,8 +1307,7 @@ class FlashButtonsPanel(QWidget):
     
     def create_initial_button(self):
         """Crea un solo botón inicial en el centro"""
-        # Center in the container (container size is 340x340 after update_panel_size)
-        container_size = 340  # 500 - 160
+        container_size = self.button_container.width()
         center_x = (container_size - self.button_size) / 2
         center_y = (container_size - self.button_size) / 2
         self.add_button_at_position(center_x, center_y, "+")
@@ -1497,34 +1512,10 @@ class FlashButtonsPanel(QWidget):
         # Container más grande para dar espacio a los botones
         self.button_container.setFixedSize(base_size - 100, base_size - 100)
     
-    def paintEvent(self, event):
-        """Dibuja el fondo del panel"""
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        
-        center = self.rect().center()
-        radius = min(self.width(), self.height()) / 2 - 40
-        
-        # Fondo circular semi-transparente (más transparente)
-        gradient = QRadialGradient(center, radius)
-        gradient.setColorAt(0, QColor(25, 25, 30, 140))   # Más transparente
-        gradient.setColorAt(0.7, QColor(15, 15, 20, 100))
-        gradient.setColorAt(1, QColor(0, 0, 0, 0))
-        
-        painter.setBrush(gradient)
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(center, int(radius), int(radius))
-        
-        self.panel_radius = radius
-        self.panel_center = center
     
     def mouseMoveEvent(self, event):
         """Detecta cuando el mouse está dentro del área"""
-        if hasattr(self, 'panel_center') and hasattr(self, 'panel_radius'):
-            dx = event.pos().x() - self.panel_center.x()
-            dy = event.pos().y() - self.panel_center.y()
-            distance = math.sqrt(dx * dx + dy * dy)
-            self.mouse_inside = distance <= self.panel_radius
+        self.mouse_inside = self.rect().contains(event.pos())
         
         super(FlashButtonsPanel, self).mouseMoveEvent(event)
     
@@ -1584,7 +1575,7 @@ class FlashButtonsPanel(QWidget):
         self.hide_timer.start()
         
         # Animación de opacidad
-        self.fade_animation = QPropertyAnimation(self.opacity_effect, b"opacity")
+        self.fade_animation = QPropertyAnimation(self, b"windowOpacity")
         self.fade_animation.setDuration(300)
         self.fade_animation.setStartValue(0.0)
         self.fade_animation.setEndValue(1.0)
@@ -1618,7 +1609,7 @@ class FlashButtonsPanel(QWidget):
         """Oculta el panel inmediatamente"""
         self.is_visible = False
         self.hide_timer.stop()
-        self.opacity_effect.setOpacity(0.0)
+        self.setWindowOpacity(0.0)
         self.hide()
     
     def execute_button_function(self, button_id):

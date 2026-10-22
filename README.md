@@ -15,6 +15,8 @@
 - **Modular Buttons** - Each button function is in a separate file for easy customization
 - **6 Built-in Themes** - Including Midnight Aurora, Cyber Neon, Forest Depths, and more
 - **4K Display Support** - Automatically scales for high-DPI displays
+- **Temp Pivot + Temp Controls** - Separate adjacent buttons: a temporary pivot
+  proxy and persistent Simple, Group, Aim and FK animation systems.
 
 ---
 
@@ -62,6 +64,21 @@ The drag-and-drop installer uses `Documents/maya/AnimKey` on Windows. If a
 source checkout was loaded instead, Update locates the existing Maya installation
 and reloads that installed copy after upgrading or downgrading. The source
 checkout is kept untouched.
+
+### AnimKey 1.2.1
+
+- Dark frosted glass windows and toolbar, with native Windows blur, rounded
+  corners and translucent buttons, fields and sliders. The docked toolbar
+  follows Maya when moving, resizing, floating, docking or minimizing.
+- Settings and tool windows share the same material, including Recovery,
+  Retimer, Animation Cleaner and Temp Controls. Outer square borders are removed.
+- Temp Pivot uses a separate proxy while preserving the rig's original pivots
+  and hierarchy. Temp Controls adds persistent Simple, Group, Aim and FK Chain
+  systems, space controls, Bake/Revert and setup import/export.
+- Copy/Paste Animation and Pose gain file-based Save/Load and improved
+  namespace matching, range boundaries and animation-layer preservation.
+- Draw uses separate floating controls and a transparent viewport canvas,
+  with deferred stroke rendering and lighter viewport synchronization.
 
 ### AnimKey 1.2.0
 
@@ -151,6 +168,28 @@ AnimKey.reload()
 
 ## 🎛️ Toolbar Sections
 
+### Copy/paste animation and poses
+
+Click **C** to copy animation. Right-click C for Copy/Paste Animation, Paste
+Insert, Copy/Paste Pose, and Save/Load Animation or Pose. Save opens a file
+chooser so you can store `.animkey_anim` and `.animkey_pose` files anywhere.
+
+Select the source controls and copy, then select the destination controls and
+paste. Matching control names work across namespaces and selection order. A
+single copied control can be pasted to multiple selected controls.
+
+Paste Animation uses the original times. Paste Insert aligns the copied range
+to the current frame and replaces keys inside that range, keeping keys outside
+it. Copy/Paste Pose uses the evaluated pose and keys the destination at the
+current frame, including on additive or Override layers.
+
+With an animation layer active, Copy Animation captures that layer and Paste
+Animation targets the layer active at paste time. Copying from Base Animation
+captures the control's layer stack; a clip with multiple layers retains that
+stack. Existing shared layer settings and weight keys stay intact. Timeline
+ranges include interpolated boundary keys, and pasted automatic endpoint
+tangents are fixed to preserve the copied curve shape.
+
 ### Key Frame Controls
 - `<` `>` - Move selected keyframes left/right
 - `-` `+` - Remove/Add inbetween frames
@@ -181,11 +220,9 @@ Apply modifications to selected curves:
 
 ### Mirror
 
-- Click **MIR** to use a saved precise profile when available, with an automatic
-  in-memory quick fallback when no snapshot exists.
-- Right-click **MIR → Quick Mirror (No Snapshot)** to force the fast pose-only
-  path. It never creates files, changes time, or scans the entire rig.
-- Right-click **MIR → Build Precise Mirror Snapshot** once from the rig's
+- Click **MIR** to use that rig's saved snapshot automatically, or the standard
+  mirror when that rig has no snapshot. Each selected rig is resolved separately.
+- Right-click **MIR → Snapshot** once from the rig's
   default pose for calibrated FK/IK, custom attributes, rotated rig roots, and
   all Maya rotation orders.
 - Left/right pairing is shared with Select Opposite and supports common tokens,
@@ -193,6 +230,33 @@ Apply modifications to selected curves:
 - Ambiguous off-plane controls are skipped instead of being mirrored onto the
   wrong target. Use Mirror diagnosis to review unresolved controls and pairing
   confidence.
+
+### Worldspace and Link Objects
+
+- Both menus offer Copy and Paste for **All Animation**, **Selected Timeline
+  Range**, **Playback Range**, and **Current Frame**.
+- All Animation copies the full animation start/end range. Playback Range uses
+  the playback start/end; Selected Timeline Range uses the highlighted frames
+  and requires an active timeline selection.
+- Link Objects uses the last selected object as the driver. Range copies record
+  the evaluated relationship on every frame, including fractional key times.
+  A copied current-frame relationship can also be repeated over a paste range.
+- Click copies a frame; Shift-click pastes a frame. Live pin/auto-link options
+  are no longer exposed in the menus or shortcuts.
+
+### Temp Pivot and Temp Control
+
+- **PIV** toggles a temporary proxy. Shift uses the last selected object as an
+  unaffected anchor, Ctrl centers on the selected transform positions, and
+  Ctrl+Shift keeps the reference frame fixed in world space. Alt edits the
+  proxy pivot; Ctrl+Alt resets it. Rig pivots remain unchanged.
+- **TCT**, next to PIV, opens creation of Simple, Group, Aim or FK Chain
+  controls. Position and Orientation spaces can be linked or independent.
+  Aim starts with an editable setup and is finalized in the panel.
+- The Temp Controls panel exposes Bake/Revert, Grab/Release, control appearance,
+  extra parents/children, pivots and Group/FK membership. Closing the panel
+  leaves the scene systems intact. Copy Animation is between HIR and MIR.
+- Import/export uses AnimKey JSON and preserves the control setup.
 
 ### Crash Recovery
 

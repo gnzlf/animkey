@@ -36,6 +36,9 @@ def get_button_stylesheet(button_type="default"):
         - danger: Delete/remove action button
         - ghost: Transparent button
     """
+    if button_type in ("default", "small", "icon"):
+        from AnimKey.core.toolbar_style import button_stylesheet
+        return button_stylesheet(icon=button_type in ("small", "icon"))
     theme = ThemeManager.get_current_theme()
     
     styles = {

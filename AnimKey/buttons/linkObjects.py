@@ -22,6 +22,7 @@ import maya.api.OpenMaya as om
 
 from AnimKey.mods import configMod as config
 from AnimKey.mods.storage import atomic_write_json, read_json
+from AnimKey.buttons import copyWorldspace as worldspace
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -36,6 +37,7 @@ class LinkObjectsState:
         self.attribute_callback_id = None
         self.time_callback_id = None
         self.auto_link_enabled = False
+        self.busy = False
         self.button = None
 
 
@@ -52,16 +54,21 @@ def _get_link_data_folder():
     return os.path.join(user_folder, "tools", "link_objects")
 
 
-def _get_link_data_file():
+def _get_link_data_file(animation=False):
     """Get the path to the link data file"""
-    return os.path.join(_get_link_data_folder(), "link_data.json")
+    return os.path.join(_get_link_data_folder(), "link_animation.json" if animation else "link_data.json")
 
 
-def _load_relative_data():
+def _load_relative_data(animation=None):
     """Load relative data from file"""
     global _state
     
-    file_path = _get_link_data_file()
+    if animation is None:
+        active = read_json(os.path.join(_get_link_data_folder(), "active.json"), default={})
+        animation = bool(active.get("animation", False)) if isinstance(active, dict) else False
+        if animation and not os.path.exists(_get_link_data_file(True)):
+            animation = False
+    file_path = _get_link_data_file(animation)
     
     if not os.path.exists(file_path):
         return False
@@ -77,366 +84,201 @@ def _load_relative_data():
 #                           COPY/PASTE FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def copy_link_frame(*args):
-    """
-    Copy the spatial relationship between selected objects at the current frame.
-    
-    Select at least 2 objects. The last selected object becomes the "main" object
-    that the others will follow.
-    """
+def _matrix_values(matrix):
+    return [float(value) for value in matrix]
+
+
+def _allowed(action):
     from AnimKey.core.executionGuard import require_animkey_context
-    if not require_animkey_context("AnimKey.buttons.linkObjects.copy_link_frame"):
+    return require_animkey_context("AnimKey.buttons.linkObjects." + action)
+
+
+def _save_clipboard(data, animation):
+    atomic_write_json(_get_link_data_file(animation), data, indent=2)
+    atomic_write_json(os.path.join(_get_link_data_folder(), "active.json"),
+                      {"animation": animation})
+    _state.relative_data = data
+
+
+def _copy_link_scope(scope):
+    if not _allowed("copy_link_" + scope):
         return None
-    global _state
-    
-    selection = cmds.ls(selection=True)
-    
-    if len(selection) < 2:
-        cmds.warning("AnimKey: Please select at least 2 objects. The last selected will be the main object.")
-        return
-    
-    main_obj = selection[-1]
-    follow_objs = selection[:-1]
-    
-    save_dict = {
-        "main_obj": main_obj,
-        "relative_matrices": {}
-    }
-    
-    for follow_obj in follow_objs:
-        # Get world matrices
-        main_matrix = cmds.xform(main_obj, query=True, matrix=True, worldSpace=True)
-        follow_matrix = cmds.xform(follow_obj, query=True, matrix=True, worldSpace=True)
-        
-        # Convert to MMatrix
-        main_mmatrix = om.MMatrix(main_matrix)
-        follow_mmatrix = om.MMatrix(follow_matrix)
-        
-        # Calculate relative matrix
-        relative_matrix = follow_mmatrix * main_mmatrix.inverse()
-        
-        # Store as list
-        save_dict["relative_matrices"][follow_obj] = [
-            relative_matrix.getElement(i, j) 
-            for i in range(4) 
-            for j in range(4)
-        ]
-    
-    # Save to file
-    folder = _get_link_data_folder()
-    os.makedirs(folder, exist_ok=True)
-    
-    file_path = _get_link_data_file()
-    atomic_write_json(file_path, save_dict, indent=2)
-    
-    # Load into state
-    _state.relative_data = save_dict
-    
-    current_frame = int(cmds.currentTime(query=True))
-    cmds.inViewMessage(
-        amg=f"<span style='color:#b48ead'>Link Copied (Frame {current_frame})</span><br>"
-            f"<span style='color:#88c0d0'>{len(follow_objs)} object(s) linked to {main_obj}</span>",
-        pos='topCenter',
-        fade=True,
-        fadeStayTime=1500
-    )
+    nodes = worldspace._ordered_selection()
+    if len(nodes) < 2:
+        cmds.warning("AnimKey: Select followers first, then the parent object last.")
+        return None
+    current = cmds.currentTime(query=True)
+    if scope == "frame":
+        bounds = (current, current)
+    elif scope == "selected_range":
+        bounds = worldspace._get_selected_time_range()
+        if bounds is None:
+            cmds.warning("AnimKey: Highlight a time range in the timeline first.")
+            return None
+    else:
+        bounds = worldspace._playback_range(animation=scope == "all_animation")
+    times = worldspace._sample_times(*bounds, nodes=nodes)
+    main = nodes[-1]
+    followers = nodes[:-1]
+    data = {"version": 2, "kind": "frame" if scope == "frame" else "animation",
+            "main_obj": main, "range": list(bounds), "times": times,
+            "relative_matrices": {}, "relative_samples": {node: {} for node in followers}}
+    suspended = worldspace._suspend_refresh()
+    was_busy = _state.busy
+    _state.busy = True
+    try:
+        for frame in times:
+            cmds.currentTime(frame)
+            inverse = om.MMatrix(worldspace._world_matrix(main)).inverse()
+            for node in followers:
+                relative = _matrix_values(om.MMatrix(worldspace._world_matrix(node)) * inverse)
+                data["relative_samples"][node][worldspace._time_key(frame)] = relative
+                if node not in data["relative_matrices"]:
+                    data["relative_matrices"][node] = relative
+    finally:
+        cmds.currentTime(current)
+        _state.busy = was_busy
+        worldspace._resume_refresh(suspended)
+    _save_clipboard(data, animation=scope != "frame")
+    worldspace._message("Parent relationship copied", "{} object(s), {} sample(s)".format(
+        len(followers), len(times)))
+    return data
 
 
-# Alias for backwards compatibility
+def copy_link_frame(*args):
+    return _copy_link_scope("frame")
+
+
 def copy_link(*args):
-    """Alias for copy_link_frame"""
-    copy_link_frame(*args)
+    return copy_link_frame(*args)
+
+
+def copy_link_all_animation(*args):
+    return _copy_link_scope("all_animation")
+
+
+def copy_link_selected_range(*args):
+    return _copy_link_scope("selected_range")
 
 
 def copy_link_playback_range(*args):
-    """
-    Copy the spatial relationship for the entire playback range.
-    This stores the relationship at the current frame but is intended
-    to be used with paste_link_all_keys.
-    """
-    from AnimKey.core.executionGuard import require_animkey_context
-    if not require_animkey_context("AnimKey.buttons.linkObjects.copy_link_playback_range"):
-        return None
-    global _state
-    
-    selection = cmds.ls(selection=True)
-    
-    if len(selection) < 2:
-        cmds.warning("AnimKey: Please select at least 2 objects. The last selected will be the main object.")
-        return
-    
-    main_obj = selection[-1]
-    follow_objs = selection[:-1]
-    
-    # Get playback range
-    start_frame = int(cmds.playbackOptions(query=True, minTime=True))
-    end_frame = int(cmds.playbackOptions(query=True, maxTime=True))
-    
-    save_dict = {
-        "main_obj": main_obj,
-        "relative_matrices": {},
-        "playback_range": [start_frame, end_frame]
-    }
-    
-    for follow_obj in follow_objs:
-        # Get world matrices at current frame
-        main_matrix = cmds.xform(main_obj, query=True, matrix=True, worldSpace=True)
-        follow_matrix = cmds.xform(follow_obj, query=True, matrix=True, worldSpace=True)
-        
-        main_mmatrix = om.MMatrix(main_matrix)
-        follow_mmatrix = om.MMatrix(follow_matrix)
-        
-        relative_matrix = follow_mmatrix * main_mmatrix.inverse()
-        
-        save_dict["relative_matrices"][follow_obj] = [
-            relative_matrix.getElement(i, j) 
-            for i in range(4) 
-            for j in range(4)
-        ]
-    
-    # Save to file
-    folder = _get_link_data_folder()
-    os.makedirs(folder, exist_ok=True)
-    
-    file_path = _get_link_data_file()
-    atomic_write_json(file_path, save_dict, indent=2)
-    
-    _state.relative_data = save_dict
-    
-    cmds.inViewMessage(
-        amg=f"<span style='color:#b48ead'>Link Copied (Playback Range)</span><br>"
-            f"<span style='color:#88c0d0'>{len(follow_objs)} object(s) linked to {main_obj}</span><br>"
-            f"<span style='color:#ebcb8b'>Range: {start_frame} - {end_frame}</span>",
-        pos='topCenter',
-        fade=True,
-        fadeStayTime=2000
-    )
+    return _copy_link_scope("playback_range")
 
 
-def _apply_link_at_frame(frame, set_key=True):
-    """
-    Internal function to apply link at a specific frame.
-    
-    Args:
-        frame: The frame to apply the link at
-        set_key: Whether to set keyframes
-    """
-    global _state
-    
-    main_obj = _state.relative_data.get("main_obj")
-    relative_matrices = _state.relative_data.get("relative_matrices", {})
-    
-    if not main_obj or not cmds.objExists(main_obj):
+def _apply_link_at_frame(frame, set_key=True, data=None):
+    data = _state.relative_data if data is None else data
+    main = data.get("main_obj")
+    if not main or not cmds.objExists(main):
         return False
-    
-    follow_objs = list(relative_matrices.keys())
-    
     cmds.currentTime(frame)
-    
-    for follow_obj in follow_objs:
-        if not cmds.objExists(follow_obj):
-            continue
-        
-        if follow_obj in relative_matrices:
-            relative_matrix_list = relative_matrices[follow_obj]
-            relative_matrix = om.MMatrix()
-            
-            for i in range(4):
-                for j in range(4):
-                    relative_matrix.setElement(i, j, relative_matrix_list[i * 4 + j])
-            
-            main_matrix = cmds.xform(main_obj, query=True, matrix=True, worldSpace=True)
-            main_mmatrix = om.MMatrix(main_matrix)
-            
-            new_follow_matrix = relative_matrix * main_mmatrix
-            new_follow_matrix_list = [
-                new_follow_matrix.getElement(i, j) 
-                for i in range(4) 
-                for j in range(4)
-            ]
-            
-            cmds.xform(follow_obj, matrix=new_follow_matrix_list, worldSpace=True)
-            
-            if set_key:
-                cmds.setKeyframe(follow_obj, attribute='translate', t=frame)
-                cmds.setKeyframe(follow_obj, attribute='rotate', t=frame)
-                cmds.setKeyframe(follow_obj, attribute='scale', t=frame)
-    
-    return True
+    main_matrix = om.MMatrix(worldspace._world_matrix(main))
+    samples = data.get("relative_samples", {})
+    static = data.get("relative_matrices", {})
+    # Cache the driver before changing followers, and solve ancestors first.
+    desired = {}
+    for node, relative in static.items():
+        if data.get("kind") == "animation":
+            relative = samples.get(node, {}).get(worldspace._time_key(frame))
+        if relative is not None and cmds.objExists(node):
+            desired[node] = _matrix_values(om.MMatrix(relative) * main_matrix)
+    for node in sorted(desired, key=lambda item: item.count("|")):
+        cmds.xform(node, matrix=desired[node], worldSpace=True)
+        if set_key:
+            for attr in ("translateX", "translateY", "translateZ",
+                         "rotateX", "rotateY", "rotateZ", "scaleX", "scaleY", "scaleZ"):
+                if cmds.getAttr(node + "." + attr, settable=True):
+                    cmds.setKeyframe(node, attribute=attr, time=frame)
+    return bool(desired)
+
+
+def _paste_link_scope(scope):
+    if not _allowed("paste_link_" + scope):
+        return None
+    bounds = None
+    if scope == "selected_range":
+        bounds = worldspace._get_selected_time_range()
+        if bounds is None:
+            cmds.warning("AnimKey: Highlight a time range in the timeline first.")
+            return None
+    if scope == "frame":
+        data = read_json(_get_link_data_file(False), default=None)
+        if not isinstance(data, dict):
+            cmds.warning("AnimKey: Copy a Parent frame first.")
+            return None
+    else:
+        if not _state.relative_data and not _load_relative_data():
+            cmds.warning("AnimKey: No Parent data found. Copy Parent first.")
+            return None
+        data = _state.relative_data
+    main = data.get("main_obj")
+    if not main or not cmds.objExists(main):
+        cmds.warning("AnimKey: Copied parent object is not in this scene.")
+        return None
+    current = cmds.currentTime(query=True)
+    if scope == "frame":
+        frames = [current]
+    else:
+        if bounds is None:
+            bounds = worldspace._playback_range(animation=scope == "all_animation")
+        if data.get("kind") == "animation":
+            frames = sorted(float(value) for value in data.get("times", [])
+                            if scope == "all_animation" or
+                            bounds[0] - 1e-7 <= float(value) <= bounds[1] + 1e-7)
+        else:
+            nodes = [main] + list(data.get("relative_matrices", {}))
+            frames = worldspace._sample_times(*bounds, nodes=nodes)
+    if not frames:
+        cmds.warning("AnimKey: No copied samples inside this range.")
+        return 0
+    suspended = worldspace._suspend_refresh()
+    auto_key = cmds.autoKeyframe(query=True, state=True)
+    was_busy = _state.busy
+    _state.busy = True
+    cmds.undoInfo(openChunk=True, chunkName="AnimKey Parent Paste")
+    try:
+        cmds.autoKeyframe(state=False)
+        count = sum(bool(_apply_link_at_frame(frame, set_key=True, data=data)) for frame in frames)
+    finally:
+        try:
+            cmds.currentTime(current)
+            cmds.autoKeyframe(state=auto_key)
+        finally:
+            _state.busy = was_busy
+            worldspace._resume_refresh(suspended)
+            cmds.undoInfo(closeChunk=True)
+    worldspace._message("Parent relationship pasted", "{} sample(s)".format(count))
+    return count
 
 
 def paste_link_frame(*args):
-    """
-    Apply the saved spatial relationship at the current frame only.
-    """
-    from AnimKey.core.executionGuard import require_animkey_context
-    if not require_animkey_context("AnimKey.buttons.linkObjects.paste_link_frame"):
-        return None
-    global _state
-    
-    if not _state.relative_data:
-        if not _load_relative_data():
-            cmds.warning("AnimKey: No link data found. Run 'Copy Link' first.")
-            return
-    
-    main_obj = _state.relative_data.get("main_obj")
-    if not main_obj or not cmds.objExists(main_obj):
-        cmds.warning(f"AnimKey: Main object '{main_obj}' not found in scene.")
-        return
-    
-    current_frame = cmds.currentTime(query=True)
-    
-    cmds.undoInfo(openChunk=True)
-    try:
-        _apply_link_at_frame(current_frame, set_key=True)
-        
-        cmds.inViewMessage(
-            amg=f"<span style='color:#a3be8c'>Link Pasted (Frame {int(current_frame)})</span>",
-            pos='topCenter',
-            fade=True,
-            fadeStayTime=1500
-        )
-    finally:
-        cmds.undoInfo(closeChunk=True)
+    return _paste_link_scope("frame")
+
+
+def paste_link_all_animation(*args):
+    return _paste_link_scope("all_animation")
+
+
+def paste_link_selected_range(*args):
+    return _paste_link_scope("selected_range")
 
 
 def paste_link_playback_range(*args):
-    """
-    Apply the saved spatial relationship to all frames in the playback range.
-    """
-    global _state
-    
-    if not _state.relative_data:
-        if not _load_relative_data():
-            cmds.warning("AnimKey: No link data found. Run 'Copy Link' first.")
-            return
-    
-    main_obj = _state.relative_data.get("main_obj")
-    if not main_obj or not cmds.objExists(main_obj):
-        cmds.warning(f"AnimKey: Main object '{main_obj}' not found in scene.")
-        return
-    
-    # Get playback range
-    start_frame = int(cmds.playbackOptions(query=True, minTime=True))
-    end_frame = int(cmds.playbackOptions(query=True, maxTime=True))
-    
-    frames = list(range(start_frame, end_frame + 1))
-    
-    cmds.undoInfo(openChunk=True)
-    try:
-        for frame in frames:
-            _apply_link_at_frame(frame, set_key=True)
-        
-        cmds.inViewMessage(
-            amg=f"<span style='color:#a3be8c'>Link Pasted (Playback Range)</span><br>"
-                f"<span style='color:#88c0d0'>{len(frames)} frame(s) processed</span><br>"
-                f"<span style='color:#ebcb8b'>Range: {start_frame} - {end_frame}</span>",
-            pos='topCenter',
-            fade=True,
-            fadeStayTime=2000
-        )
-    finally:
-        cmds.undoInfo(closeChunk=True)
+    return _paste_link_scope("playback_range")
 
 
 def paste_link(*args):
-    """
-    Apply the saved spatial relationship to objects.
-    
-    If a timeline range is selected, keyframes will be created for each frame.
-    Otherwise, applies to the current frame only.
-    """
-    global _state
-    
-    # Load data if not already loaded
-    if not _state.relative_data:
-        if not _load_relative_data():
-            cmds.warning("AnimKey: No link data found. Run 'Copy Link' first.")
-            return
-    
-    main_obj = _state.relative_data.get("main_obj")
-    relative_matrices = _state.relative_data.get("relative_matrices", {})
-    
-    if not main_obj or not cmds.objExists(main_obj):
-        cmds.warning(f"AnimKey: Main object '{main_obj}' not found in scene.")
-        return
-    
-    follow_objs = list(relative_matrices.keys())
-    
-    # Check for timeline range selection
-    playback_range = (
-        cmds.playbackOptions(query=True, minTime=True),
-        cmds.playbackOptions(query=True, maxTime=True)
-    )
-    
-    try:
-        range_start, range_end = cmds.timeControl('timeControl1', q=True, rangeArray=True)
-        
-        if range_start != playback_range[0] or range_end != playback_range[1]:
-            frames = list(range(int(range_start), int(range_end)))
-        else:
-            frames = [cmds.currentTime(query=True)]
-    except:
-        frames = [cmds.currentTime(query=True)]
-    
-    # Apply link for each frame
-    cmds.undoInfo(openChunk=True)
-    
-    try:
-        for frame in frames:
-            _apply_link_at_frame(frame, set_key=True)
-        
-        frame_count = len(frames)
-        cmds.inViewMessage(
-            amg=f"<span style='color:#a3be8c'>Link Pasted</span><br>"
-                f"<span style='color:#88c0d0'>{len(follow_objs)} object(s), {frame_count} frame(s)</span>",
-            pos='topCenter',
-            fade=True,
-            fadeStayTime=1500
-        )
-    
-    finally:
-        cmds.undoInfo(closeChunk=True)
+    scope = "selected_range" if worldspace._get_selected_time_range() else "frame"
+    return _paste_link_scope(scope)
 
 
 def paste_link_realtime():
-    """
-    Apply link in real-time (used by auto-link callback).
-    Simplified version without timeline range check for speed.
-    """
-    global _state
-    
-    main_obj = _state.relative_data.get("main_obj")
-    relative_matrices = _state.relative_data.get("relative_matrices", {})
-    
-    if not main_obj or not cmds.objExists(main_obj):
+    if _state.busy:
         return
-    
-    follow_objs = list(relative_matrices.keys())
-    
-    for follow_obj in follow_objs:
-        if not cmds.objExists(follow_obj):
-            continue
-        
-        if follow_obj in relative_matrices:
-            relative_matrix_list = relative_matrices[follow_obj]
-            relative_matrix = om.MMatrix()
-            
-            for i in range(4):
-                for j in range(4):
-                    relative_matrix.setElement(i, j, relative_matrix_list[i * 4 + j])
-            
-            main_matrix = cmds.xform(main_obj, query=True, matrix=True, worldSpace=True)
-            main_mmatrix = om.MMatrix(main_matrix)
-            
-            new_follow_matrix = relative_matrix * main_mmatrix
-            new_follow_matrix_list = [
-                new_follow_matrix.getElement(i, j) 
-                for i in range(4) 
-                for j in range(4)
-            ]
-            
-            cmds.xform(follow_obj, matrix=new_follow_matrix_list, worldSpace=True)
+    _state.busy = True
+    try:
+        _apply_link_at_frame(cmds.currentTime(query=True), set_key=False)
+    finally:
+        _state.busy = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

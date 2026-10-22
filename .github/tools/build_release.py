@@ -14,7 +14,7 @@ VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
 VERSION_FILE_PATTERN = re.compile(
     r'^__version__\s*=\s*[\'\"]([^\'\"]+)[\'\"]', re.MULTILINE
 )
-SKIPPED_DIRECTORIES = {"__pycache__", ".git", ".pytest_cache"}
+SKIPPED_DIRECTORIES = {"__pycache__", ".git", ".pytest_cache", ".mayaswatches"}
 SKIPPED_SUFFIXES = (".pyc", ".pyo")
 TOP_LEVEL_FILES = ("AnimKey_Install.py", "AnimKey_plugin.py", "README.md")
 

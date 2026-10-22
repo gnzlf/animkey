@@ -5,6 +5,7 @@
     seamlessly with Maya's native interface.
 """
 
+from AnimKey.mods import material_palette as material
 # ═══════════════════════════════════════════════════════════════════════════════
 #                              COLOR PALETTES
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -19,16 +20,16 @@ THEMES = {
         "description": "Theme inspired by Maya's native interface",
         
         # Base colors - Match Maya's grey tones
-        "bg_primary": "#3a3a3a",
-        "bg_secondary": "#444444",
-        "bg_tertiary": "#4d4d4d",
-        "bg_hover": "#555555",
-        "bg_pressed": "#363636",
+        "bg_primary": material.SURFACE,
+        "bg_secondary": material.CONTROL,
+        "bg_tertiary": "#2b3341",
+        "bg_hover": material.HOVER,
+        "bg_pressed": material.PRESSED,
         
         # Text colors
-        "text_primary": "#cccccc",
-        "text_secondary": "#999999",
-        "text_muted": "#666666",
+        "text_primary": material.TEXT,
+        "text_secondary": material.SECONDARY,
+        "text_muted": material.MUTED,
         "text_accent": "#88aadd",
         
         # Accent colors - Colorful palette for buttons
@@ -40,21 +41,21 @@ THEMES = {
         "accent_danger": "#bf616a",     # Red
         
         # Slider colors
-        "slider_bg": "#333333",
-        "slider_groove": "#444444",
-        "slider_handle": "#888888",
-        "slider_handle_hover": "#aaaaaa",
+        "slider_bg": "#151a23",
+        "slider_groove": "#303a49",
+        "slider_handle": "#bdc9da",
+        "slider_handle_hover": "#d9e4f2",
         "slider_tick": "#6699cc",
         
         # Button colors
-        "button_bg": "#4d4d4d",
-        "button_hover": "#5a5a5a",
-        "button_pressed": "#404040",
-        "button_border": "#5a5a5a",
+        "button_bg": material.CONTROL,
+        "button_hover": material.HOVER,
+        "button_pressed": material.PRESSED,
+        "button_border": material.BORDER,
         
         # Border & Effects
-        "border_color": "#5a5a5a",
-        "border_radius": "3px",
+        "border_color": material.BORDER,
+        "border_radius": "8px",
         "shadow_color": "rgba(0, 0, 0, 0.2)",
         "glow_color": "rgba(102, 153, 204, 0.1)",
         

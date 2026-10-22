@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
 from unittest import mock
 from AnimKey.mods.maya_compat import QtWidgets
@@ -13,6 +14,7 @@ except RuntimeError:
 import maya.cmds as cmds
 from AnimKey.buttons import copyAnimation as copy_anim
 from AnimKey.core import animation_curve_transfer as transfer
+from AnimKey.core.executionGuard import animkey_execution
 
 
 class CopyStorageTests(unittest.TestCase):
@@ -83,6 +85,97 @@ class CopyStorageTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8-sig") as handle:
                 handle.write(content)
             self.assertEqual(copy_anim.load_animation_file(path), (meta, payload))
+
+    def test_save_and_load_animation_file_preserve_layers_and_clipboard(self):
+        control, layer = self.make_layered_clip()
+        copy_anim._anim_buffer = {"previous_clipboard": {}}
+        copy_anim._anim_layer_metadata = {"previous_layer": {"weight": 0.25}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "chosen_animation")
+            with animkey_execution("Storage test"), \
+                    mock.patch.object(cmds, "fileDialog2", return_value=[path]), \
+                    mock.patch.object(copy_anim, "get_selected_time_range", return_value=(1, 10)):
+                saved = copy_anim.save_animation()
+            self.assertEqual(saved, path + ".animkey_anim")
+            self.assertEqual(copy_anim._anim_buffer, {"previous_clipboard": {}})
+            self.assertEqual(copy_anim._anim_layer_metadata, {"previous_layer": {"weight": 0.25}})
+            meta, payload = copy_anim.load_animation_file(saved)
+            self.assertEqual(meta["type"], "animation")
+            self.assertIn(layer, meta["layers"])
+
+            cmds.file(new=True, force=True)
+            cmds.namespace(add="Target")
+            target = cmds.createNode("transform", name="Target:ctrl")
+            cmds.select(target)
+            with animkey_execution("Storage test"), \
+                    mock.patch.object(cmds, "fileDialog2", return_value=[saved]), \
+                    mock.patch.object(copy_anim, "get_user_data_folder", return_value=directory):
+                self.assertEqual(copy_anim.load_animation(), saved)
+                for worker in threading.enumerate():
+                    if worker.name == "AnimKeyJsonWriter":
+                        worker.join(5)
+            for layer_name, expected in (("BaseAnimation", [1., 5., 10.]),
+                                         (layer, [2., 10., 20.])):
+                curve = transfer.resolve_anim_curve(target + ".translateX", layer_name=layer_name)
+                self.assertEqual(cmds.keyframe(curve, query=True, valueChange=True), expected)
+
+    def test_save_pose_and_load_on_active_layer_at_playhead(self):
+        source, layer = self.make_layered_clip()
+        cmds.currentTime(5)
+        expected = cmds.getAttr(source + ".translateX")
+        previous = {"meta": {"name": "previous_pose"}, "animation": {}}
+        copy_anim._pose_buffer = previous
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "chosen_pose.animkey_pose")
+            with animkey_execution("Storage test"), \
+                    mock.patch.object(cmds, "fileDialog2", return_value=[path]):
+                self.assertEqual(copy_anim.save_pose(), path)
+            self.assertIs(copy_anim._pose_buffer, previous)
+            self.assertEqual(copy_anim._read_clip_file(path, "pose")["meta"]["source_frame"], 5)
+
+            cmds.file(new=True, force=True)
+            cmds.namespace(add="Target")
+            target = cmds.createNode("transform", name="Target:ctrl")
+            cmds.setKeyframe(target, attribute="translateX", time=21, value=100)
+            destination = cmds.animLayer("Destination")
+            cmds.animLayer(destination, edit=True, attribute=target + ".translateX")
+            for name in cmds.ls(type="animLayer"):
+                cmds.animLayer(name, edit=True, selected=False, preferred=False)
+            cmds.animLayer(destination, edit=True, selected=True, preferred=True)
+            cmds.currentTime(21)
+            cmds.select(target)
+            with animkey_execution("Storage test"), \
+                    mock.patch.object(cmds, "fileDialog2", return_value=[path]), \
+                    mock.patch.object(copy_anim, "get_user_data_folder", return_value=directory):
+                self.assertEqual(copy_anim.load_pose(), path)
+                for worker in threading.enumerate():
+                    if worker.name == "AnimKeyJsonWriter":
+                        worker.join(5)
+            self.assertAlmostEqual(cmds.getAttr(target + ".translateX"), expected)
+            curve = transfer.resolve_anim_curve(target + ".translateX", layer_name=destination)
+            self.assertEqual(cmds.keyframe(curve, query=True, timeChange=True), [21.])
+
+    def test_cancel_save_does_not_capture_or_write(self):
+        self.make_layered_clip()
+        with animkey_execution("Storage test"), \
+                mock.patch.object(cmds, "fileDialog2", return_value=None), \
+                mock.patch.object(copy_anim, "_capture_file_animation") as capture:
+            self.assertIsNone(copy_anim.save_animation())
+            capture.assert_not_called()
+
+    def test_invalid_animation_file_does_not_replace_clipboard(self):
+        previous = {"previous_clipboard": {}}
+        copy_anim._anim_buffer = previous
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "invalid.animkey_anim")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"animation": {"ctrl": {"translateX": {
+                    "keyframes": [1, 2], "values": [3],
+                }}}}, handle)
+            with animkey_execution("Storage test"), \
+                    mock.patch.object(cmds, "fileDialog2", return_value=[path]):
+                self.assertIsNone(copy_anim.load_animation())
+            self.assertIs(copy_anim._anim_buffer, previous)
 
 
 if __name__ == "__main__":

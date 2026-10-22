@@ -17,6 +17,8 @@ if "_active" not in globals():
     _active = False
 if "_script_jobs" not in globals():
     _script_jobs = []
+if "_running" not in globals():
+    _running = False
 _pending = False
 
 
@@ -73,36 +75,53 @@ def refresh():
     context = _tumble_context()
     if not context:
         return False
-    results = (
-        _set_setting(context, "objectTumble", False),
-        _set_setting(context, "localTumble", 0 if _active else 1),
-        _set_setting(context, "autoSetPivot", _active),
-    )
+    # Context commands are undoable. A later animation Undo must never restore
+    # the broken navigation preferences or consume a camera-preference step.
+    undo_enabled = cmds.undoInfo(query=True, state=True)
+    if undo_enabled:
+        cmds.undoInfo(stateWithoutFlush=False)
+    try:
+        results = (
+            _set_setting(context, "objectTumble", False),
+            _set_setting(context, "localTumble", 0 if _active else 1),
+            _set_setting(context, "autoSetPivot", _active),
+        )
+    finally:
+        if undo_enabled:
+            cmds.undoInfo(stateWithoutFlush=True)
     return all(results)
 
 
 def _refresh_deferred():
     global _pending
-    if _pending:
+    if _pending or not _running:
         return
     _pending = True
     try:
         cmds.evalDeferred(
             "from AnimKey.mods import tumbleAroundSelection; "
-            "tumbleAroundSelection.refresh()",
+            "tumbleAroundSelection._run_deferred()",
             lowestPriority=True,
         )
     except TypeError:
         cmds.evalDeferred(
             "from AnimKey.mods import tumbleAroundSelection; "
-            "tumbleAroundSelection.refresh()"
+            "tumbleAroundSelection._run_deferred()"
         )
     except Exception:
         _pending = False
 
 
+def _run_deferred():
+    global _pending
+    _pending = False
+    if _running:
+        refresh()
+
+
 def _install_script_jobs():
     global _script_jobs
+    _script_jobs = [job for job in _script_jobs if cmds.scriptJob(exists=job)]
     if _script_jobs:
         return
     for event_name in ("ToolChanged", "SceneOpened", "NewSceneOpened"):
@@ -126,21 +145,30 @@ def _kill_script_jobs():
 
 
 def apply(enabled=None):
-    global _active, _pending
+    global _active, _pending, _running
     if enabled is None:
         enabled = is_enabled()
     _active = bool(enabled)
+    _running = True
     _pending = False
-    if _active:
-        _install_script_jobs()
-    else:
-        _kill_script_jobs()
+    # Maya can reload context preferences when tools or scenes change, even
+    # while our selection-following mode is off. Keep normal F navigation safe.
+    _install_script_jobs()
 
     # Disabled means normal center-of-interest navigation. Restoring a saved
     # cursor-pivot setting could reproduce the jump even with the box unchecked;
     # after a restart there may be no saved snapshot to restore at all.
     if not refresh():
         _refresh_deferred()
+
+
+def shutdown():
+    global _active, _running, _pending
+    _active = False
+    _running = False
+    _pending = False
+    _kill_script_jobs()
+    refresh()
 
 
 def is_active():

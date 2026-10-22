@@ -247,7 +247,7 @@ DEFAULT_WORKSPACE = {
     "buttons": {
         "ISO": True, "ALN": True, "OPP": True, "TRL": True,
         "RST": True, "TMP": True, "OFF": True, "HIR": True, "MIR": True,
-        "C": True, "LKN": True, "CAM": True, "WS": True, "PIV": True, "RUL": True,
+        "C": True, "LKN": True, "CAM": True, "WS": True, "PIV": True, "TMC": True, "RUL": True,
         "PLT": True, "STP": True, "FLT": True, "LIN": True, "CLP": True, "SPL": True, "AUT": True,
         "RBK": True, "GMB": True, "SWT": True, "BAK": True, "RTM": True, "ACL": True, "BTNS": True, "SETS": True, "CRASH": True
     },

@@ -11,6 +11,7 @@ import json
 import os
 
 from AnimKey.mods.storage import atomic_write_json
+from AnimKey.core.window_style import apply_window_style, polish_tool_widgets
 
 from AnimKey.mods.maya_compat import (
     QtCore, QtGui, QtWidgets, execute_qt, screen_available_geometry,
@@ -571,6 +572,7 @@ class PopupInput(QtWidgets.QWidget):
         self.selected_color = _palette_color(initial_color)
         self._color_buttons = []
         self.setup_ui()
+        apply_window_style(self)
         
     def setup_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
@@ -636,6 +638,7 @@ class PopupInput(QtWidgets.QWidget):
             palette_grid.setVerticalSpacing(5)
             for index, color in enumerate(self._palette):
                 button = QtWidgets.QToolButton(palette_widget)
+                button.setProperty("preserveMaterialStyle", True)
                 button.setFixedSize(24, 24)
                 button.setCursor(QtCore.Qt.PointingHandCursor)
                 button.setToolTip(color)
@@ -4030,7 +4033,7 @@ class SetManagerWindow(QtWidgets.QWidget):
         self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.FramelessWindowHint)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
         
-        self._base_opacity = 0.5
+        self._base_opacity = 1.0
         self._hover_opacity = 1.0
         self._anim = None
         self._sort_mode = "Manual"
@@ -4042,6 +4045,8 @@ class SetManagerWindow(QtWidgets.QWidget):
         
         if len(self.pages) == 0:
             self.add_new_tab()
+
+        apply_window_style(self)
             
         QtCore.QTimer.singleShot(100, self.refresh_all_namespaces)
 
@@ -4213,6 +4218,7 @@ class SetManagerWindow(QtWidgets.QWidget):
             name = f"Tab {self.tab_bar.count() + 1}"
             
         page = TabPage()
+        polish_tool_widgets(page)
         self.pages.append(page)
         self.stack.addWidget(page)
         

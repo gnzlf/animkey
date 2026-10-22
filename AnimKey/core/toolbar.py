@@ -34,6 +34,7 @@ from AnimKey.mods import styleMod as style
 from AnimKey.mods import configMod as config
 from AnimKey.mods import uiMod as ui
 from AnimKey.core.executionGuard import animkey_execution
+from AnimKey.core.toolbar_style import apply_toolbar_style
 from AnimKey.sliders.graph_editor_view import GraphEditorViewSync
 
 
@@ -67,6 +68,9 @@ from AnimKey.buttons.copyAnimation import (
     execute as copy_animation_execute,
     copy_animation,
     save_animation,
+    load_animation,
+    save_pose,
+    load_pose,
     paste_animation,
     paste_insert_animation,
     paste_opposite_animation,
@@ -87,8 +91,12 @@ from AnimKey.buttons.linkObjects import (
     execute as link_objects_execute,
     copy_link_frame,
     copy_link_playback_range,
+    copy_link_all_animation,
+    copy_link_selected_range,
     paste_link_frame,
     paste_link_playback_range,
+    paste_link_all_animation,
+    paste_link_selected_range,
     toggle_auto_link,
     is_auto_link_enabled
 )
@@ -100,10 +108,14 @@ from AnimKey.buttons.select_hierarchy import (
     select_visible_nurbs_curves
 )
 from AnimKey.buttons.tempPivot import (
-    execute as temp_pivot_execute,
+    show_menu as temp_pivot_menu,
     execute_temp_pivot as temp_pivot_quick_execute,
     is_active as is_temp_pivot_active, 
     set_button_active as set_temp_pivot_button_active
+)
+from AnimKey.buttons.tempControls import (
+    execute as temp_controls_execute,
+    show_menu as temp_controls_menu,
 )
 from AnimKey.buttons.trail import (
     execute as trail_execute,
@@ -1938,6 +1950,7 @@ class AnimKeyToolbar:
         # SECTION 5: Settings items (BRUSH, CRASH, Settings) added directly
         # ─────────────────────────────────────────────────────────────────────
         self._add_settings_items_to_layout(main_layout)
+        apply_toolbar_style(self)
 
         # ─────────────────────────────────────────────────────────────────────
         # Apply initial slider visibility from workspace config (no animation)
@@ -2310,7 +2323,7 @@ class AnimKeyToolbar:
         theme = ThemeManager.get_current_theme()
         scale = float(self.config.get("toolbar_scale", 1.0))
 
-        self._tangent_toggle_btn = QtWidgets.QPushButton()
+        self._tangent_toggle_btn = ui.HoverButton()
         self._tangent_toggle_btn.setObjectName("TANGENT_TOGGLE")
         self._tangent_toggle_btn.setFixedSize(max(14, int(16 * scale)), icon_size)
         self._tangent_toggle_btn.setCursor(QtCore.Qt.PointingHandCursor)
@@ -2544,7 +2557,8 @@ class AnimKeyToolbar:
             ("LKN", "Link Objects", link_objects_execute, "#b48ead"),      # Purple - Link Objects
             ("CAM", "Follow Cam", follow_cam_execute, "#5e81ac"),          # Dark Blue - Follow Cam
             ("WS", "World Space — Click: copy frame | Shift: paste | Ctrl: Auto | Right-click: ranges", copy_worldspace_execute, "#a3be8c"),
-            ("PIV", "TEMP (Right-click: Temp Control)", temp_pivot_quick_execute, "#bf616a"),
+            ("PIV", "Temp Pivot | Shift: Last Object | Ctrl: Center | Ctrl+Shift: World | Alt: Edit | Ctrl+Alt: Reset", temp_pivot_quick_execute, "#5bc0be"),
+            ("TMC", "Temp Controls | Ctrl: Relative | Shift: Object | Alt: Toggle + Bake | Shift+Alt: Panel", temp_controls_execute, "#5bc0be"),
             ("RUL", "Micro Move", None, "#ebcb8b"),                        # Yellow - Micro Move (callback set separately)
         ]
         
@@ -2614,7 +2628,7 @@ class AnimKeyToolbar:
                                 print(f"AnimKey: Triggered '{action_name}' via button click shortcut '{shortcut_str}'")
                                 execute_action(action_name)
                                 return  # Successfully executed mapped action
-                            else:
+                            elif t not in ("PIV", "TMC"):
                                 # Modifiers were pressed but not mapped to anything. Do nothing.
                                 return
                                 
@@ -2627,7 +2641,7 @@ class AnimKeyToolbar:
             icon_path = media.get_button_icon(text)
             
             # Always create the button first
-            btn = QtWidgets.QPushButton()
+            btn = ui.HoverButton()
             btn.setObjectName(text)
             btn.setText(text)  # Set text as fallback
             
@@ -2669,8 +2683,9 @@ class AnimKeyToolbar:
                         lambda checked=False, b=piv_btn: temp_pivot_quick_execute(button=b)
                     )
                 )
-                if is_temp_pivot_active():
-                    set_temp_pivot_button_active(piv_btn, True)
+                set_temp_pivot_button_active(piv_btn, False)
+            elif text == "TMC":
+                btn.clicked.connect(picking_wrapper(lambda checked=False, b=btn: temp_controls_execute(button=b)))
             # Special handling for C button (copy animation) – pass button ref for popup anchoring
             elif text == "C":
                 copy_btn = btn
@@ -2752,7 +2767,12 @@ class AnimKeyToolbar:
             elif text == "PIV":
                 btn.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
                 btn.customContextMenuRequested.connect(
-                    lambda pos, button=btn: temp_pivot_execute(button=button)
+                    lambda pos, button=btn: temp_pivot_menu(button=button, pos=pos)
+                )
+            elif text == "TMC":
+                btn.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+                btn.customContextMenuRequested.connect(
+                    lambda pos, button=btn: temp_controls_menu(button=button, pos=pos)
                 )
             elif text == "TRL":
                 btn.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
@@ -2870,7 +2890,7 @@ class AnimKeyToolbar:
         # ─────────────────────────────────────────────────────────────────────
         # Selector Button (shows count of selected objects)
         # ─────────────────────────────────────────────────────────────────────
-        self.selector_button = QtWidgets.QPushButton("0")
+        self.selector_button = ui.HoverButton("0")
         self.selector_button.setObjectName("SELECTOR")
         self.selector_button.setFixedSize(int(32 * float(self.config.get("toolbar_scale", 1.0))), int(28 * float(self.config.get("toolbar_scale", 1.0))))
         self.selector_button.setStyleSheet(f'''
@@ -2998,7 +3018,7 @@ class AnimKeyToolbar:
         target_layout.addWidget(ui.AnimKeySeparator("vertical"))
 
         # Selection Sets button lives with the right-side utility buttons.
-        sets_btn = QtWidgets.QPushButton("Sel Sets")
+        sets_btn = ui.HoverButton("Sel Sets")
         sets_btn.setObjectName("SETS")
         self._apply_wide_button_icon(sets_btn, "SETS", base_width=55)
 
@@ -3039,7 +3059,7 @@ class AnimKeyToolbar:
         
         # BRUSH button
         from AnimKey.buttons.brush import execute as brush_execute
-        self.brush_btn = QtWidgets.QPushButton("BRUSH")
+        self.brush_btn = ui.HoverButton("BRUSH")
         self.brush_btn.setObjectName("BRUSH")
         self._apply_wide_button_icon(self.brush_btn, "BRUSH", base_width=50)
         self.brush_btn.setToolTip("Viewport Sketchboard")
@@ -3073,7 +3093,7 @@ class AnimKeyToolbar:
 
         # ACR (Anim Crash) button with blinking capability
         from AnimKey.buttons.animCrash import execute as anim_crash_execute, RecoverySystem
-        self.crash_btn = QtWidgets.QPushButton("CRASH")
+        self.crash_btn = ui.HoverButton("CRASH")
         self.crash_btn.setObjectName("ACR")
         self._apply_wide_button_icon(self.crash_btn, "ACR", base_width=50)
 
@@ -3171,7 +3191,7 @@ class AnimKeyToolbar:
         target_layout.addWidget(settings_separator)
         
         # Settings button
-        btn_settings = QtWidgets.QPushButton("\u2699 Settings")
+        btn_settings = ui.HoverButton("\u2699 Settings")
         btn_settings.setObjectName("SETTINGS")
         btn_settings.setFixedSize(int(80 * float(self.config.get("toolbar_scale", 1.0))), int(28 * float(self.config.get("toolbar_scale", 1.0))))
         btn_settings.setStyleSheet(f'''
@@ -4464,7 +4484,10 @@ class AnimKeyToolbar:
         act_copy.setToolTip("Copy animation to temporary buffer")
         
         act_save = self._add_menu_action(menu, "Save Animation", "Save Animation")
-        act_save.setToolTip("Save animation permanently to the AnimKey library")
+        act_save.setToolTip("Save selected controls and animation layers to a chosen file")
+
+        act_load = self._add_menu_action(menu, "Load Animation", "Load Animation")
+        act_load.setToolTip("Load an animation file onto the selected controls")
         
         menu.addSeparator()
 
@@ -4485,17 +4508,26 @@ class AnimKeyToolbar:
         
         act_paste_pose = self._add_menu_action(menu, "Paste Pose", "Paste Pose")
         act_paste_pose.setToolTip("Paste pose to selected controls")
+
+        act_save_pose = self._add_menu_action(menu, "Save Pose", "Save Pose")
+        act_save_pose.setToolTip("Save the selected controls' current pose to a chosen file")
+
+        act_load_pose = self._add_menu_action(menu, "Load Pose", "Load Pose")
+        act_load_pose.setToolTip("Load a pose at the current frame and animation layer")
         
         menu.addSeparator()
         
         # Connect actions
         self._connect_guarded_action(act_copy, "Copy Animation", copy_animation)
         self._connect_guarded_action(act_save, "Save Animation", lambda: save_animation(button=button))
+        self._connect_guarded_action(act_load, "Load Animation", load_animation)
         self._connect_guarded_action(act_paste, "Paste Animation", paste_animation)
         self._connect_guarded_action(act_insert, "Paste Insert Animation", paste_insert_animation)
         self._connect_guarded_action(act_opposite, "Paste Opposite Animation", paste_opposite_animation)
         self._connect_guarded_action(act_copy_pose, "Copy Pose", copy_pose)
         self._connect_guarded_action(act_paste_pose, "Paste Pose", paste_pose)
+        self._connect_guarded_action(act_save_pose, "Save Pose", save_pose)
+        self._connect_guarded_action(act_load_pose, "Load Pose", load_pose)
         
         # Show menu at cursor position
         execute_qt(menu, button.mapToGlobal(position))
@@ -4689,6 +4721,10 @@ class AnimKeyToolbar:
         
         action_copy_range = self._add_menu_action(menu, "Copy Link Playback Range", "Copy Link Playback Range")
         action_copy_range.setToolTip("Save relationship for the entire playback range")
+        action_copy_all = self._add_menu_action(menu, "Copy Link All Animation", "Copy Link All Animation")
+        action_copy_all.setToolTip("Sample the relationship over the full animation range")
+        action_copy_selected = self._add_menu_action(menu, "Copy Link Selected Timeline Range", "Copy Link Selected Range")
+        action_copy_selected.setToolTip("Sample only the highlighted timeline range")
         
         menu.addSeparator()
         
@@ -4698,6 +4734,10 @@ class AnimKeyToolbar:
         
         action_paste_range = self._add_menu_action(menu, "Paste Link Playback Range", "Paste Link Playback Range")
         action_paste_range.setToolTip("Apply relationship to all frames in playback range")
+        action_paste_all = self._add_menu_action(menu, "Paste Link All Animation", "Paste Link All Animation")
+        action_paste_all.setToolTip("Apply copied relationships over the full animation range")
+        action_paste_selected = self._add_menu_action(menu, "Paste Link Selected Timeline Range", "Paste Link Selected Range")
+        action_paste_selected.setToolTip("Apply only inside the highlighted timeline range")
         
         menu.addSeparator()
         
@@ -4710,8 +4750,12 @@ class AnimKeyToolbar:
         # Connect actions
         self._connect_guarded_action(action_copy_frame, "Copy Link Frame", copy_link_frame)
         self._connect_guarded_action(action_copy_range, "Copy Link Playback Range", copy_link_playback_range)
+        self._connect_guarded_action(action_copy_all, "Copy Link All Animation", copy_link_all_animation)
+        self._connect_guarded_action(action_copy_selected, "Copy Link Selected Range", copy_link_selected_range)
         self._connect_guarded_action(action_paste_frame, "Paste Link Frame", paste_link_frame)
         self._connect_guarded_action(action_paste_range, "Paste Link Playback Range", paste_link_playback_range)
+        self._connect_guarded_action(action_paste_all, "Paste Link All Animation", paste_link_all_animation)
+        self._connect_guarded_action(action_paste_selected, "Paste Link Selected Range", paste_link_selected_range)
         self._connect_guarded_action(action_auto, "Toggle Auto Link", toggle_auto_link)
         
         # Show menu at cursor position

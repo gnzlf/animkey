@@ -144,7 +144,7 @@ class GimbalFixerWindow(ContextPopupWindow):
         
         
         
-        self._base_opacity = 0.5
+        self._base_opacity = 1.0
         self._hover_opacity = 1.0
         
         self.quality_names = ["Best", "Good", "Moderate", "Average", "Poor", "Worst"]
@@ -331,13 +331,8 @@ class GimbalFixerWindow(ContextPopupWindow):
             self.order_edit.setText("---")
             self.order_edit.setStyleSheet("""
                 QLineEdit {
-                    background-color: #666666;
-                    color: #888;
-                    border: none;
-                    border-radius: 6px;
-                    padding: 6px;
-                    font-size: 11px;
-                    font-weight: bold;
+                    color: #c4c8ce;
+                    font-weight: 600;
                 }
             """)
             self._disable_buttons()
@@ -359,13 +354,9 @@ class GimbalFixerWindow(ContextPopupWindow):
             self.order_edit.setText(current_order.upper())
             self.order_edit.setStyleSheet("""
                 QLineEdit {
-                    background-color: #3498DB;
-                    color: #FFF;
-                    border: none;
-                    border-radius: 6px;
-                    padding: 6px;
-                    font-size: 11px;
-                    font-weight: bold;
+                    color: #99cfff;
+                    border-color: #70b7ff;
+                    font-weight: 600;
                 }
             """)
         except:
@@ -403,43 +394,31 @@ class GimbalFixerWindow(ContextPopupWindow):
             
             color = self.quality_colors[i]
             if is_current:
-                # Current order: Filled color
+                tint = QtGui.QColor(color)
                 btn.setStyleSheet(f"""
                     QPushButton {{
-                        background-color: {color}20;
+                        background: rgba({tint.red()},{tint.green()},{tint.blue()},25);
                         color: {color};
-                        border: 2px solid {color};
-                        border-radius: 8px;
-                        padding: 10px 16px;
-                        font-size: 11px;
-                        font-weight: bold;
+                        border-color: {color};
+                        font-weight: 600;
                         text-align: left;
                     }}
                     QPushButton:hover {{
-                        background-color: {color}40;
+                        background: rgba({tint.red()},{tint.green()},{tint.blue()},45);
                         color: #ffffff;
                     }}
                 """)
             else:
-                # Other orders: Black with colored hover (Border ONLY)
                 btn.setStyleSheet(f"""
                     QPushButton {{
-                        background-color: #4d4d4d;
-                        color: #BBB;
-                        border: 1px solid #666666;
-                        border-radius: 8px;
-                        padding: 10px 16px;
-                        font-size: 11px;
                         text-align: left;
                     }}
                     QPushButton:hover {{
-                        background-color: #4d4d4d;
-                        border: 1px solid {color};
+                        border-color: {color};
                         color: {color};
                     }}
                     QPushButton:pressed {{
-                        background-color: #4d4d4d;
-                        border: 1px solid {color};
+                        border-color: {color};
                         color: #FFF;
                     }}
                 """)
@@ -451,12 +430,6 @@ class GimbalFixerWindow(ContextPopupWindow):
             btn.setEnabled(False)
             btn.setStyleSheet("""
                 QPushButton {
-                    background-color: #4d4d4d;
-                    color: #555;
-                    border: 1px solid #5a5a5a;
-                    border-radius: 8px;
-                    padding: 10px 16px;
-                    font-size: 11px;
                     text-align: left;
                 }
             """)

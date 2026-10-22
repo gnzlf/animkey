@@ -14,14 +14,8 @@ import copy
 import re
 import threading
 from datetime import datetime
-from AnimKey.mods.themes import ThemeManager
-from AnimKey.mods.uiMod import ContextPopupWindow
 from AnimKey.mods.storage import atomic_write_json
 from AnimKey.core import animation_curve_transfer as curve_transfer
-
-from AnimKey.mods.maya_compat import (
-    QtCore, QtGui, QtWidgets, screen_available_geometry,
-)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -277,17 +271,17 @@ def _ensure_target_layer(layer_name):
             # cannot recurse forever. Maya rejects an invalid parent change.
             if _ensure_target_layer(parent):
                 cmds.animLayer(layer_name, edit=True, parent=parent)
-    # A locked copied layer cannot receive curves. Restore its lock only once
-    # transfers are complete.
-    try:
-        cmds.animLayer(layer_name, edit=True, lock=False)
-    except Exception:
-        pass
+    # Existing layers belong to the scene, potentially to several rigs. Never
+    # unlock them or reset their weight/animation as a side effect of paste.
+    if curve_transfer._layer_is_locked(layer_name):
+        return None
     return layer_name
 
 
-def _restore_layer_state(layer_name, time_offset=0.0, _seen=None):
+def _restore_layer_state(layer_name, time_offset=0.0, _seen=None, _allowed=None):
     if curve_transfer.is_base_layer(layer_name):
+        return
+    if _allowed is not None and layer_name not in _allowed:
         return
     _seen = set() if _seen is None else _seen
     if layer_name in _seen:
@@ -311,7 +305,7 @@ def _restore_layer_state(layer_name, time_offset=0.0, _seen=None):
         cmds.animLayer(layer_name, edit=True, lock=state["lock"])
     parent = state.get("parent")
     if parent and not curve_transfer.is_base_layer(parent) and cmds.objExists(parent):
-        _restore_layer_state(parent, time_offset=time_offset, _seen=_seen)
+        _restore_layer_state(parent, time_offset=time_offset, _seen=_seen, _allowed=_allowed)
 
 
 def _build_animation_transfers(assignments, animation_data):
@@ -950,8 +944,7 @@ def _collect_selected_graph_animation(selected):
             selected_candidates = [
                 item for item in candidates if item[0] in selected_transforms
             ]
-            if selected_candidates:
-                candidates = selected_candidates
+            candidates = selected_candidates
         if not candidates:
             continue
 
@@ -1764,10 +1757,6 @@ def _export_buffer_to_disk(save_to_library=False):
             atomic_write_json(latest_backup, animation_data, indent=None)
             atomic_write_json(snapshot_backup, animation_data, indent=None)
             
-            # If library window is open, refresh it
-            global _library_window
-            if _library_window and _library_window.isVisible():
-                _library_window.refresh_library()
         else:
             def _mark_written(mtime):
                 global _last_disk_mtime
@@ -1832,485 +1821,6 @@ def _sync_buffer_from_disk():
         pass
 
 
-_library_window = None
-_save_window = None
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#                       VIEWPORT GIF CAPTURE HELPER
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _capture_viewport_gif(output_path, start_frame, end_frame, size=128, step=2):
-    """
-    Capture a small animated GIF of the viewport for preview thumbnails.
-
-    Uses Maya playblast to grab frames, then assembles them into a GIF.
-    Returns the output path on success, None on failure.
-    """
-    import tempfile
-    import glob
-    import struct
-    import shutil
-
-    temp_dir = tempfile.mkdtemp(prefix="animkey_gif_")
-    try:
-        # Playblast individual frames to temp dir
-        frame_files = []
-        original_time = cmds.currentTime(query=True)
-
-        # Determine which frames to capture (skip frames for smaller GIF)
-        frames_to_capture = list(range(int(start_frame), int(end_frame) + 1, step))
-        if not frames_to_capture:
-            return None
-
-        for frame in frames_to_capture:
-            cmds.currentTime(frame, edit=True)
-            temp_file = os.path.join(temp_dir, f"frame_{int(frame):06d}")
-            try:
-                result = cmds.playblast(
-                    startTime=frame,
-                    endTime=frame,
-                    format="image",
-                    compression="png",
-                    quality=50,
-                    widthHeight=[size, size],
-                    showOrnaments=False,
-                    viewer=False,
-                    offScreen=True,
-                    filename=temp_file,
-                    forceOverwrite=True,
-                    framePadding=6,
-                    percent=100,
-                )
-                if result:
-                    # Maya appends frame number to filename
-                    pattern = temp_file + ".*"
-                    found = glob.glob(pattern)
-                    if found:
-                        frame_files.append(found[0])
-            except Exception:
-                pass
-
-        cmds.currentTime(original_time, edit=True)
-
-        if len(frame_files) < 2:
-            return None
-
-        # Assemble GIF from PNG frames using a pure-Python approach
-        # Load images via Qt since we already have PySide available
-        gif_frames = []
-        for fp in frame_files:
-            img = QtGui.QImage(fp)
-            if img.isNull():
-                continue
-            scaled = img.scaled(size, size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
-            gif_frames.append(scaled)
-
-        if len(gif_frames) < 2:
-            return None
-
-        # Write as animated GIF using QImageWriter (if available) or
-        # fall back to saving just a static thumbnail
-        try:
-            # Try using imageio if available (common in Maya envs)
-            import imageio
-            frames_np = []
-            for qimg in gif_frames:
-                qimg = qimg.convertToFormat(QtGui.QImage.Format_RGBA8888)
-                ptr = qimg.bits()
-                w, h = qimg.width(), qimg.height()
-                # PySide2 returns a memoryview or shiboken wrapper
-                try:
-                    ptr.setsize(w * h * 4)
-                except Exception:
-                    pass
-                import numpy as np
-                arr = np.frombuffer(bytes(ptr), dtype=np.uint8).reshape((h, w, 4))
-                frames_np.append(arr[:, :, :3])  # drop alpha for GIF
-
-            # Calculate frame duration: ~24fps feels smooth, but cap for small gifs
-            fps = max(4, min(24, len(frames_np)))
-            duration = 1.0 / fps
-
-            imageio.mimsave(output_path, frames_np, duration=duration, loop=0)
-            return output_path
-        except ImportError:
-            pass
-
-        # Fallback: save first frame as static PNG thumbnail
-        static_path = os.path.splitext(output_path)[0] + ".gif"
-        gif_frames[0].save(static_path, "PNG")
-        if os.path.exists(static_path):
-            return static_path
-        return None
-
-    except Exception as e:
-        cmds.warning(f"AnimKey: GIF capture failed: {e}")
-        return None
-    finally:
-        # Clean up temp dir
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except Exception:
-            pass
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#                       SAVE ANIMATION WINDOW
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class SaveAnimationWindow(QtWidgets.QWidget):
-    """Popup dialog for saving animation to the library with custom name, range, and GIF."""
-
-    def __init__(self, anchor_button=None, parent=None):
-        if parent is None:
-            from AnimKey.mods import uiMod
-            parent = uiMod.get_maya_main_window()
-        super(SaveAnimationWindow, self).__init__(parent)
-        self.setObjectName("AnimKey_SaveAnimation")
-        self.anchor_button = anchor_button
-        self.theme = ThemeManager.get_current_theme()
-        self.setWindowFlags(QtCore.Qt.Popup | QtCore.Qt.FramelessWindowHint)
-        self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
-        self._tail_height = 10
-        self._tail_width = 16
-        self._tail_x = 0
-        self._tail_on_top = False
-        self.resize(340, 370)
-        self._build_ui()
-        self._position_window()
-
-    # ── Paint: rounded rect + speech-bubble tail ──────────────────────────
-    def paintEvent(self, event):
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-
-        bg = QtGui.QColor(30, 30, 30)
-        border_color = QtGui.QColor(51, 51, 51)
-
-        if self._tail_on_top:
-            body_rect = QtCore.QRectF(0.5, self._tail_height + 0.5,
-                                       self.width() - 1,
-                                       self.height() - self._tail_height - 1)
-        else:
-            body_rect = QtCore.QRectF(0.5, 0.5,
-                                       self.width() - 1,
-                                       self.height() - self._tail_height - 1)
-
-        path = QtGui.QPainterPath()
-        path.addRoundedRect(body_rect, 10, 10)
-
-        tail_cx = max(20, min(self._tail_x, self.width() - 20))
-        hw = self._tail_width / 2
-
-        if self._tail_on_top:
-            tail_base = body_rect.top()
-            path.moveTo(tail_cx - hw, tail_base)
-            path.lineTo(tail_cx, tail_base - self._tail_height)
-            path.lineTo(tail_cx + hw, tail_base)
-        else:
-            tail_base = body_rect.bottom()
-            path.moveTo(tail_cx - hw, tail_base)
-            path.lineTo(tail_cx, tail_base + self._tail_height)
-            path.lineTo(tail_cx + hw, tail_base)
-        path.closeSubpath()
-
-        self.setMask(path.toFillPolygon().toPolygon())
-
-        painter.setPen(QtGui.QPen(border_color, 1))
-        painter.setBrush(bg)
-        painter.drawPath(path)
-        painter.end()
-
-    # ── Build UI ──────────────────────────────────────────────────────────
-    def _build_ui(self):
-        outer_layout = QtWidgets.QVBoxLayout(self)
-        outer_layout.setContentsMargins(1, 1, 1, self._tail_height + 1)
-        outer_layout.setSpacing(0)
-
-        self.container = QtWidgets.QFrame()
-        self.container.setObjectName("saveAnimContainer")
-        self.container.setStyleSheet("""
-            QFrame#saveAnimContainer {
-                background-color: transparent;
-                border: none;
-            }
-        """)
-        outer_layout.addWidget(self.container)
-
-        layout = QtWidgets.QVBoxLayout(self.container)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
-
-        # ── Header ──
-        header = QtWidgets.QHBoxLayout()
-        title = QtWidgets.QLabel("Save Animation")
-        title.setStyleSheet("color: #a3be8c; font-size: 13px; font-weight: 700;")
-        header.addWidget(title)
-        header.addStretch()
-
-        close_btn = QtWidgets.QPushButton("✕")
-        close_btn.setFixedSize(20, 20)
-        close_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        close_btn.setStyleSheet("""
-            QPushButton {
-                background-color: transparent;
-                color: #888;
-                font-size: 11px;
-                font-weight: bold;
-                border: none;
-                border-radius: 3px;
-            }
-            QPushButton:hover {
-                background-color: #E74C3C;
-                color: #FFF;
-            }
-        """)
-        close_btn.clicked.connect(self.close)
-        header.addWidget(close_btn)
-        layout.addLayout(header)
-
-        # ── Subtitle ──
-        subtitle = QtWidgets.QLabel("Save animation from selected controls to the library.")
-        subtitle.setWordWrap(True)
-        subtitle.setStyleSheet("color: #9ca3af; font-size: 10px;")
-        layout.addWidget(subtitle)
-
-        # ── Shared form styles ──
-        form_style = """
-            QLabel { color: #9ca3af; font-size: 9px; font-weight: 700; border: none; }
-            QLineEdit, QSpinBox {
-                color: #FFF;
-                background-color: #2D2D2D;
-                border: 1px solid #444;
-                border-radius: 4px;
-                padding: 6px 8px;
-                font-size: 11px;
-            }
-            QLineEdit:hover, QSpinBox:hover { border-color: #555; }
-            QLineEdit:focus, QSpinBox:focus { border-color: #a3be8c; }
-            QCheckBox {
-                color: #d7dbe1;
-                font-size: 11px;
-                spacing: 6px;
-            }
-            QCheckBox::indicator {
-                width: 16px; height: 16px;
-                border-radius: 3px;
-                border: 1px solid #555;
-                background-color: #2D2D2D;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #a3be8c;
-                border-color: #a3be8c;
-            }
-            QCheckBox::indicator:hover { border-color: #a3be8c; }
-        """
-        form_widget = QtWidgets.QWidget()
-        form_widget.setStyleSheet(form_style)
-        form_layout = QtWidgets.QVBoxLayout(form_widget)
-        form_layout.setContentsMargins(0, 0, 0, 0)
-        form_layout.setSpacing(8)
-
-        # ── File Name ──
-        name_label = QtWidgets.QLabel("FILE NAME")
-        form_layout.addWidget(name_label)
-
-        self.name_input = QtWidgets.QLineEdit()
-        self.name_input.setPlaceholderText("e.g. walk_cycle, idle_pose...")
-        # Default: scene name + timestamp
-        scene_name = cmds.file(query=True, sceneName=True, shortName=True) or "untitled"
-        scene_base = os.path.splitext(scene_name)[0]
-        timestamp = datetime.now().strftime("%H%M%S")
-        self.name_input.setText(f"{scene_base}_{timestamp}")
-        self.name_input.selectAll()
-        form_layout.addWidget(self.name_input)
-
-        # ── Frame Range ──
-        range_label = QtWidgets.QLabel("FRAME RANGE")
-        form_layout.addWidget(range_label)
-
-        range_row = QtWidgets.QHBoxLayout()
-        range_row.setSpacing(6)
-
-        self.start_frame = QtWidgets.QSpinBox()
-        self.start_frame.setRange(-100000, 100000)
-        self.end_frame = QtWidgets.QSpinBox()
-        self.end_frame.setRange(-100000, 100000)
-
-        # Default range: timeline selection or playback range
-        time_range = get_selected_time_range()
-        if time_range:
-            self.start_frame.setValue(int(time_range[0]))
-            self.end_frame.setValue(int(time_range[1]))
-        else:
-            self.start_frame.setValue(int(cmds.playbackOptions(query=True, min=True)))
-            self.end_frame.setValue(int(cmds.playbackOptions(query=True, max=True)))
-
-        start_col = QtWidgets.QVBoxLayout()
-        start_col.setSpacing(2)
-        start_lbl = QtWidgets.QLabel("Start")
-        start_col.addWidget(start_lbl)
-        start_col.addWidget(self.start_frame)
-
-        end_col = QtWidgets.QVBoxLayout()
-        end_col.setSpacing(2)
-        end_lbl = QtWidgets.QLabel("End")
-        end_col.addWidget(end_lbl)
-        end_col.addWidget(self.end_frame)
-
-        range_row.addLayout(start_col, 1)
-        range_row.addLayout(end_col, 1)
-        form_layout.addLayout(range_row)
-
-        # ── GIF Preview Checkbox ──
-        self.gif_checkbox = QtWidgets.QCheckBox("Capture GIF preview")
-        self.gif_checkbox.setChecked(False)
-        self.gif_checkbox.setToolTip(
-            "Record a small viewport GIF thumbnail for the library card.\n"
-            "This takes a few seconds to capture."
-        )
-        form_layout.addWidget(self.gif_checkbox)
-
-        layout.addWidget(form_widget)
-
-        # ── Save Button ──
-        self.save_btn = QtWidgets.QPushButton("💾  Save to Library")
-        self.save_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self.save_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #a3be8c;
-                color: #1e1e1e;
-                border: none;
-                border-radius: 6px;
-                padding: 10px 16px;
-                font-size: 12px;
-                font-weight: 700;
-            }
-            QPushButton:hover {
-                background-color: #b5d19c;
-            }
-            QPushButton:pressed {
-                background-color: #8faa78;
-            }
-        """)
-        self.save_btn.clicked.connect(self._do_save)
-        layout.addWidget(self.save_btn)
-
-        # ── Status label (hidden initially) ──
-        self.status_label = QtWidgets.QLabel("")
-        self.status_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.status_label.setStyleSheet("color: #a3be8c; font-size: 10px;")
-        self.status_label.hide()
-        layout.addWidget(self.status_label)
-
-    # ── Position window (same logic as SmartAnimationLibraryWindow) ────────
-    def _position_window(self):
-        if self.anchor_button is None:
-            cursor_pos = QtGui.QCursor.pos()
-            self.move(cursor_pos.x() - self.width() // 2,
-                      cursor_pos.y() - self.height() - 10)
-            self._tail_x = self.width() // 2
-            self._tail_on_top = False
-            self.update()
-            return
-
-        btn_rect = self.anchor_button.rect()
-        btn_top_left = self.anchor_button.mapToGlobal(btn_rect.topLeft())
-        btn_center_x = btn_top_left.x() + btn_rect.width() // 2
-        btn_top_y = btn_top_left.y()
-        btn_bottom_y = btn_top_y + btn_rect.height()
-
-        screen_rect = screen_available_geometry(self.anchor_button, btn_top_left)
-
-        popup_w = self.width()
-        popup_h = self.height()
-
-        space_above = btn_top_y - screen_rect.top()
-        space_below = screen_rect.bottom() - btn_bottom_y
-
-        if space_above >= popup_h:
-            y_pos = btn_top_y - popup_h
-            self._tail_on_top = False
-        elif space_below >= popup_h:
-            y_pos = btn_bottom_y
-            self._tail_on_top = True
-        else:
-            if space_above >= space_below:
-                y_pos = btn_top_y - popup_h
-                self._tail_on_top = False
-            else:
-                y_pos = btn_bottom_y
-                self._tail_on_top = True
-
-        x_pos = btn_center_x - popup_w // 2
-        if x_pos < screen_rect.left():
-            x_pos = screen_rect.left()
-        elif x_pos + popup_w > screen_rect.right():
-            x_pos = screen_rect.right() - popup_w
-
-        self.move(x_pos, y_pos)
-        self._tail_x = btn_center_x - x_pos
-
-        if self._tail_on_top:
-            self.layout().setContentsMargins(1, self._tail_height + 1, 1, 1)
-        else:
-            self.layout().setContentsMargins(1, 1, 1, self._tail_height + 1)
-        self.update()
-
-    # ── Execute Save ──────────────────────────────────────────────────────
-    def _do_save(self):
-        file_name = self.name_input.text().strip()
-        if not file_name:
-            self.status_label.setText("⚠ Please enter a file name.")
-            self.status_label.setStyleSheet("color: #ebcb8b; font-size: 10px;")
-            self.status_label.show()
-            return
-
-        # Sanitize filename
-        safe_name = re.sub(r'[^\w\-. ]', '_', file_name)
-        if not safe_name:
-            self.status_label.setText("⚠ Invalid file name.")
-            self.status_label.setStyleSheet("color: #ebcb8b; font-size: 10px;")
-            self.status_label.show()
-            return
-
-        start = self.start_frame.value()
-        end = self.end_frame.value()
-        if end < start:
-            end = start
-            self.end_frame.setValue(end)
-
-        capture_gif = self.gif_checkbox.isChecked()
-
-        # Disable save button during operation
-        self.save_btn.setEnabled(False)
-        self.save_btn.setText("Saving...")
-        QtWidgets.QApplication.processEvents()
-
-        try:
-            _do_save_to_library(safe_name, start, end, capture_gif, self.anchor_button)
-
-            self.status_label.setText("✓ Animation saved!")
-            self.status_label.setStyleSheet("color: #a3be8c; font-size: 10px;")
-            self.status_label.show()
-
-            # Auto-close after a short delay
-            QtCore.QTimer.singleShot(800, self.close)
-
-        except Exception as e:
-            self.save_btn.setEnabled(True)
-            self.save_btn.setText("💾  Save to Library")
-            self.status_label.setText(f"⚠ Error: {e}")
-            self.status_label.setStyleSheet("color: #bf616a; font-size: 10px;")
-            self.status_label.show()
-
-    def closeEvent(self, event):
-        global _save_window
-        _save_window = None
-        super(SaveAnimationWindow, self).closeEvent(event)
-
-
 def _do_save_to_library(file_name, start_frame, end_frame, capture_gif=False, anchor_button=None):
     """
     Collect animation from selected controls and save a single
@@ -2372,21 +1882,6 @@ def _do_save_to_library(file_name, start_frame, end_frame, capture_gif=False, an
 
     atomic_write_json(file_path, save_data, indent=None)
 
-    # Optionally capture GIF preview
-    gif_path = None
-    if capture_gif:
-        gif_output = os.path.splitext(file_path)[0] + ".gif"
-        gif_path = _capture_viewport_gif(gif_output, start_frame, end_frame, size=128, step=2)
-        if gif_path:
-            # Update meta with gif path
-            save_data["meta"]["preview_gif"] = gif_path
-            atomic_write_json(file_path, save_data, indent=2)
-
-    # Refresh library window if open
-    global _library_window
-    if _library_window and _library_window.isVisible():
-        _library_window.refresh_library()
-
     cmds.inViewMessage(
         amg=f"<span style='color:#a3be8c'>Saved: {file_name}</span>",
         pos='topCenter',
@@ -2395,661 +1890,8 @@ def _do_save_to_library(file_name, start_frame, end_frame, capture_gif=False, an
     )
 
 
-def show_save_animation_window(anchor_button=None):
-    """Show the Save Animation dialog."""
-    global _save_window
-    from AnimKey.mods import uiMod
-    uiMod.close_animkey_tool_windows()
-    if _save_window is not None:
-        try:
-            if _save_window.isVisible():
-                _save_window.close()
-                return None
-        except RuntimeError:
-            _save_window = None
-        except Exception:
-            _save_window = None
-
-    _save_window = SaveAnimationWindow(anchor_button=anchor_button)
-    _save_window.show()
-    _save_window.raise_()
-    _save_window.activateWindow()
-    return _save_window
-
-
-class AnimationLibraryCard(QtWidgets.QFrame):
-    """Preview card for one saved animation."""
-
-    selected = QtCore.Signal(dict)
-
-    def __init__(self, entry, parent=None):
-        super(AnimationLibraryCard, self).__init__(parent)
-        self.entry = entry
-        self.movie = None
-        self.preview = None
-        self.setObjectName("animationLibraryCard")
-        self.setFixedHeight(80)
-        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        self.setCursor(QtCore.Qt.PointingHandCursor)
-        self.theme = ThemeManager.get_current_theme()
-        self._build_ui()
-
-    def _build_ui(self):
-        layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(8)
-
-        self._apply_card_style(False)
-
-        preview = QtWidgets.QLabel()
-        self.preview = preview
-        preview.setAlignment(QtCore.Qt.AlignCenter)
-        preview.setFixedSize(64, 64)
-        preview.setStyleSheet("""
-            QLabel {
-                background-color: #1a1a1a;
-                color: #666;
-                border: 1px solid #333;
-                border-radius: 5px;
-                font-size: 9px;
-                font-weight: 600;
-            }
-        """)
-        gif_path = self.entry.get("gif_path")
-        if gif_path and os.path.exists(gif_path):
-            self.movie = QtGui.QMovie(gif_path)
-            if self.movie.isValid():
-                self.movie.setCacheMode(QtGui.QMovie.CacheAll)
-                self.movie.setScaledSize(QtCore.QSize(64, 64))
-                preview.setMovie(self.movie)
-                self.movie.start()
-            else:
-                self.movie = None
-                preview.setText("BAD GIF")
-        else:
-            preview.setText("NO GIF")
-        layout.addWidget(preview)
-
-        info_col = QtWidgets.QVBoxLayout()
-        info_col.setContentsMargins(0, 0, 0, 0)
-        info_col.setSpacing(2)
-
-        name_label = QtWidgets.QLabel(self.entry["name"])
-        name_label.setWordWrap(True)
-        name_label.setStyleSheet("color: #f1f3f5; font-size: 11px; font-weight: 700;")
-        info_col.addWidget(name_label)
-
-        frame_range = self.entry.get("frame_range")
-        if frame_range:
-            range_text = f"{int(frame_range[0])} - {int(frame_range[1])}"
-            duration = int(frame_range[1] - frame_range[0]) + 1
-            range_sub = f"{duration} frames"
-        else:
-            range_text = "No range"
-            range_sub = "0 frames"
-
-        range_label = QtWidgets.QLabel(range_text)
-        range_label.setStyleSheet("color: #d7dbe1; font-size: 12px; font-weight: 700;")
-        info_col.addWidget(range_label)
-
-        sub_label = QtWidgets.QLabel(
-            f"{range_sub}  |  {self.entry.get('controls_count', 0)} ctrls"
-        )
-        sub_label.setStyleSheet("color: #9aa3b2; font-size: 9px;")
-        info_col.addWidget(sub_label)
-
-        info_col.addStretch()
-        layout.addLayout(info_col, 1)
-
-    def _apply_card_style(self, is_selected):
-        border = "#3498DB" if is_selected else "#333"
-        background = "#2a2a2a" if is_selected else "#222"
-        self.setStyleSheet(f"""
-            QFrame#animationLibraryCard {{
-                background-color: {background};
-                border: 1px solid {border};
-                border-radius: 6px;
-            }}
-            QFrame#animationLibraryCard:hover {{
-                border-color: #3498DB;
-                background-color: #2a2a2a;
-            }}
-        """)
-
-    def set_selected(self, is_selected):
-        self._apply_card_style(is_selected)
-
-    def mousePressEvent(self, event):
-        if event.button() == QtCore.Qt.LeftButton:
-            self.selected.emit(self.entry)
-            event.accept()
-            return
-        super(AnimationLibraryCard, self).mousePressEvent(event)
-
-    def showEvent(self, event):
-        super(AnimationLibraryCard, self).showEvent(event)
-        if self.movie is not None:
-            self.movie.start()
-
-
-class SmartAnimationLibraryWindow(ContextPopupWindow):
-    """Compact popup-style smart animation browser – context-menu feel."""
-
-    def __init__(self, anchor_button=None, parent=None):
-        if parent is None:
-            from AnimKey.mods import uiMod
-            parent = uiMod.get_maya_main_window()
-        super(SmartAnimationLibraryWindow, self).__init__(anchor_button=anchor_button, parent=parent)
-        self.setObjectName("AnimKey_CopyAnimation")
-        self.anchor_button = anchor_button
-        self.selected_entry = None
-        self.card_widgets = []
-        self.theme = ThemeManager.get_current_theme()
-        self._tail_x = 0
-        self._tail_on_top = False  # False = tail at bottom, True = tail at top
-        self.resize(340, 520)
-        self._drag_pos = None
-        self._base_opacity = 0.5
-        self._hover_opacity = 1.0
-        self._anim = None
-        self._build_ui()
-        self.refresh_library()
-        self.position_window()
-        self.setWindowOpacity(self._base_opacity)
-
-    def paintEvent(self, event):
-        """Draw solid rounded rect + speech bubble tail."""
-        return super(SmartAnimationLibraryWindow, self).paintEvent(event)
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-
-        bg = QtGui.QColor(30, 30, 30)
-        border_color = QtGui.QColor(51, 51, 51)
-
-        if self._tail_on_top:
-            body_rect = QtCore.QRectF(0.5, self._tail_height + 0.5,
-                                       self.width() - 1,
-                                       self.height() - self._tail_height - 1)
-        else:
-            body_rect = QtCore.QRectF(0.5, 0.5,
-                                       self.width() - 1,
-                                       self.height() - self._tail_height - 1)
-
-        path = QtGui.QPainterPath()
-        path.addRoundedRect(body_rect, 10, 10)
-
-        tail_cx = max(20, min(self._tail_x, self.width() - 20))
-        hw = self._tail_width / 2
-
-        if self._tail_on_top:
-            tail_base = body_rect.top()
-            path.moveTo(tail_cx - hw, tail_base)
-            path.lineTo(tail_cx, tail_base - self._tail_height)
-            path.lineTo(tail_cx + hw, tail_base)
-        else:
-            tail_base = body_rect.bottom()
-            path.moveTo(tail_cx - hw, tail_base)
-            path.lineTo(tail_cx, tail_base + self._tail_height)
-            path.lineTo(tail_cx + hw, tail_base)
-        path.closeSubpath()
-
-        # Apply mask so the widget shape matches the rounded path exactly
-        # This removes the rectangular transparent frame behind the rounded corners
-        self.setMask(path.toFillPolygon().toPolygon())
-
-        painter.setPen(QtGui.QPen(border_color, 1))
-        painter.setBrush(bg)
-        painter.drawPath(path)
-        painter.end()
-
-    def _build_ui(self):
-        outer_layout = QtWidgets.QVBoxLayout(self)
-        outer_layout.setContentsMargins(1, 1, 1, self._tail_height + 1)
-        outer_layout.setSpacing(0)
-
-        self.container = QtWidgets.QFrame()
-        self.container.setObjectName("smartLibraryContainer")
-        self.container.setStyleSheet("""
-            QFrame#smartLibraryContainer {
-                background-color: transparent;
-                border: none;
-            }
-        """)
-        outer_layout.addWidget(self.container)
-
-        layout = QtWidgets.QVBoxLayout(self.container)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
-
-        # ── Header ──
-        header = QtWidgets.QHBoxLayout()
-        self.title_label = QtWidgets.QLabel("Copy Animation")
-        self.title_label.setStyleSheet("color: #AAA; font-size: 11px; font-weight: 500;")
-        header.addWidget(self.title_label)
-        header.addStretch()
-
-        close_btn = QtWidgets.QPushButton("✕")
-        close_btn.setFixedSize(20, 20)
-        close_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        close_btn.setStyleSheet("""
-            QPushButton {
-                background-color: transparent;
-                color: #888;
-                font-size: 11px;
-                font-weight: bold;
-                border: none;
-                border-radius: 3px;
-            }
-            QPushButton:hover {
-                background-color: #E74C3C;
-                color: #FFF;
-            }
-        """)
-        close_btn.clicked.connect(self.close)
-        header.addWidget(close_btn)
-        layout.addLayout(header)
-
-        self.info_label = QtWidgets.QLabel("")
-        self.info_label.setStyleSheet("color: #a0a7b4; font-size: 9px;")
-        layout.addWidget(self.info_label)
-
-        # ── Clips scroll area (vertical list) ──
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        scroll.setStyleSheet("""
-            QScrollArea {
-                border: none;
-                background: transparent;
-            }
-            QScrollBar:vertical {
-                background: transparent;
-                width: 6px;
-                margin: 2px 0 2px 0;
-            }
-            QScrollBar::handle:vertical {
-                background: #444;
-                border-radius: 3px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background: #555;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0px;
-            }
-        """)
-
-        self.cards_widget = QtWidgets.QWidget()
-        self.cards_layout = QtWidgets.QVBoxLayout(self.cards_widget)
-        self.cards_layout.setContentsMargins(2, 2, 2, 2)
-        self.cards_layout.setSpacing(6)
-        self.cards_layout.addStretch()
-        scroll.setWidget(self.cards_widget)
-        layout.addWidget(scroll, 1)
-
-        # ── Detail / paste options panel ──
-        self.detail_panel = QtWidgets.QFrame()
-        self.detail_panel.setStyleSheet("""
-            QFrame {
-                background-color: #444444;
-                border: 1px solid #666666;
-                border-radius: 6px;
-            }
-            QLabel {
-                color: #BBB;
-                border: none;
-            }
-            QComboBox, QSpinBox {
-                color: #FFF;
-                background-color: #4d4d4d;
-                border: 1px solid #666666;
-                border-radius: 6px;
-                padding: 4px 6px;
-                font-size: 11px;
-                selection-background-color: #3498DB;
-            }
-            QComboBox:hover, QSpinBox:hover {
-                border-color: #555;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 18px;
-            }
-            QComboBox QAbstractItemView {
-                color: #FFF;
-                background-color: #4d4d4d;
-                border: 1px solid #666666;
-                selection-background-color: #3498DB;
-            }
-            QPushButton {
-                background-color: #4d4d4d;
-                color: #BBB;
-                border: 1px solid #666666;
-                border-radius: 6px;
-                padding: 7px 10px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #5a5a5a;
-                color: #FFF;
-                border-color: #888;
-            }
-            QPushButton:disabled {
-                color: #555;
-                background-color: #222;
-                border-color: #333;
-            }
-        """)
-        detail_layout = QtWidgets.QVBoxLayout(self.detail_panel)
-        detail_layout.setContentsMargins(10, 10, 10, 10)
-        detail_layout.setSpacing(6)
-
-        self.detail_title = QtWidgets.QLabel("Select a Clip")
-        self.detail_title.setStyleSheet("color: #f5f5f7; font-size: 12px; font-weight: 700; border: none;")
-        detail_layout.addWidget(self.detail_title)
-
-        self.detail_range = QtWidgets.QLabel("Choose a saved animation to configure paste options.")
-        self.detail_range.setWordWrap(True)
-        self.detail_range.setStyleSheet("color: #a0a7b4; font-size: 10px; border: none;")
-        detail_layout.addWidget(self.detail_range)
-
-        # Compact row: Target Rig + Paste Mode side by side
-        combos_row = QtWidgets.QHBoxLayout()
-        combos_row.setSpacing(6)
-
-        rig_col = QtWidgets.QVBoxLayout()
-        rig_col.setSpacing(2)
-        rig_col.addWidget(self._make_form_label("Target Rig"))
-        self.rig_combo = QtWidgets.QComboBox()
-        rig_col.addWidget(self.rig_combo)
-        combos_row.addLayout(rig_col, 1)
-
-        mode_col = QtWidgets.QVBoxLayout()
-        mode_col.setSpacing(2)
-        mode_col.addWidget(self._make_form_label("Mode"))
-        self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItem("Replace", "replace")
-        self.mode_combo.addItem("Insert", "insert")
-        mode_col.addWidget(self.mode_combo)
-        combos_row.addLayout(mode_col, 1)
-
-        detail_layout.addLayout(combos_row)
-
-        # Frame range row
-        frame_row = QtWidgets.QHBoxLayout()
-        frame_row.setSpacing(6)
-        frame_lbl_col = QtWidgets.QVBoxLayout()
-        frame_lbl_col.setSpacing(2)
-        frame_lbl_col.addWidget(self._make_form_label("Paste Range"))
-        fr = QtWidgets.QHBoxLayout()
-        fr.setSpacing(4)
-        self.start_frame = QtWidgets.QSpinBox()
-        self.start_frame.setRange(-100000, 100000)
-        self.end_frame = QtWidgets.QSpinBox()
-        self.end_frame.setRange(-100000, 100000)
-        fr.addWidget(self.start_frame)
-        fr.addWidget(self.end_frame)
-        frame_lbl_col.addLayout(fr)
-        frame_row.addLayout(frame_lbl_col, 1)
-        detail_layout.addLayout(frame_row)
-
-        self.apply_btn = QtWidgets.QPushButton("Paste Selected Animation")
-        self.apply_btn.clicked.connect(self._apply_selected_entry)
-        self.apply_btn.setEnabled(False)
-        detail_layout.addWidget(self.apply_btn)
-
-        layout.addWidget(self.detail_panel)
-
-    def _make_form_label(self, text):
-        label = QtWidgets.QLabel(text)
-        label.setStyleSheet("color: #9ca3af; font-size: 9px; font-weight: 700; border: none;")
-        return label
-
-    def _position_window(self):
-        """Position the popup anchored to the button, like a context menu."""
-        if self.anchor_button is None:
-            # Fallback: center on cursor
-            cursor_pos = QtGui.QCursor.pos()
-            self.move(cursor_pos.x() - self.width() // 2,
-                      cursor_pos.y() - self.height() - 10)
-            self._tail_x = self.width() // 2
-            self._tail_on_top = False
-            self.update()
-            return
-
-        btn_rect = self.anchor_button.rect()
-        btn_top_left = self.anchor_button.mapToGlobal(btn_rect.topLeft())
-        btn_center_x = btn_top_left.x() + btn_rect.width() // 2
-        btn_top_y = btn_top_left.y()
-        btn_bottom_y = btn_top_y + btn_rect.height()
-
-        # Get available screen geometry
-        screen_rect = screen_available_geometry(self.anchor_button, btn_top_left)
-
-        popup_w = self.width()
-        popup_h = self.height()
-
-        # Prefer opening ABOVE the button (tail at bottom pointing down)
-        space_above = btn_top_y - screen_rect.top()
-        space_below = screen_rect.bottom() - btn_bottom_y
-
-        if space_above >= popup_h:
-            # Place above button – tail at bottom
-            y_pos = btn_top_y - popup_h
-            self._tail_on_top = False
-        elif space_below >= popup_h:
-            # Place below button – tail at top
-            y_pos = btn_bottom_y
-            self._tail_on_top = True
-        else:
-            # Not enough room either way, use whichever has more space
-            if space_above >= space_below:
-                y_pos = btn_top_y - popup_h
-                self._tail_on_top = False
-            else:
-                y_pos = btn_bottom_y
-                self._tail_on_top = True
-
-        # Horizontal: try to align so tail points at button center
-        x_pos = btn_center_x - popup_w // 2
-
-        # Clamp to screen edges
-        if x_pos < screen_rect.left():
-            x_pos = screen_rect.left()
-        elif x_pos + popup_w > screen_rect.right():
-            x_pos = screen_rect.right() - popup_w
-
-        self.move(x_pos, y_pos)
-
-        # Calculate tail x relative to popup
-        self._tail_x = btn_center_x - x_pos
-
-        # Adjust outer layout margins for tail position
-        if self._tail_on_top:
-            self.layout().setContentsMargins(1, self._tail_height + 1, 1, 1)
-        else:
-            self.layout().setContentsMargins(1, 1, 1, self._tail_height + 1)
-
-        self.update()
-
-    def refresh_library(self):
-        self.card_widgets = []
-        while self.cards_layout.count():
-            item = self.cards_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-
-        entries = list_animation_library_entries()
-        if not entries:
-            empty = QtWidgets.QLabel("No saved clips yet.\nCopy animation to start building the library.")
-            empty.setAlignment(QtCore.Qt.AlignCenter)
-            empty.setMinimumHeight(100)
-            empty.setStyleSheet("""
-                QLabel {
-                    background-color: #444444;
-                    color: #9ca3af;
-                    border: 1px solid #666666;
-                    border-radius: 6px;
-                    font-size: 12px;
-                    font-weight: 600;
-                    padding: 20px;
-                }
-            """)
-            self.cards_layout.addWidget(empty)
-            self.cards_layout.addStretch()
-            self.info_label.setText("0 clips")
-            return
-
-        self.info_label.setText(f"{len(entries)} clips available")
-        for entry in entries:
-            card = AnimationLibraryCard(entry)
-            card.selected.connect(self._select_entry)
-            self.cards_layout.addWidget(card)
-            self.card_widgets.append(card)
-        self.cards_layout.addStretch()
-
-    def _select_entry(self, entry):
-        self.selected_entry = entry
-        for card in self.card_widgets:
-            card.set_selected(card.entry["file_path"] == entry["file_path"])
-
-        self.detail_title.setText(entry["name"])
-        frame_range = entry.get("frame_range") or (0, 0)
-        self.detail_range.setText(
-            f"Frames {int(frame_range[0])} to {int(frame_range[1])}  |  "
-            f"{entry.get('controls_count', 0)} controls"
-        )
-        self.start_frame.setValue(int(frame_range[0]))
-        self.end_frame.setValue(int(frame_range[1]))
-        self._refresh_rig_combo(entry["animation"])
-        self.apply_btn.setEnabled(True)
-
-    def _refresh_rig_combo(self, animation_data):
-        self.rig_combo.clear()
-        for option in list_target_rig_options(animation_data):
-            self.rig_combo.addItem(option["label"], option["value"])
-
-    def _apply_selected_entry(self):
-        entry = self.selected_entry
-        if not entry:
-            return
-
-        target_mode = self.mode_combo.currentData()
-        preferred_namespace = self.rig_combo.currentData()
-        original_range = entry.get("frame_range")
-        selected_start = self.start_frame.value()
-        selected_end = self.end_frame.value()
-        if selected_end < selected_start:
-            selected_end = selected_start
-            self.end_frame.setValue(selected_end)
-
-        animation_data = entry["animation"]
-        if original_range:
-            source_start = int(original_range[0])
-            source_end = int(original_range[1])
-            selected_duration = selected_end - selected_start
-            source_duration = source_end - source_start
-            if selected_duration < source_duration:
-                relative_end = source_start + selected_duration
-                animation_data = trim_animation_data_to_range(
-                    animation_data,
-                    source_start,
-                    relative_end
-                )
-
-        time_offset = None
-        if original_range:
-            time_offset = selected_start - int(original_range[0])
-
-        applied, skipped = apply_animation_data_to_scene(
-            animation_data,
-            preferred_namespace=preferred_namespace,
-            time_offset=time_offset,
-            paste_mode=target_mode,
-            layer_metadata=entry.get("meta", {}).get("layers", {}),
-        )
-        if applied:
-            cmds.inViewMessage(
-                amg=(
-                    f"<span style='color:#a3be8c'>Pasted: {entry['name']}</span>"
-                    f"<br><span style='color:#88c0d0'>{applied} channel(s)</span>"
-                ),
-                pos='topCenter',
-                fade=True,
-                fadeStayTime=1800,
-            )
-        else:
-            cmds.warning(
-                f"AnimKey: Could not paste '{entry['name']}'. Matching controls were not found."
-            )
-        if skipped:
-            print(f"AnimKey: Smart library skipped {skipped} channel(s) while pasting {entry['name']}.")
-
-    def resizeEvent(self, event):
-        super(SmartAnimationLibraryWindow, self).resizeEvent(event)
-
-    def enterEvent(self, e):
-        self._animate(self._hover_opacity)
-        super(SmartAnimationLibraryWindow, self).enterEvent(e)
-
-    def leaveEvent(self, e):
-        self._animate(self._base_opacity)
-        super(SmartAnimationLibraryWindow, self).leaveEvent(e)
-
-    def _animate(self, val):
-        if self._anim is not None:
-            try:
-                if self._anim.state() == QtCore.QPropertyAnimation.Running:
-                    self._anim.stop()
-            except RuntimeError:
-                self._anim = None
-        self._anim = QtCore.QPropertyAnimation(self, b"windowOpacity")
-        self._anim.setDuration(150)
-        self._anim.setEndValue(val)
-        self._anim.finished.connect(self._on_anim_finished)
-        self._anim.start()
-
-    def _on_anim_finished(self):
-        self._anim = None
-
-    def closeEvent(self, event):
-        global _library_window
-        _library_window = None
-        if self._anim is not None:
-            try:
-                self._anim.stop()
-            except RuntimeError:
-                pass
-            self._anim = None
-        super(SmartAnimationLibraryWindow, self).closeEvent(event)
-
-
-def show_smart_animation_library(anchor_button=None):
-    """Show the large animation library panel."""
-    global _library_window
-    from AnimKey.mods import uiMod
-    uiMod.close_animkey_tool_windows(except_widget=_library_window)
-    existing = uiMod.show_existing_animkey_tool_window(_library_window, anchor_button)
-    if existing is not None:
-        _library_window = existing
-        return _library_window
-
-    _library_window = SmartAnimationLibraryWindow(anchor_button=anchor_button)
-    _library_window.show()
-    _library_window.raise_()
-    _library_window.activateWindow()
-    return _library_window
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#                           COPY ANIMATION
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def copy_animation(*args):
-    """Copy all animation layers that contribute to selected controls."""
+    """Copy selected keys, the active layer, or the full stack from Base Animation."""
     from AnimKey.core.executionGuard import require_animkey_context
     if not require_animkey_context("AnimKey.buttons.copyAnimation.copy_animation"):
         return None
@@ -3074,7 +1916,7 @@ def copy_animation(*args):
         captured, sources = collect_animation_for_controls(
             selected,
             time_range=time_range,
-            all_layers=True,
+            all_layers=curve_transfer.is_base_layer(curve_transfer.active_animation_layer()),
         )
         _anim_buffer.update(captured)
         _anim_sources.update(sources)
@@ -3093,21 +1935,195 @@ def copy_animation(*args):
         cmds.warning("AnimKey: No animation found on selected controls.")
 
 
-def save_animation(*args, **kwargs):
-    """
-    Open the Save Animation dialog to save animation to the library.
+def _capture_file_animation(selected, time_range=None):
+    """Capture a saved clip without modifying either clipboard."""
+    old_metadata = copy.deepcopy(_anim_layer_metadata)
+    try:
+        _anim_layer_metadata.clear()
+        animation, _ = collect_animation_for_controls(
+            selected, time_range=time_range, all_layers=True,
+        )
+        layers = copy.deepcopy(_anim_layer_metadata)
+    finally:
+        _anim_layer_metadata.clear()
+        _anim_layer_metadata.update(old_metadata)
+    return animation, layers
 
-    The dialog lets the user choose a file name, frame range,
-    and optionally capture a GIF preview before saving.
-    """
-    selected = cmds.ls(selection=True, long=True)
+
+def _capture_file_pose(selected):
+    """Capture evaluated values at the playhead without modifying the pose clipboard."""
+    frame = cmds.currentTime(query=True)
+    animation = {}
+    for control in selected:
+        try:
+            attrs = cmds.listAttr(control, keyable=True, unlocked=True) or []
+        except Exception:
+            attrs = cmds.listAttr(control, keyable=True) or []
+        channels = {}
+        for attr in attrs:
+            try:
+                value = cmds.getAttr(f"{control}.{attr}")
+                if _is_numeric_pose_value(value):
+                    channels[attr] = _make_single_frame_curve_snapshot(value, frame)
+            except Exception:
+                continue
+        if channels:
+            animation[get_control_storage_key(control)] = channels
+    return animation, {}
+
+
+def _choose_clip_file(clip_type, save=False):
+    extension = ".animkey_pose" if clip_type == "pose" else ".animkey_anim"
+    label = "Pose" if clip_type == "pose" else "Animation"
+    paths = cmds.fileDialog2(
+        caption=f"{'Save' if save else 'Load'} {label}",
+        fileMode=0 if save else 1,
+        fileFilter=f"AnimKey {label} (*{extension})",
+        dialogStyle=2,
+        okCaption="Save" if save else "Load",
+    )
+    if not paths:
+        return None
+    path = paths[0]
+    if save and not path.lower().endswith(extension):
+        path += extension
+    return path
+
+
+def _save_clip_file(clip_type):
+    selected = cmds.ls(selection=True, long=True) or []
     if not selected:
         cmds.warning("AnimKey: Please select at least one control to save.")
-        return
+        return None
+    file_path = _choose_clip_file(clip_type, save=True)
+    if not file_path:
+        return None
+    try:
+        if clip_type == "pose":
+            animation, layers = _capture_file_pose(selected)
+        else:
+            animation, layers = _capture_file_animation(selected, get_selected_time_range())
+        if not animation:
+            cmds.warning(f"AnimKey: No {clip_type} data found on selected controls.")
+            return None
+        meta = {
+            "name": os.path.splitext(os.path.basename(file_path))[0],
+            "type": clip_type,
+            "format_version": 4,
+            "frame_range": get_animation_frame_range(animation),
+            "controls_count": len(animation),
+            "scene": cmds.file(query=True, sceneName=True, shortName=True) or "untitled",
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source_layer": curve_transfer.active_animation_layer(),
+            "layers": layers,
+            "source_controls": {
+                key: {"short_name": get_control_short_name(key),
+                      "path_signature": get_control_path_signature(key)}
+                for key in animation
+            },
+        }
+        if clip_type == "pose":
+            meta["source_frame"] = cmds.currentTime(query=True)
+        atomic_write_json(file_path, {"meta": meta, "animation": animation}, indent=None)
+        cmds.warning(f"AnimKey: {clip_type.capitalize()} saved: {file_path}")
+        return file_path
+    except Exception as exc:
+        cmds.warning(f"AnimKey: Error saving {clip_type}: {exc}")
+        return None
 
-    # Get anchor button from the Copy Animation toolbar button, if available
-    anchor_button = kwargs.get("button", None)
-    show_save_animation_window(anchor_button=anchor_button)
+
+def _read_clip_file(file_path, clip_type):
+    with open(file_path, "r", encoding="utf-8-sig") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict):
+        raise ValueError("The selected file is not an AnimKey clip.")
+    meta = data.get("meta", {})
+    animation = data.get("animation", data)
+    if not isinstance(meta, dict) or meta.get("type", clip_type) != clip_type:
+        raise ValueError(f"The selected file does not contain a {clip_type}.")
+    if not isinstance(meta.get("layers", {}), dict):
+        raise ValueError("The selected clip has invalid animation layer data.")
+    if not isinstance(animation, dict) or not animation:
+        raise ValueError("The selected clip is empty.")
+    for control, channels in animation.items():
+        if not isinstance(control, str) or not isinstance(channels, dict) or not channels:
+            raise ValueError("The selected clip has invalid control data.")
+        for channel, payload in channels.items():
+            if not isinstance(channel, str) or not isinstance(payload, dict):
+                raise ValueError("The selected clip has invalid channel data.")
+            curves = list(_iter_curve_payloads(payload))
+            if not curves:
+                raise ValueError("The selected clip has invalid curve data.")
+            for _layer, curve in curves:
+                frames, values = curve.get("keyframes"), curve.get("values")
+                if (not isinstance(frames, list) or not isinstance(values, list)
+                        or len(frames) != len(values)
+                        or not all(isinstance(value, (int, float)) for value in frames + values)):
+                    raise ValueError("The selected clip has invalid keyframe data.")
+    return {"meta": meta, "animation": animation}
+
+
+def save_animation(*args, **kwargs):
+    """Save selected controls and layers to a file chosen by the user."""
+    from AnimKey.core.executionGuard import require_animkey_context
+    if not require_animkey_context("AnimKey.buttons.copyAnimation.save_animation"):
+        return None
+    return _save_clip_file("animation")
+
+
+def save_pose(*args, **kwargs):
+    """Save the selected controls' current pose to a chosen file."""
+    from AnimKey.core.executionGuard import require_animkey_context
+    if not require_animkey_context("AnimKey.buttons.copyAnimation.save_pose"):
+        return None
+    return _save_clip_file("pose")
+
+
+def load_animation(*args, **kwargs):
+    """Load a saved animation and paste it with the regular target/layer rules."""
+    from AnimKey.core.executionGuard import require_animkey_context
+    if not require_animkey_context("AnimKey.buttons.copyAnimation.load_animation"):
+        return None
+    file_path = _choose_clip_file("animation")
+    if not file_path:
+        return None
+    try:
+        data = _read_clip_file(file_path, "animation")
+        global _anim_buffer, _anim_layer_metadata
+        _cleanup_buffer()
+        _anim_buffer = data["animation"]
+        _anim_layer_metadata = dict(data["meta"].get("layers", {}) or {})
+        _export_buffer_to_disk(save_to_library=False)
+        paste_animation()
+        return file_path
+    except Exception as exc:
+        cmds.warning(f"AnimKey: Error loading animation: {exc}")
+        return None
+
+
+def load_pose(*args, **kwargs):
+    """Load a saved pose at the current frame and animation layer."""
+    from AnimKey.core.executionGuard import require_animkey_context
+    if not require_animkey_context("AnimKey.buttons.copyAnimation.load_pose"):
+        return None
+    file_path = _choose_clip_file("pose")
+    if not file_path:
+        return None
+    try:
+        data = _read_clip_file(file_path, "pose")
+        global _pose_buffer, _pose_buffer_mtime, _pose_buffer_is_current
+        _pose_buffer = data
+        _pose_buffer_mtime = 0
+        _pose_buffer_is_current = True
+        def _mark_written(mtime):
+            global _pose_buffer_mtime
+            _pose_buffer_mtime = mtime
+        _schedule_json_write(get_copy_paste_pose_file(), data, on_written=_mark_written)
+        paste_pose()
+        return file_path
+    except Exception as exc:
+        cmds.warning(f"AnimKey: Error loading pose: {exc}")
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3146,7 +2162,8 @@ def _validate_buffer(ctrl_short):
     return buf_node
 
 
-def _paste_clip_to_targets(target_map, time_offset=0.0, clear_existing=True):
+def _paste_clip_to_targets(target_map, time_offset=0.0, clear_existing=True,
+                           use_active_layer=False):
     """Paste the in-memory clip to a resolved source-key -> target-control map."""
     pasted_count = 0
     skipped_count = 0
@@ -3156,11 +2173,19 @@ def _paste_clip_to_targets(target_map, time_offset=0.0, clear_existing=True):
         _anim_buffer,
     )
     skipped_count += skipped_channels
+    # A one-layer clipboard is transferable to the user's keying layer. A
+    # stack remains a stack: combining its raw additive/override curves into
+    # one curve would discard its composition.
+    active_layer = curve_transfer.active_animation_layer() or "BaseAnimation"
+    remap_single_layer = use_active_layer and len(layer_groups) == 1
+    existing_layers = set(cmds.ls(type="animLayer") or [])
     for source_layer in sorted(
             layer_groups,
             key=lambda name: 0 if curve_transfer.is_base_layer(name) else 1):
         group = layer_groups[source_layer]
-        target_layer = _ensure_target_layer(source_layer)
+        destination = active_layer if remap_single_layer else source_layer
+        layer_existed = cmds.objExists(destination)
+        target_layer = _ensure_target_layer(destination)
         if not target_layer:
             skipped_count += len(group["transfers"])
             continue
@@ -3173,7 +2198,11 @@ def _paste_clip_to_targets(target_map, time_offset=0.0, clear_existing=True):
         )
         pasted_count += sum(1 for result in results if result)
         skipped_count += sum(1 for result in results if not result)
-        _restore_layer_state(target_layer, time_offset=time_offset)
+        if not layer_existed and not remap_single_layer:
+            new_layers = set(cmds.ls(type="animLayer") or []) - existing_layers
+            _restore_layer_state(target_layer, time_offset=time_offset, _allowed=new_layers)
+    if pasted_count:
+        cmds.currentTime(cmds.currentTime(query=True), edit=True, update=True)
     return pasted_count, skipped_count
 
 
@@ -3208,6 +2237,7 @@ def paste_animation(*args):
             target_assignments,
             time_offset=0.0,
             clear_existing=True,
+            use_active_layer=True,
         )
 
         if pasted_count:
@@ -3231,7 +2261,7 @@ def paste_animation(*args):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def paste_insert_animation(*args):
-    """Paste animation at current time (merge, offset to playhead)."""
+    """Paste the copied span at the playhead, preserving keys outside that span."""
     from AnimKey.core.executionGuard import require_animkey_context
     if not require_animkey_context("AnimKey.buttons.copyAnimation.paste_insert_animation"):
         return None
@@ -3265,7 +2295,10 @@ def paste_insert_animation(*args):
         inserted_count, skipped_count = _paste_clip_to_targets(
             target_assignments,
             time_offset=time_offset,
-            clear_existing=False,
+            # A merge leaves old destination keys inside the inserted motion,
+            # changing its interpolation even when every copied key is right.
+            clear_existing=True,
+            use_active_layer=True,
         )
         if inserted_count:
             cmds.warning(
@@ -3360,6 +2393,7 @@ def paste_opposite_animation(*args):
                 )
                 value_offset = 0.0
                 for source_layer, curve_data in _iter_curve_payloads(stored_data):
+                    layer_existed = cmds.objExists(source_layer)
                     target_layer = _ensure_target_layer(source_layer)
                     if not target_layer:
                         skipped_count += 1
@@ -3390,7 +2424,8 @@ def paste_opposite_animation(*args):
                         pasted_count += 1
                     else:
                         skipped_count += 1
-                    _restore_layer_state(target_layer)
+                    if not layer_existed:
+                        _restore_layer_state(target_layer)
 
         if pasted_count:
             cmds.warning(
@@ -3540,8 +2575,9 @@ def paste_pose(*args):
         if isinstance(pose_data, dict) and "animation" in pose_data:
             animation_payload = pose_data.get("animation") or {}
             current_frame = cmds.currentTime(query=True)
-            target_map = resolve_target_controls(animation_payload.keys(), selected_objects)
-            if not target_map:
+            target_assignments = resolve_animation_target_assignments(
+                animation_payload.keys(), selected_objects)
+            if not target_assignments:
                 cmds.warning("AnimKey: No matching target controls found for the copied pose.")
                 return
 
@@ -3551,7 +2587,7 @@ def paste_pose(*args):
             cmds.undoInfo(openChunk=True)
             try:
                 key_values = []
-                for control_name, control in target_map.items():
+                for control_name, control in target_assignments:
                     try:
                         editable_attrs = set(cmds.listAttr(
                             control,
@@ -3580,6 +2616,10 @@ def paste_pose(*args):
                 )
                 applied += sum(1 for result in results if result)
                 skipped += sum(1 for result in results if not result)
+                if applied:
+                    # setKeyframe(value=...) updates curves but Maya can keep
+                    # the previous evaluated pose cached until time is updated.
+                    cmds.currentTime(current_frame, edit=True, update=True)
             finally:
                 cmds.undoInfo(closeChunk=True)
 
@@ -3632,7 +2672,7 @@ def execute(*args, **kwargs):
     from AnimKey.core.executionGuard import require_animkey_context
     if not require_animkey_context("AnimKey.buttons.copyAnimation.execute"):
         return None
-    show_smart_animation_library(anchor_button=kwargs.get("button"))
+    return copy_animation(*args)
 
 
 def get_info():

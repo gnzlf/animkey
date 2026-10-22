@@ -137,6 +137,8 @@ class WelcomeWindow(QWidget):
         self._current_language = "en"
         self._setup_ui()
         self._apply_translations()
+        from AnimKey.core.window_style import apply_window_style
+        apply_window_style(self)
     
     def _setup_ui(self):
         """Setup the UI components"""
@@ -213,6 +215,10 @@ class WelcomeWindow(QWidget):
         
         header_layout.addStretch()
         header_layout.addLayout(lang_container)
+        from AnimKey.core.settings_style import WindowControl
+        close_button = WindowControl("close", "Close", self)
+        close_button.clicked.connect(self.close)
+        header_layout.addWidget(close_button)
         bg_layout.addLayout(header_layout)
         
         # ─── Logo ───

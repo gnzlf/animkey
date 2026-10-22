@@ -29,6 +29,30 @@ from AnimKey.core.executionGuard import animkey_execution
 
 
 class OffsetAndCopyAnimoRegressionTests(unittest.TestCase):
+    def test_layer_switch_replaces_node_watchers_without_closing_session_timers(self):
+        control = cmds.createNode("transform")
+        for frame in (1., 10.):
+            cmds.setKeyframe(control, attribute="tx", time=frame, value=frame)
+        layer = cmds.animLayer("OffsetSessionLayer")
+        cmds.animLayer(layer, edit=True, attribute=control + ".tx")
+        for frame in (1., 10.):
+            curve_transfer.set_key_on_layer(control + ".tx", frame, frame / 2., layer_name=layer)
+        session = OffsetSession()
+        try:
+            session.start([control], (1, 10), target_layer="BaseAnimation", follow_layer_selection=True)
+            resources = session.resources
+            previous_callbacks = session.callback_resources
+            with mock.patch("AnimKey.core.animation_offset_session.get_selected_animation_layer", return_value=layer):
+                session._sync_keying_layer()
+            self.assertTrue(resources.active)
+            self.assertFalse(previous_callbacks.active)
+            self.assertTrue(session.callback_resources.active)
+            self.assertIn("timer.flush", resources.pending_cleanup)
+            cmds.file(new=True, force=True)
+            self.assertFalse(resources.active)
+        finally:
+            session.stop(commit=False)
+
     def setUp(self):
         cmds.file(new=True, force=True)
         self.data_dir = tempfile.mkdtemp(prefix="animkey_animo_regressions_")

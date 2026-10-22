@@ -37,6 +37,7 @@ QPainterPath = QtGui.QPainterPath
 
 from AnimKey.mods.themes import ThemeManager
 from AnimKey.mods import styleMod as style
+from AnimKey.core.window_style import apply_window_style
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -67,13 +68,13 @@ class AnimKeyColors:
     TEXT_MUTED = QColor(100, 100, 115)
     
     # Slider specific
-    SLIDER_TRACK = QColor(45, 45, 55)
+    SLIDER_TRACK = QColor(8, 12, 19, 100)
     SLIDER_FILL = QColor(0, 180, 230)
-    SLIDER_HANDLE = QColor(85, 85, 95)  # Dark gray handle instead of white
-    SLIDER_HANDLE_BORDER = QColor(110, 110, 120)  # Lighter border for contrast
+    SLIDER_HANDLE = QColor(189, 201, 218)
+    SLIDER_HANDLE_BORDER = QColor(225, 233, 245)
     
     # Dot button states
-    DOT_INACTIVE = QColor(70, 70, 85)
+    DOT_INACTIVE = QColor(111, 126, 148)
     DOT_HOVER = QColor(0, 220, 255)
     DOT_ACTIVE = QColor(130, 255, 180)
     DOT_GLOW = QColor(0, 200, 255, 100)
@@ -108,6 +109,8 @@ ANIMKEY_SINGLE_POPUP_OBJECTS = {
 
 def _is_animkey_tool_window(widget):
     """Return whether a top-level Qt widget belongs to an AnimKey script."""
+    if widget.property("animkeyPersistentSurface"):
+        return False
     try:
         object_name = str(widget.objectName() or "")
     except Exception:
@@ -230,6 +233,8 @@ def cleanup_animkey_runtime(except_widget=None, full=False):
     try:
         from AnimKey.buttons import tempPivot
         _safe_call(tempPivot.cleanup_orphans)
+        from AnimKey.buttons import tempControls
+        _safe_call(tempControls.shutdown)
     except Exception:
         pass
 
@@ -241,7 +246,7 @@ def cleanup_animkey_runtime(except_widget=None, full=False):
 
     try:
         from AnimKey.mods import tumbleAroundSelection
-        _safe_call(tumbleAroundSelection.apply, False)
+        _safe_call(tumbleAroundSelection.shutdown)
     except Exception:
         pass
 
@@ -600,7 +605,8 @@ class IlluminatedDotButton(QWidget):
         
         painter.setBrush(gradient)
         painter.setPen(QPen(dot_color.darker(120), 1))
-        painter.drawEllipse(center, self.dot_radius, self.dot_radius)
+        radius = self.dot_radius + (self._glow_intensity if self._is_hovered else 0.0)
+        painter.drawEllipse(QtCore.QPointF(center), radius, radius)
         
         # Draw inner highlight
         if self._glow_intensity > 0.3:
@@ -1019,7 +1025,8 @@ class DropdownLabel(QWidget):
             )
         
         path = QPainterPath()
-        path.addRoundedRect(QRect(0, 0, self.width(), self.height()), 4, 4)
+        bg_color.setAlpha(75 if self._is_hovered or self._menu_visible else 48)
+        path.addRoundedRect(QtCore.QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
         
         # Gradient background
         gradient = QLinearGradient(0, 0, 0, self.height())
@@ -1093,6 +1100,11 @@ class AnimKeySlider(QWidget):
         self._origin = origin
         self._return_to_origin = return_to_origin
         self._is_dragging = False
+        self._handle_hover = 0.0
+        self._handle_hovered = False
+        self._handle_hover_animation = QPropertyAnimation(self, b"handle_hover", self)
+        self._handle_hover_animation.setDuration(110)
+        self._handle_hover_animation.setEasingCurve(QEasingCurve.OutCubic)
         self._dots_visible = show_dots
         self._dots_enabled = show_dots  # Store whether to show dots (renamed to avoid conflict)
         self._dots_opacity = 1.0 if show_dots else 0.0
@@ -1100,7 +1112,7 @@ class AnimKeySlider(QWidget):
         self._accent_color = QColor(0, 200, 255)  # Default cyan like original
         
         # Dimensions - Compact for toolbar
-        self.slider_height = 4
+        self.slider_height = 6
         self.track_margin = 24 if show_dots else 12  # Less margin if no dots
         self.widget_height = 28  # Compact height for toolbar
         
@@ -1396,6 +1408,42 @@ class AnimKeySlider(QWidget):
         super().resizeEvent(event)
         self._update_dot_positions()
     
+    def _set_handle_hover(self, value):
+        self._handle_hover = value
+        self.update()
+
+    handle_hover = Property(float, lambda self: self._handle_hover, _set_handle_hover)
+
+    def _reset_handle_hover(self):
+        self._handle_hover_animation.stop()
+        self._handle_hovered = False
+        self._set_handle_hover(0.0)
+
+    def hideEvent(self, event):
+        self._reset_handle_hover()
+        super().hideEvent(event)
+
+    def changeEvent(self, event):
+        if event.type() == QtCore.QEvent.EnabledChange and not self.isEnabled():
+            self._reset_handle_hover()
+        super().changeEvent(event)
+
+    def _update_handle_hover(self, position=None):
+        center = QPoint(self._value_to_x(self._display_value), self._get_track_rect().center().y())
+        hovered = self.isEnabled() and (self._is_dragging or (
+            position is not None and (position.x() - center.x()) ** 2
+            + (position.y() - center.y()) ** 2 <= 100))
+        if hovered != self._handle_hovered:
+            self._handle_hovered = hovered
+            self._handle_hover_animation.stop()
+            self._handle_hover_animation.setStartValue(self._handle_hover)
+            self._handle_hover_animation.setEndValue(1.0 if hovered else 0.0)
+            self._handle_hover_animation.start()
+
+    def leaveEvent(self, event):
+        self._update_handle_hover()
+        super().leaveEvent(event)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             if self._get_tab_rect().contains(event.pos()):
@@ -1408,6 +1456,7 @@ class AnimKeySlider(QWidget):
             
             if expanded_track.contains(event.pos()):
                 self._is_dragging = True
+                self._update_handle_hover(event.pos())
                 self._hide_dots_animation()
                 
                 # Make dots transparent to mouse events while dragging
@@ -1427,6 +1476,7 @@ class AnimKeySlider(QWidget):
                 return
     
     def mouseMoveEvent(self, event):
+        self._update_handle_hover(event.pos())
         if self._is_dragging:
             self.setValue(self._x_to_value(event.x()))
             handle_x = self._value_to_x(self._value)
@@ -1462,6 +1512,7 @@ class AnimKeySlider(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton and self._is_dragging:
             self._is_dragging = False
+            self._update_handle_hover(event.pos())
             
             self.releaseMouse()
             
@@ -1490,6 +1541,12 @@ class AnimKeySlider(QWidget):
         painter.setRenderHint(QPainter.Antialiasing, True)
         
         track = self._get_track_rect()
+        # A dark rounded well matches the window controls. It is painted here
+        # because this custom slider does not use Qt's QSlider stylesheet.
+        body = QtCore.QRectF(self.rect()).adjusted(0.5, 1.5, -0.5, -1.5)
+        painter.setBrush(QColor(255, 255, 255, 12))
+        painter.setPen(QPen(QColor(222, 233, 250, 60), 1))
+        painter.drawRoundedRect(body, 9, 9)
         # Use display_value for smooth animation rendering
         display_val = self._display_value if hasattr(self, '_display_value') else self._value
         handle_x = self._value_to_x(display_val)
@@ -1506,6 +1563,9 @@ class AnimKeySlider(QWidget):
         track_gradient.setColorAt(1, AnimKeyColors.SLIDER_TRACK.lighter(110))
         
         painter.fillPath(track_path, track_gradient)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(70, 80, 95), 1))
+        painter.drawPath(track_path)
         
         # Draw origin marker (subtle line where slider returns to)
         if self._return_to_origin:
@@ -1547,8 +1607,8 @@ class AnimKeySlider(QWidget):
             painter.fillPath(glow_path, glow_gradient)
         
         # Draw handle - compact size for toolbar
-        handle_radius = 7
-        handle_center = QPoint(handle_x, track.center().y())
+        handle_radius = 7.0 + 1.5 * self._handle_hover
+        handle_center = QtCore.QPointF(handle_x, track.center().y())
         
         # Handle glow when dragging with accent color
         if self._is_dragging:
@@ -1561,7 +1621,7 @@ class AnimKeySlider(QWidget):
             painter.setPen(Qt.NoPen)
             painter.drawEllipse(handle_center, handle_radius + 6, handle_radius + 6)
         
-        # Handle gradient - dark gray
+        # Light handle against the dark well, matching Settings' sliders.
         handle_gradient = QRadialGradient(
             handle_center.x() - 2,
             handle_center.y() - 2,
@@ -1770,7 +1830,60 @@ class AnimKeySliderWithButtons(QtWidgets.QWidget):
         return self.slider
 
 
-class AnimKeyButton(QtWidgets.QPushButton):
+class HoverButton(QtWidgets.QPushButton):
+    """Paint-only hover growth: the layout and hit area never move."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._hover_amount = 0.0
+        self._hover_animation = QPropertyAnimation(self, b"hover_amount", self)
+        self._hover_animation.setDuration(110)
+        self._hover_animation.setEasingCurve(QEasingCurve.OutCubic)
+
+    def _set_hover_amount(self, value):
+        self._hover_amount = value
+        self.update()
+
+    hover_amount = Property(float, lambda self: self._hover_amount, _set_hover_amount)
+
+    def _animate_hover(self, active):
+        self._hover_animation.stop()
+        self._hover_animation.setStartValue(self._hover_amount)
+        self._hover_animation.setEndValue(1.0 if active and self.isEnabled() else 0.0)
+        self._hover_animation.start()
+
+    def enterEvent(self, event):
+        self._animate_hover(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._animate_hover(False)
+        super().leaveEvent(event)
+
+    def hideEvent(self, event):
+        self._hover_animation.stop()
+        self._set_hover_amount(0.0)
+        super().hideEvent(event)
+
+    def changeEvent(self, event):
+        if event.type() == QtCore.QEvent.EnabledChange and not self.isEnabled():
+            self._hover_animation.stop()
+            self._set_hover_amount(0.0)
+        super().changeEvent(event)
+
+    def paintEvent(self, event):
+        option = QtWidgets.QStyleOptionButton()
+        self.initStyleOption(option)
+        painter = QtWidgets.QStylePainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.translate(self.width() / 2.0, self.height() / 2.0)
+        scale = 0.94 + 0.06 * self._hover_amount
+        painter.scale(scale, scale)
+        painter.translate(-self.width() / 2.0, -self.height() / 2.0)
+        painter.drawControl(QtWidgets.QStyle.CE_PushButton, option)
+
+
+class AnimKeyButton(HoverButton):
     """
     Custom button with enhanced styling and optional icon support
     """
@@ -1807,7 +1920,7 @@ class AnimKeyButton(QtWidgets.QPushButton):
             self.setStyleSheet(style.get_button_stylesheet(self.button_type))
 
 
-class AnimKeyIconButton(QtWidgets.QPushButton):
+class AnimKeyIconButton(HoverButton):
     """
     Icon-only button with tooltip support
     """
@@ -2404,51 +2517,8 @@ class ContextPopupWindow(QtWidgets.QWidget):
         
         # Default size, subclass should resize
         self.resize(340, 520)
+        apply_window_style(self, defer_polish=True)
 
-    def paintEvent(self, event):
-        """Draw solid rounded rect + speech bubble tail."""
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-
-        bg = QColor(58, 58, 58)
-        border_color = QColor(90, 90, 90)
-        tail_height = self._tail_height if self._magnet_attached else 0
-
-        if self._tail_on_top and self._magnet_attached:
-            body_rect = QtCore.QRectF(0.5, tail_height + 0.5,
-                                       self.width() - 1,
-                                       self.height() - tail_height - 1)
-        else:
-            body_rect = QtCore.QRectF(0.5, 0.5,
-                                       self.width() - 1,
-                                       self.height() - tail_height - 1)
-
-        path = QPainterPath()
-        path.addRoundedRect(body_rect, 10, 10)
-
-        if self._magnet_attached:
-            tail_cx = max(20, min(self._tail_x, self.width() - 20))
-            hw = self._tail_width / 2
-
-            if self._tail_on_top:
-                tail_base = body_rect.top()
-                path.moveTo(tail_cx - hw, tail_base)
-                path.lineTo(tail_cx, tail_base - tail_height)
-                path.lineTo(tail_cx + hw, tail_base)
-            else:
-                tail_base = body_rect.bottom()
-                path.moveTo(tail_cx - hw, tail_base)
-                path.lineTo(tail_cx, tail_base + tail_height)
-                path.lineTo(tail_cx + hw, tail_base)
-            path.closeSubpath()
-
-        # Apply mask so the widget shape matches the rounded path exactly
-        self.setMask(path.toFillPolygon().toPolygon())
-
-        painter.setPen(QPen(border_color, 1))
-        painter.setBrush(bg)
-        painter.drawPath(path)
-        painter.end()
 
     def _set_body_margins(self):
         if not self.layout():

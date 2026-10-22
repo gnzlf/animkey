@@ -24,6 +24,10 @@ from AnimKey.mods.themes import ThemeManager
 from AnimKey.mods import configMod as config
 from AnimKey.mods import uiMod as ui
 from AnimKey.mods.storage import atomic_write_json, backup_corrupt_file
+from AnimKey.core.settings_style import (
+    GlassPanel, SettingsSwitch, WindowControl, STYLESHEET, polish_page,
+)
+from AnimKey.core.window_style import apply_window_style
 
 # Global state for picking mode
 ACTIVE_PICKER = None
@@ -46,6 +50,8 @@ class AnimKeyUninstallDialog(QtWidgets.QDialog):
         self.setWindowFlags(self.windowFlags() | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self._build_ui()
+
+        apply_window_style(self)
 
     def _build_ui(self):
         root = QtWidgets.QVBoxLayout(self)
@@ -99,11 +105,6 @@ class AnimKeyUninstallDialog(QtWidgets.QDialog):
                 background-color: #7c3333;
             }
         """)
-        shadow = QtWidgets.QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(36)
-        shadow.setOffset(0, 12)
-        shadow.setColor(QtGui.QColor(0, 0, 0, 180))
-        panel.setGraphicsEffect(shadow)
         root.addWidget(panel)
 
         layout = QtWidgets.QVBoxLayout(panel)
@@ -222,6 +223,7 @@ DEFAULT_SHORTCUTS = {
     "CAM": "",
     "WS": "",
     "PIV": "",
+    "TMC": "",
     "RUL": "",
     "RTM": "",
     
@@ -271,11 +273,15 @@ DEFAULT_SHORTCUTS = {
     
     # Copy Animation submenu
     "Copy Animation": "",
+    "Save Animation": "",
+    "Load Animation": "",
     "Paste Animation": "",
     "Paste Insert": "",
     "Paste Opposite": "",
     "Copy Pose": "",
     "Paste Pose": "",
+    "Save Pose": "",
+    "Load Pose": "",
     
     # Follow Cam submenu
     "Follow Cam Translation & Rotation": "",
@@ -284,6 +290,11 @@ DEFAULT_SHORTCUTS = {
     "Remove Follow Cam": "",
     
     # Link Objects submenu
+    "Copy Link All Animation": "",
+    "Copy Link Selected Range": "",
+    "Paste Link All Animation": "",
+    "Paste Link Selected Range": "",
+    "Paste Link Playback Range": "",
     "Copy Link Frame": "",
     "Copy Link Playback Range": "",
     "Paste Link Frame": "",
@@ -375,28 +386,10 @@ class ShortcutEditWidget(QtWidgets.QLineEdit):
         self._update_style()
     
     def _update_style(self):
-        theme = ThemeManager.get_current_theme()
-        bg = theme["bg_secondary"]
-        border = theme["border_color"]
-        text = theme["text_primary"]
-        
-        if self._is_picking:
-            bg = "#3d2d1d"  # Slight orange tint
-            border = "#d08770"  # Orange accent
-        
-        self.setStyleSheet(f'''
-            QLineEdit {{
-                color: {text};
-                background-color: {bg};
-                border: 1px solid {border};
-                border-radius: 4px;
-                padding: 4px 8px;
-                font-size: 11px;
-            }}
-            QLineEdit:focus {{
-                border-color: {theme["accent_primary"]};
-            }}
-        ''')
+        self.setProperty("picking", self._is_picking)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
 
     def setPickingMode(self, enabled):
         """Enable or disable picking mode (waiting for toolbar click)"""
@@ -516,73 +509,69 @@ class ShortcutEditWidget(QtWidgets.QLineEdit):
 
 class TitleBar(QtWidgets.QWidget):
     def __init__(self, parent=None, title="Settings"):
-        super(TitleBar, self).__init__(parent)
+        super().__init__(parent)
         self.parent_window = parent
         self._drag_pos = None
-        self.setFixedHeight(32)
-        self.setup_ui(title)
-        
-    def setup_ui(self, title):
+        self.setObjectName("settingsTitleBar")
+        self.setFixedHeight(62)
         layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(12, 0, 6, 0)
-        layout.setSpacing(8)
-        
-        # Title
-        self.title_label = QtWidgets.QLabel(title)
-        self.title_label.setStyleSheet("""
-            QLabel {
-                color: #AAA;
-                font-size: 11px;
-                font-weight: 500;
-            }
-        """)
-        layout.addWidget(self.title_label)
-        
+        layout.setContentsMargins(24, 8, 16, 8)
+        layout.setSpacing(10)
+        titles = QtWidgets.QVBoxLayout()
+        titles.setSpacing(1)
+        self.title_label = QtWidgets.QLabel("AnimKey")
+        self.title_label.setObjectName("settingsTitle")
+        titles.addWidget(self.title_label)
+        subtitle = QtWidgets.QLabel("Settings")
+        subtitle.setObjectName("settingsSubtitle")
+        titles.addWidget(subtitle)
+        layout.addLayout(titles)
         layout.addStretch()
-        
-        # Close button
-        self.close_btn = QtWidgets.QPushButton("✕")
-        self.close_btn.setFixedSize(24, 24)
-        self.close_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self.close_btn.setStyleSheet("""
-            QPushButton {
-                background-color: transparent;
-                color: #888;
-                font-size: 12px;
-                font-weight: bold;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #E74C3C;
-                color: #FFF;
-            }
-        """)
-        self.close_btn.clicked.connect(self.close_window)
-        layout.addWidget(self.close_btn)
-        
-        self.setStyleSheet("""
-            TitleBar {
-                background-color: #363636;
-                border-top-left-radius: 8px;
-                border-top-right-radius: 8px;
-            }
-        """)
-        
+        self.minimize_btn = self._window_button(
+            "minimize", "Minimize", parent.showMinimized)
+        self.maximize_btn = self._window_button(
+            "maximize", "Maximize / Restore", self._toggle_maximized)
+        self.close_btn = self._window_button(
+            "close", "Close", self.close_window)
+        self.close_btn.setObjectName("settingsClose")
+        for button in (self.minimize_btn, self.maximize_btn, self.close_btn):
+            layout.addWidget(button)
+
+    def _window_button(self, kind, tooltip, callback):
+        button = WindowControl(kind, tooltip, self)
+        button.clicked.connect(callback)
+        return button
+
+    def _toggle_maximized(self):
+        if self.parent_window.isMaximized():
+            self.parent_window.showNormal()
+        else:
+            self.parent_window.showMaximized()
+
     def close_window(self):
-        if self.parent_window:
-            self.parent_window.close()
-            
+        self.parent_window.close()
+
+    @staticmethod
+    def _global_position(event):
+        if hasattr(event, "globalPosition"):
+            return event.globalPosition().toPoint()
+        return event.globalPos()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._toggle_maximized()
+            event.accept()
+
     def mousePressEvent(self, event):
-        if event.button() == QtCore.Qt.LeftButton:
-            self._drag_pos = event.globalPos() - self.parent_window.frameGeometry().topLeft()
+        if event.button() == Qt.LeftButton and not self.parent_window.isMaximized():
+            self._drag_pos = self._global_position(event) - self.parent_window.frameGeometry().topLeft()
             event.accept()
-            
+
     def mouseMoveEvent(self, event):
-        if event.buttons() == QtCore.Qt.LeftButton and self._drag_pos:
-            self.parent_window.move(event.globalPos() - self._drag_pos)
+        if event.buttons() & Qt.LeftButton and self._drag_pos is not None:
+            self.parent_window.move(self._global_position(event) - self._drag_pos)
             event.accept()
-            
+
     def mouseReleaseEvent(self, event):
         self._drag_pos = None
 
@@ -605,7 +594,9 @@ class SettingsWindow(QtWidgets.QWidget):
         
         self.setObjectName("AnimKey_Settings")
         self.setWindowTitle("AnimKey Settings")
-        self.setMinimumSize(600, 500)
+        self.setMinimumSize(640, 560)
+        screen = ui.screen_available_geometry(self)
+        self.resize(min(780, screen.width() - 48), min(760, screen.height() - 64))
         
         # Frameless + translucent — must use QWidget (not QDialog) for this to
         # work reliably on Windows. QDialog ignores WA_TranslucentBackground.
@@ -617,15 +608,16 @@ class SettingsWindow(QtWidgets.QWidget):
         self._lazy_tabs = {}
         self._drag_pos = None
         
-        # Opacity: semi-transparent when idle, fully opaque on hover
-        self._base_opacity = 0.82
-        self._hover_opacity = 1.0
-        self._anim = None
-        
         self._build_ui()
-        
-        # Start semi-transparent like the Retimer window
-        self.setWindowOpacity(self._base_opacity)
+
+        apply_window_style(self, polish=False, paint=False, panel=self.container)
+
+    def paintEvent(self, event):
+        # Clear damaged alpha pixels before painting the current page. Otherwise
+        # semi-transparent controls can retain the page previously behind them.
+        painter = QtGui.QPainter(self)
+        painter.setCompositionMode(QtGui.QPainter.CompositionMode_Source)
+        painter.fillRect(event.rect(), QtCore.Qt.transparent)
     
     def _build_ui(self):
         """Build the settings UI"""
@@ -634,18 +626,11 @@ class SettingsWindow(QtWidgets.QWidget):
         outer_layout.setSpacing(0)
         
         # Main container with rounded corners
-        self.container = QtWidgets.QFrame()
+        self.container = GlassPanel()
         self.container.setObjectName("settingsContainer")
-        self.container.setStyleSheet("""
-            #settingsContainer {
-                background-color: #3a3a3a;
-                border: 1px solid #5a5a5a;
-                border-radius: 8px;
-            }
-        """)
         
         main_layout = QtWidgets.QVBoxLayout(self.container)
-        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setContentsMargins(1, 1, 1, 1)
         main_layout.setSpacing(0)
         
         # Custom title bar
@@ -654,33 +639,6 @@ class SettingsWindow(QtWidgets.QWidget):
         
         # Tab widget
         self.tab_widget = QtWidgets.QTabWidget()
-        self.tab_widget.setStyleSheet("""
-            QTabWidget::pane {
-                border-top: 1px solid #5a5a5a;
-                background-color: #3a3a3a;
-            }
-            QTabWidget::tab-bar {
-                alignment: left;
-            }
-            QTabBar::tab {
-                background-color: #363636;
-                color: #888;
-                padding: 8px 16px;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
-                margin-right: 2px;
-                margin-left: 10px;
-            }
-            QTabBar::tab:selected {
-                background-color: #4d4d4d;
-                color: #FFF;
-                border-bottom: 2px solid #3498DB;
-            }
-            QTabBar::tab:hover {
-                color: #FFF;
-                background-color: #4d4d4d;
-            }
-        """)
         main_layout.addWidget(self.tab_widget)
         
         # Build the first tab immediately and defer heavier tabs until opened.
@@ -689,18 +647,11 @@ class SettingsWindow(QtWidgets.QWidget):
         self._add_lazy_tab("Workspace", self._create_workspace_tab)
         self._add_lazy_tab("Update", self._create_update_tab)
         self._add_lazy_tab("Exit", self._create_exit_tab)
-        self.tab_widget.currentChanged.connect(self._load_lazy_tab)
+        self.tab_widget.currentChanged.connect(self._on_tab_changed)
         
         # Bottom buttons
         button_bar = QtWidgets.QFrame()
-        button_bar.setStyleSheet("""
-            QFrame {
-                background-color: #363636;
-                border-bottom-left-radius: 8px;
-                border-bottom-right-radius: 8px;
-                border-top: 1px solid #5a5a5a;
-            }
-        """)
+        button_bar.setObjectName("settingsFooter")
         button_layout = QtWidgets.QHBoxLayout(button_bar)
         button_layout.setContentsMargins(16, 12, 16, 12)
         
@@ -709,51 +660,33 @@ class SettingsWindow(QtWidgets.QWidget):
         btn_cancel = QtWidgets.QPushButton("Cancel")
         btn_cancel.setFixedSize(90, 32)
         btn_cancel.setCursor(QtCore.Qt.PointingHandCursor)
-        btn_cancel.setStyleSheet("""
-            QPushButton {
-                background-color: #4d4d4d;
-                color: #AAA;
-                border: 1px solid #666666;
-                border-radius: 6px;
-                font-size: 11px;
-            }
-            QPushButton:hover {
-                background-color: #3d2d2d;
-                color: #FFF;
-                border-color: #ff6b6b;
-            }
-        """)
         btn_cancel.clicked.connect(self.close)
         button_layout.addWidget(btn_cancel)
         
         btn_save = QtWidgets.QPushButton("Save")
+        btn_save.setProperty("role", "primary")
         btn_save.setFixedSize(90, 32)
         btn_save.setCursor(QtCore.Qt.PointingHandCursor)
-        btn_save.setStyleSheet("""
-            QPushButton {
-                background-color: #2d4d3d;
-                color: #a3be8c;
-                border: 1px solid #5a7a5a;
-                border-radius: 6px;
-                font-size: 11px;
-                font-weight: 600;
-            }
-            QPushButton:hover {
-                background-color: #3d5d4d;
-                border-color: #a3be8c;
-                color: #FFF;
-            }
-        """)
         btn_save.clicked.connect(self._save_and_close)
         button_layout.addWidget(btn_save)
         self._settings_action_buttons = (btn_cancel, btn_save)
+        button_layout.addWidget(QtWidgets.QSizeGrip(self))
         
         main_layout.addWidget(button_bar)
         outer_layout.addWidget(self.container)
+        polish_page(self.tab_widget.widget(0))
+        self._apply_theme()
+
+    def _scroll_page(self, page):
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setWidget(page)
+        return scroll
 
     def _add_lazy_tab(self, title, builder):
         placeholder = QtWidgets.QWidget()
-        placeholder.setStyleSheet("background-color: transparent;")
         layout = QtWidgets.QVBoxLayout(placeholder)
         layout.addStretch()
         index = self.tab_widget.addTab(placeholder, title)
@@ -766,14 +699,32 @@ class SettingsWindow(QtWidgets.QWidget):
 
         title, builder = data
         tab = builder(add_to_tabs=False)
+        polish_page(tab)
+        if title == "Exit":
+            tab = self._scroll_page(tab)
 
         was_blocked = self.tab_widget.blockSignals(True)
         try:
+            placeholder = self.tab_widget.widget(index)
+            placeholder.hide()
             self.tab_widget.removeTab(index)
+            placeholder.deleteLater()
             self.tab_widget.insertTab(index, tab, title)
             self.tab_widget.setCurrentIndex(index)
         finally:
             self.tab_widget.blockSignals(was_blocked)
+
+    def _on_tab_changed(self, index):
+        self.setUpdatesEnabled(False)
+        try:
+            self._load_lazy_tab(index)
+            current = self.tab_widget.currentIndex()
+            for page_index in range(self.tab_widget.count()):
+                self.tab_widget.widget(page_index).setVisible(page_index == current)
+        finally:
+            self.setUpdatesEnabled(True)
+            self.container.update()
+            self.update()
 
     def _on_pick_clicked(self, widget):
         global ACTIVE_PICKER
@@ -814,75 +765,36 @@ class SettingsWindow(QtWidgets.QWidget):
         
         # Toolbar Scale Setting
         scale_group = QtWidgets.QGroupBox("Toolbar Scale")
-        scale_group.setStyleSheet("""
-            QGroupBox { 
-                color: #AAA; 
-                font-weight: bold; 
-                border: 1px solid #5a5a5a; 
-                border-radius: 4px; 
-                margin-top: 1ex; 
-                padding: 10px; 
-            } 
-            QGroupBox::title { 
-                subcontrol-origin: margin; 
-                left: 10px; 
-                padding: 0 3px 0 3px; 
-            }
-        """)
         scale_layout = QtWidgets.QHBoxLayout(scale_group)
         
         scale_label = QtWidgets.QLabel("UI Size Multiplier:")
-        scale_label.setStyleSheet("color: #CCC;")
         scale_layout.addWidget(scale_label)
         
         self.scale_spinbox = QtWidgets.QDoubleSpinBox()
         self.scale_spinbox.setRange(0.5, 3.0)
         self.scale_spinbox.setSingleStep(0.1)
         self.scale_spinbox.setValue(config.get_setting("toolbar_scale", 1.0))
-        self.scale_spinbox.setStyleSheet("""
-            QDoubleSpinBox { 
-                background-color: #4d4d4d; 
-                color: #FFF; 
-                border: 1px solid #666666; 
-                border-radius: 4px; 
-                padding: 4px; 
-            }
-        """)
+        self.scale_spinbox.setFixedWidth(76)
+        self.scale_spinbox.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.scale_spinbox.setAlignment(Qt.AlignCenter)
+        self.scale_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.scale_slider.setFixedHeight(28)
+        self.scale_slider.setRange(50, 300)
+        self.scale_slider.setValue(round(self.scale_spinbox.value() * 100))
+        self.scale_slider.setAccessibleName("Toolbar scale")
+        self.scale_slider.valueChanged.connect(lambda value: self.scale_spinbox.setValue(value / 100.0))
+        self.scale_spinbox.valueChanged.connect(lambda value: self.scale_slider.setValue(round(value * 100)))
+        scale_layout.addWidget(self.scale_slider, 1)
         scale_layout.addWidget(self.scale_spinbox)
-        scale_layout.addStretch()
         
         layout.addWidget(scale_group)
 
         # Channel Box helpers
         channel_box_group = QtWidgets.QGroupBox("Channel Box")
-        channel_box_group.setStyleSheet("""
-            QGroupBox {
-                color: #AAA;
-                font-weight: bold;
-                border: 1px solid #5a5a5a;
-                border-radius: 4px;
-                margin-top: 1ex;
-                padding: 10px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 3px 0 3px;
-            }
-            QCheckBox {
-                color: #DDD;
-                font-size: 11px;
-                spacing: 8px;
-            }
-            QCheckBox::indicator {
-                width: 14px;
-                height: 14px;
-            }
-        """)
         channel_box_layout = QtWidgets.QVBoxLayout(channel_box_group)
         channel_box_layout.setContentsMargins(12, 16, 12, 12)
 
-        self.channel_box_multi_selection_checkbox = QtWidgets.QCheckBox(
+        self.channel_box_multi_selection_checkbox = SettingsSwitch(
             "Channel Box Multi Selection Helper"
         )
         self.channel_box_multi_selection_checkbox.setToolTip(
@@ -896,7 +808,7 @@ class SettingsWindow(QtWidgets.QWidget):
         )
         channel_box_layout.addWidget(self.channel_box_multi_selection_checkbox)
 
-        self.channel_box_key_filter_checkbox = QtWidgets.QCheckBox(
+        self.channel_box_key_filter_checkbox = SettingsSwitch(
             "Show only selected Channel Box keys in the Timeline"
         )
         self.channel_box_key_filter_checkbox.setToolTip(
@@ -913,33 +825,9 @@ class SettingsWindow(QtWidgets.QWidget):
 
         # Viewport roll gimbal
         viewport_group = QtWidgets.QGroupBox("Viewport")
-        viewport_group.setStyleSheet("""
-            QGroupBox {
-                color: #AAA;
-                font-weight: bold;
-                border: 1px solid #5a5a5a;
-                border-radius: 4px;
-                margin-top: 1ex;
-                padding: 10px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 3px 0 3px;
-            }
-            QCheckBox {
-                color: #DDD;
-                font-size: 11px;
-                spacing: 8px;
-            }
-            QCheckBox::indicator {
-                width: 14px;
-                height: 14px;
-            }
-        """)
         viewport_layout = QtWidgets.QVBoxLayout(viewport_group)
         viewport_layout.setContentsMargins(12, 16, 12, 12)
-        self.viewport_gimbal_checkbox = QtWidgets.QCheckBox(
+        self.viewport_gimbal_checkbox = SettingsSwitch(
             "Show viewport roll gimbal in the active viewport"
         )
         self.viewport_gimbal_checkbox.setToolTip(
@@ -953,7 +841,7 @@ class SettingsWindow(QtWidgets.QWidget):
         )
         viewport_layout.addWidget(self.viewport_gimbal_checkbox)
 
-        self.tumble_around_selection_checkbox = QtWidgets.QCheckBox(
+        self.tumble_around_selection_checkbox = SettingsSwitch(
             "Tumble Around Selection"
         )
         self.tumble_around_selection_checkbox.setToolTip(
@@ -970,56 +858,18 @@ class SettingsWindow(QtWidgets.QWidget):
         layout.addWidget(viewport_group)
         
         # Folders Setting
-        folders_group = QtWidgets.QGroupBox("Folders & Paths")
-        folders_group.setStyleSheet("""
-            QGroupBox { 
-                color: #AAA; 
-                font-weight: bold; 
-                border: 1px solid #5a5a5a; 
-                border-radius: 4px; 
-                margin-top: 1ex; 
-                padding: 10px; 
-            } 
-            QGroupBox::title { 
-                subcontrol-origin: margin; 
-                left: 10px; 
-                padding: 0 3px 0 3px; 
-            }
-        """)
+        folders_group = QtWidgets.QGroupBox("Folders && Paths")
         folders_layout = QtWidgets.QVBoxLayout(folders_group)
         
         backup_label = QtWidgets.QLabel("Animation Backup Folder:")
-        backup_label.setStyleSheet("color: #CCC;")
         folders_layout.addWidget(backup_label)
         
         path_layout = QtWidgets.QHBoxLayout()
         self.backup_path_edit = QtWidgets.QLineEdit()
         self.backup_path_edit.setText(config.get_animation_backup_folder(create=False))
-        self.backup_path_edit.setStyleSheet("""
-            QLineEdit { 
-                background-color: #4d4d4d; 
-                color: #FFF; 
-                border: 1px solid #666666; 
-                border-radius: 4px; 
-                padding: 4px; 
-            }
-        """)
         path_layout.addWidget(self.backup_path_edit)
         
         browse_btn = QtWidgets.QPushButton("Browse...")
-        browse_btn.setStyleSheet("""
-            QPushButton { 
-                background-color: #4d4d4d; 
-                color: #CCC; 
-                border: 1px solid #666666; 
-                border-radius: 4px; 
-                padding: 4px 8px; 
-            } 
-            QPushButton:hover { 
-                background-color: #3D3D3D; 
-                color: #FFF; 
-            }
-        """)
         browse_btn.clicked.connect(self._browse_backup_folder)
         path_layout.addWidget(browse_btn)
         
@@ -1028,7 +878,7 @@ class SettingsWindow(QtWidgets.QWidget):
         
         layout.addStretch()
         if add_to_tabs:
-            self.tab_widget.addTab(tab, "General / Folders")
+            self.tab_widget.addTab(self._scroll_page(tab), "General")
         return tab
         
     def _browse_backup_folder(self):
@@ -1094,24 +944,20 @@ class SettingsWindow(QtWidgets.QWidget):
             "Click on a field and press the desired key combination. "
             "Shortcuts are saved and activated automatically."
         )
-        desc.setStyleSheet("color: #AAA; font-size: 11px;")
         desc.setWordWrap(True)
         layout.addWidget(desc)
         
         # Separator
         line = QtWidgets.QFrame()
         line.setFrameShape(QtWidgets.QFrame.HLine)
-        line.setStyleSheet("background-color: #5a5a5a;")
         layout.addWidget(line)
         
         # Scroll area for shortcuts
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        scroll.setStyleSheet("background-color: transparent;")
         
         scroll_content = QtWidgets.QWidget()
-        scroll_content.setStyleSheet("background-color: transparent;")
         scroll_layout = QtWidgets.QVBoxLayout(scroll_content)
         scroll_layout.setSpacing(8)
         
@@ -1131,7 +977,8 @@ class SettingsWindow(QtWidgets.QWidget):
             ("LKN", "Link Objects"),
             ("CAM", "Follow Cam"),
             ("WS", "World Space Copy"),
-            ("PIV", "TEMP"),
+            ("PIV", "Temp Pivot"),
+            ("TMC", "Temp Controls"),
             ("RUL", "Ruler"),
             ("RTM", "Retimer"),
         ])
@@ -1201,11 +1048,15 @@ class SettingsWindow(QtWidgets.QWidget):
         # Group: Copy Animation Submenu
         group_copy = self._create_shortcut_group("Copy Animation (Submenu)", [
             ("Copy Animation", "Copy Animation"),
+            ("Save Animation", "Save Animation"),
+            ("Load Animation", "Load Animation"),
             ("Paste Animation", "Paste Animation"),
             ("Paste Insert", "Paste Insert"),
             ("Paste Opposite", "Paste Opposite"),
             ("Copy Pose", "Copy Pose"),
             ("Paste Pose", "Paste Pose"),
+            ("Save Pose", "Save Pose"),
+            ("Load Pose", "Load Pose"),
         ])
         scroll_layout.addWidget(group_copy)
         
@@ -1220,6 +1071,11 @@ class SettingsWindow(QtWidgets.QWidget):
         
         # Group: Link Objects Submenu
         group_link = self._create_shortcut_group("Link Objects (Submenu)", [
+            ("Copy Link All Animation", "Copy All Animation"),
+            ("Copy Link Selected Range", "Copy Selected Timeline Range"),
+            ("Paste Link All Animation", "Paste All Animation"),
+            ("Paste Link Selected Range", "Paste Selected Timeline Range"),
+            ("Paste Link Playback Range", "Paste Playback Range"),
             ("Copy Link Frame", "Copy Link Frame"),
             ("Copy Link Playback Range", "Copy Playback Range"),
             ("Paste Link Frame", "Paste Link Frame"),
@@ -1269,21 +1125,6 @@ class SettingsWindow(QtWidgets.QWidget):
         # Reset shortcuts button
         btn_reset = QtWidgets.QPushButton("Reset All Shortcuts")
         btn_reset.setCursor(QtCore.Qt.PointingHandCursor)
-        btn_reset.setStyleSheet("""
-            QPushButton {
-                background-color: #4d4d4d;
-                color: #AAA;
-                border: 1px solid #666666;
-                border-radius: 4px;
-                padding: 6px;
-                font-size: 11px;
-            }
-            QPushButton:hover {
-                background-color: #3d2d2d;
-                color: #FFF;
-                border-color: #ff6b6b;
-            }
-        """)
         btn_reset.clicked.connect(self._reset_shortcuts)
         layout.addWidget(btn_reset)
         
@@ -1295,22 +1136,6 @@ class SettingsWindow(QtWidgets.QWidget):
         """Create a group of shortcut settings"""
         
         group = QtWidgets.QGroupBox(title)
-        group.setStyleSheet("""
-            QGroupBox {
-                color: #FFF;
-                font-weight: bold;
-                border: 1px solid #5a5a5a;
-                border-radius: 6px;
-                margin-top: 12px;
-                padding-top: 8px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-                color: #3498DB;
-            }
-        """)
         
         layout = QtWidgets.QGridLayout(group)
         layout.setContentsMargins(12, 16, 12, 12)
@@ -1319,7 +1144,6 @@ class SettingsWindow(QtWidgets.QWidget):
         for i, (key, label) in enumerate(items):
             # Label
             lbl = QtWidgets.QLabel(label)
-            lbl.setStyleSheet("color: #AAA; font-weight: normal;")
             layout.addWidget(lbl, i, 0)
             
             # Shortcut edit
@@ -1332,39 +1156,20 @@ class SettingsWindow(QtWidgets.QWidget):
             layout.addWidget(shortcut_edit, i, 1)
             
             # Clear button
-            btn_clear = QtWidgets.QPushButton("✕")
+            btn_clear = QtWidgets.QPushButton()
+            btn_clear.setText("\u00d7")
+            btn_clear.setToolTip("Clear shortcut")
             btn_clear.setFixedSize(24, 24)
             btn_clear.setCursor(QtCore.Qt.PointingHandCursor)
-            btn_clear.setStyleSheet("""
-                QPushButton {
-                    color: #666;
-                    background: transparent;
-                    border: none;
-                    font-size: 14px;
-                }
-                QPushButton:hover {
-                    color: #ff6b6b;
-                }
-            """)
             btn_clear.clicked.connect(lambda checked=False, w=shortcut_edit: w.clearShortcut())
             layout.addWidget(btn_clear, i, 2)
             
             # Pick button
-            btn_pick = QtWidgets.QPushButton("🖱️")
+            btn_pick = QtWidgets.QPushButton()
+            btn_pick.setText("+")
             btn_pick.setFixedSize(24, 24)
             btn_pick.setCursor(QtCore.Qt.PointingHandCursor)
             btn_pick.setToolTip("Pick action from toolbar")
-            btn_pick.setStyleSheet("""
-                QPushButton {
-                    color: #666;
-                    background: transparent;
-                    border: none;
-                    font-size: 14px;
-                }
-                QPushButton:hover {
-                    color: #3498DB;
-                }
-            """)
             btn_pick.clicked.connect(lambda checked=False, w=shortcut_edit: self._on_pick_clicked(w))
             layout.addWidget(btn_pick, i, 3)
             
@@ -1388,42 +1193,18 @@ class SettingsWindow(QtWidgets.QWidget):
         info_label = QtWidgets.QLabel(
             "Configure which elements appear in the toolbar. Uncheck to hide."
         )
-        info_label.setStyleSheet("color: #AAA; font-size: 11px;")
         layout.addWidget(info_label)
         
         # Scroll area for all checkboxes
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("""
-            QScrollArea {
-                border: none;
-                background-color: transparent;
-            }
-        """)
         
         scroll_content = QtWidgets.QWidget()
-        scroll_content.setStyleSheet("background-color: transparent;")
         scroll_layout = QtWidgets.QVBoxLayout(scroll_content)
         scroll_layout.setSpacing(12)
         
         # === BUTTONS SECTION ===
         buttons_group = QtWidgets.QGroupBox("Toolbar Buttons")
-        buttons_group.setStyleSheet("""
-            QGroupBox {
-                font-weight: bold;
-                color: #FFF;
-                border: 1px solid #5a5a5a;
-                border-radius: 6px;
-                margin-top: 8px;
-                padding-top: 12px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
-                color: #3498DB;
-            }
-        """)
         buttons_layout = QtWidgets.QGridLayout(buttons_group)
         buttons_layout.setSpacing(8)
         
@@ -1435,7 +1216,7 @@ class SettingsWindow(QtWidgets.QWidget):
             "RST": "Reset Values", "OFF": "Anim Offset",  "HIR": "Hierarchy",  "MIR": "Mirror",
             # Group 3
             "C":   "Copy Anim",    "LKN": "Link Objects", "CAM": "Follow Cam",
-            "WS":  "Worldspace",   "PIV": "TEMP",         "RUL": "Micro Move",
+            "WS":  "Worldspace",   "PIV": "Temp Pivot",   "TMC": "Temp Controls", "RUL": "Micro Move",
             # Group 4 – Tangents
             "PLT": "Plateau",      "STP": "Step",         "FLT": "Flat",
             "LIN": "Linear",       "CLP": "Clamped",      "SPL": "Spline",     "AUT": "Auto",
@@ -1447,19 +1228,15 @@ class SettingsWindow(QtWidgets.QWidget):
 
         row, col = 0, 0
         for btn_key, btn_label in button_labels.items():
-            cb = QtWidgets.QCheckBox(f"{btn_key}  {btn_label}")
+            cb = SettingsSwitch(f"{btn_key}  {btn_label}")
             cb.setChecked(self._workspace["buttons"].get(btn_key, True))
-            cb.setStyleSheet("""
-                QCheckBox { color: #DDD; font-size: 11px; }
-                QCheckBox::indicator { width: 13px; height: 13px; }
-            """)
             cb.stateChanged.connect(
                 lambda state, k=btn_key: self._on_workspace_button_toggle(k, bool(state))
             )
             buttons_layout.addWidget(cb, row, col)
             self._workspace_checkboxes["buttons"][btn_key] = cb
             col += 1
-            if col >= 4:
+            if col >= 2:
                 col = 0
                 row += 1
 
@@ -1468,7 +1245,6 @@ class SettingsWindow(QtWidgets.QWidget):
         # === SLIDERS SECTION =====================================================
         # Each entry = ONE checkbox that hides/shows the entire dropdown+slider unit.
         sliders_group = QtWidgets.QGroupBox("Slider Sections")
-        sliders_group.setStyleSheet(buttons_group.styleSheet())
         sl_layout = QtWidgets.QVBoxLayout(sliders_group)
         sl_layout.setSpacing(8)
 
@@ -1480,12 +1256,9 @@ class SettingsWindow(QtWidgets.QWidget):
         ]
 
         for section_key, section_label in slider_sections:
-            cb = QtWidgets.QCheckBox(section_label)
+            cb = SettingsSwitch(section_label.split("  ", 1)[0])
+            cb.setToolTip(section_label)
             cb.setChecked(self._workspace.get("sliders", {}).get(section_key, True))
-            cb.setStyleSheet("""
-                QCheckBox { color: #DDD; font-size: 11px; }
-                QCheckBox::indicator { width: 13px; height: 13px; }
-            """)
             cb.stateChanged.connect(
                 lambda state, k=section_key: self._on_workspace_slider_toggle(k, bool(state))
             )
@@ -1497,7 +1270,6 @@ class SettingsWindow(QtWidgets.QWidget):
         # === INDIVIDUAL ELEMENTS SECTION =====================================
         # Things that don't fit neatly into a group or slider section.
         elements_group = QtWidgets.QGroupBox("Individual Elements")
-        elements_group.setStyleSheet(buttons_group.styleSheet())
         el_layout = QtWidgets.QVBoxLayout(elements_group)
         el_layout.setSpacing(6)
 
@@ -1505,12 +1277,9 @@ class SettingsWindow(QtWidgets.QWidget):
             "SELECTOR": "Selector  —  Object count badge + selector window",
         }
         for btn_key, btn_label in individual_buttons.items():
-            cb = QtWidgets.QCheckBox(btn_label)
+            cb = SettingsSwitch(btn_label.split("  ", 1)[0])
+            cb.setToolTip(btn_label)
             cb.setChecked(self._workspace["buttons"].get(btn_key, True))
-            cb.setStyleSheet("""
-                QCheckBox { color: #DDD; font-size: 11px; }
-                QCheckBox::indicator { width: 13px; height: 13px; }
-            """)
             cb.stateChanged.connect(
                 lambda state, k=btn_key: self._on_workspace_button_toggle(k, bool(state))
             )
@@ -1531,27 +1300,12 @@ class SettingsWindow(QtWidgets.QWidget):
         btn_export.setFixedHeight(30)
         btn_export.setCursor(QtCore.Qt.PointingHandCursor)
         btn_export.clicked.connect(self._export_workspace_preset)
-        btn_export.setStyleSheet("""
-            QPushButton {
-                background-color: #4d4d4d;
-                color: #AAA;
-                border: 1px solid #666666;
-                border-radius: 4px;
-                padding: 4px 12px;
-            }
-            QPushButton:hover {
-                background-color: #3498DB;
-                color: #FFF;
-                border-color: #3498DB;
-            }
-        """)
         preset_layout.addWidget(btn_export)
         
         btn_import = QtWidgets.QPushButton("Import Preset")
         btn_import.setFixedHeight(30)
         btn_import.setCursor(QtCore.Qt.PointingHandCursor)
         btn_import.clicked.connect(self._import_workspace_preset)
-        btn_import.setStyleSheet(btn_export.styleSheet())
         preset_layout.addWidget(btn_import)
         
         preset_layout.addStretch()
@@ -1560,20 +1314,6 @@ class SettingsWindow(QtWidgets.QWidget):
         btn_reset.setFixedHeight(30)
         btn_reset.setCursor(QtCore.Qt.PointingHandCursor)
         btn_reset.clicked.connect(self._reset_workspace)
-        btn_reset.setStyleSheet("""
-            QPushButton {
-                background-color: #3d2d2d;
-                color: #ff6b6b;
-                border: 1px solid #5a3a3a;
-                border-radius: 4px;
-                padding: 4px 12px;
-            }
-            QPushButton:hover {
-                background-color: #4d3d3d;
-                border-color: #ff6b6b;
-                color: #FFF;
-            }
-        """)
         preset_layout.addWidget(btn_reset)
         
         layout.addLayout(preset_layout)
@@ -1696,22 +1436,6 @@ class SettingsWindow(QtWidgets.QWidget):
         
         # Refresh section
         refresh_group = QtWidgets.QGroupBox("Refresh AnimKey")
-        refresh_group.setStyleSheet("""
-            QGroupBox {
-                color: #FFF;
-                font-weight: bold;
-                border: 1px solid #5a5a5a;
-                border-radius: 6px;
-                margin-top: 12px;
-                padding-top: 8px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-                color: #3498DB;
-            }
-        """)
         
         refresh_layout = QtWidgets.QVBoxLayout(refresh_group)
         refresh_layout.setContentsMargins(12, 16, 12, 12)
@@ -1720,27 +1444,13 @@ class SettingsWindow(QtWidgets.QWidget):
             "Clear AnimKey's cache and reload all modules.\n"
             "Use this if you experience issues or after updating AnimKey."
         )
-        refresh_desc.setStyleSheet("color: #AAA; font-weight: normal;")
         refresh_desc.setWordWrap(True)
         refresh_layout.addWidget(refresh_desc)
         
-        btn_refresh = QtWidgets.QPushButton("🔄 Refresh AnimKey")
+        btn_refresh = QtWidgets.QPushButton("Refresh AnimKey")
+        btn_refresh.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload))
         btn_refresh.setFixedHeight(36)
         btn_refresh.setCursor(QtCore.Qt.PointingHandCursor)
-        btn_refresh.setStyleSheet("""
-            QPushButton {
-                color: #FFF;
-                background-color: #4d4d4d;
-                border: 1px solid #666666;
-                border-radius: 6px;
-                font-size: 12px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #3498DB;
-                border-color: #3498DB;
-            }
-        """)
         btn_refresh.clicked.connect(self._refresh_animkey)
         refresh_layout.addWidget(btn_refresh)
         
@@ -1748,21 +1458,6 @@ class SettingsWindow(QtWidgets.QWidget):
         
         # Uninstall section
         uninstall_group = QtWidgets.QGroupBox("Uninstall AnimKey")
-        uninstall_group.setStyleSheet("""
-            QGroupBox {
-                color: #ff6b6b;
-                font-weight: bold;
-                border: 1px solid #5a3a3a;
-                border-radius: 6px;
-                margin-top: 12px;
-                padding-top: 8px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-            }
-        """)
         
         uninstall_layout = QtWidgets.QVBoxLayout(uninstall_group)
         uninstall_layout.setContentsMargins(12, 16, 12, 12)
@@ -1772,27 +1467,13 @@ class SettingsWindow(QtWidgets.QWidget):
             "All user data, shortcuts, and preferences will be deleted.\n"
             "This action cannot be undone."
         )
-        uninstall_desc.setStyleSheet("color: #ff6b6b; font-weight: normal;")
         uninstall_desc.setWordWrap(True)
         uninstall_layout.addWidget(uninstall_desc)
         
-        btn_uninstall = QtWidgets.QPushButton("🗑️ Uninstall AnimKey")
+        btn_uninstall = QtWidgets.QPushButton("Uninstall AnimKey")
+        btn_uninstall.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_TrashIcon))
         btn_uninstall.setFixedHeight(36)
         btn_uninstall.setCursor(QtCore.Qt.PointingHandCursor)
-        btn_uninstall.setStyleSheet("""
-            QPushButton {
-                color: white;
-                background-color: #3d2d2d;
-                border: 1px solid #5a3a3a;
-                border-radius: 6px;
-                font-size: 12px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #bf616a;
-                border-color: #bf616a;
-            }
-        """)
         btn_uninstall.clicked.connect(self._uninstall_animkey)
         uninstall_layout.addWidget(btn_uninstall)
         
@@ -1801,7 +1482,7 @@ class SettingsWindow(QtWidgets.QWidget):
         layout.addStretch()
         
         if add_to_tabs:
-            self.tab_widget.addTab(tab, "Exit")
+            self.tab_widget.addTab(self._scroll_page(tab), "Exit")
         return tab
 
     def _create_update_tab(self, add_to_tabs=True):
@@ -1814,70 +1495,7 @@ class SettingsWindow(QtWidgets.QWidget):
         return tab
     
     def _apply_theme(self):
-        """Apply theme to the window.
-        
-        NOTE: Do NOT set background-color on the root widget here —
-        that would override WA_TranslucentBackground and make the window opaque.
-        The container QFrame already has the dark background via its own
-        stylesheet, which is all that is needed.
-        """
-        # Only style child widgets, never the root QWidget itself
-        self.setStyleSheet("""
-            QTabWidget::pane {
-                border: none;
-                background-color: #3a3a3a;
-            }
-            QTabBar::tab {
-                color: #888;
-                background-color: #363636;
-                border: 1px solid #5a5a5a;
-                border-bottom: none;
-                padding: 8px 20px;
-                margin-right: 2px;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
-            }
-            QTabBar::tab:selected {
-                color: #FFF;
-                background-color: #3a3a3a;
-                border-bottom: 1px solid #3a3a3a;
-            }
-            QTabBar::tab:hover:!selected {
-                background-color: #4d4d4d;
-            }
-            QScrollArea {
-                background-color: transparent;
-            }
-            QScrollBar:vertical {
-                background-color: #444444;
-                width: 10px;
-                border-radius: 5px;
-            }
-            QScrollBar::handle:vertical {
-                background-color: #666666;
-                border-radius: 5px;
-                min-height: 20px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background-color: #666;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0px;
-            }
-        """)
-    
-    def enterEvent(self, event):
-        self._animate_opacity(self._hover_opacity)
-    
-    def leaveEvent(self, event):
-        self._animate_opacity(self._base_opacity)
-    
-    def _animate_opacity(self, val):
-        anim = QtCore.QPropertyAnimation(self, b"windowOpacity")
-        anim.setDuration(150)
-        anim.setEndValue(val)
-        anim.start(QtCore.QPropertyAnimation.DeleteWhenStopped)
-        self._anim = anim
+        self.setStyleSheet(STYLESHEET)
 
     def closeEvent(self, event):
         """Clean up global reference when the window is closed."""

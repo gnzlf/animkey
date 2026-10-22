@@ -1083,7 +1083,7 @@ class AnimCleanerWindow(ContextPopupWindow):
         
         
         
-        self._base_opacity = 0.5
+        self._base_opacity = 1.0
         self._hover_opacity = 1.0
         self._scope_index = 1  # Default: Selected Objects
         

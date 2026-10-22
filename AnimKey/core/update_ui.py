@@ -10,6 +10,7 @@ from AnimKey.core import updater
 from AnimKey.mods import configMod as config
 from AnimKey.mods.maya_compat import QtCore, QtGui, QtWidgets
 from AnimKey.version import __version__
+from AnimKey.core.settings_style import SettingsSwitch
 
 
 def _reload_after_update(install_root=None):
@@ -107,10 +108,8 @@ class UpdateTab(QtWidgets.QWidget):
         header = QtWidgets.QHBoxLayout()
         title_block = QtWidgets.QVBoxLayout()
         title = QtWidgets.QLabel("AnimKey Updates")
-        title.setStyleSheet("color: #FFF; font-size: 17px; font-weight: 700;")
         title_block.addWidget(title)
         self.current_label = QtWidgets.QLabel()
-        self.current_label.setStyleSheet("color: #a3be8c; font-size: 11px;")
         title_block.addWidget(self.current_label)
         header.addLayout(title_block)
         header.addStretch()
@@ -118,18 +117,6 @@ class UpdateTab(QtWidgets.QWidget):
         self.refresh_button = QtWidgets.QPushButton("Check for updates")
         self.refresh_button.setCursor(QtCore.Qt.PointingHandCursor)
         self.refresh_button.setFixedHeight(32)
-        self.refresh_button.setStyleSheet("""
-            QPushButton {
-                background-color: #2f536d;
-                color: #FFF;
-                border: 1px solid #477a9d;
-                border-radius: 5px;
-                padding: 5px 12px;
-                font-weight: 600;
-            }
-            QPushButton:hover { background-color: #376985; }
-            QPushButton:disabled { color: #777; background-color: #3f3f3f; border-color: #555; }
-        """)
         self.refresh_button.clicked.connect(self.refresh_releases)
         header.addWidget(self.refresh_button)
         layout.addLayout(header)
@@ -139,7 +126,6 @@ class UpdateTab(QtWidgets.QWidget):
             "Your preferences, shortcuts, workspace, and saved data are kept when changing versions."
         )
         description.setWordWrap(True)
-        description.setStyleSheet("color: #AAA; font-size: 11px;")
         layout.addWidget(description)
 
         self.table = QtWidgets.QTableWidget(0, 5)
@@ -151,23 +137,6 @@ class UpdateTab(QtWidgets.QWidget):
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
-        self.table.setStyleSheet("""
-            QTableWidget {
-                background-color: #333;
-                alternate-background-color: #383838;
-                color: #CCC;
-                border: 1px solid #555;
-                border-radius: 5px;
-            }
-            QHeaderView::section {
-                background-color: #414141;
-                color: #DDD;
-                border: none;
-                border-bottom: 1px solid #5a5a5a;
-                padding: 6px;
-                font-weight: 600;
-            }
-        """)
         table_header = self.table.horizontalHeader()
         table_header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         table_header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
@@ -177,9 +146,8 @@ class UpdateTab(QtWidgets.QWidget):
         layout.addWidget(self.table, 1)
 
         footer = QtWidgets.QHBoxLayout()
-        self.auto_check = QtWidgets.QCheckBox("Check automatically when opening this tab")
+        self.auto_check = SettingsSwitch("Check automatically when opening this tab")
         self.auto_check.setChecked(bool(config.get_setting("check_updates", True)))
-        self.auto_check.setStyleSheet("color: #AAA;")
         self.auto_check.toggled.connect(
             lambda enabled: config.set_setting("check_updates", bool(enabled))
         )
@@ -187,10 +155,6 @@ class UpdateTab(QtWidgets.QWidget):
         footer.addStretch()
         releases_link = QtWidgets.QPushButton("Open GitHub Releases")
         releases_link.setCursor(QtCore.Qt.PointingHandCursor)
-        releases_link.setStyleSheet("""
-            QPushButton { color: #69aee6; background: transparent; border: none; padding: 4px; }
-            QPushButton:hover { color: #9acdf2; text-decoration: underline; }
-        """)
         releases_link.clicked.connect(
             lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl(updater.RELEASES_PAGE_URL))
         )
@@ -199,7 +163,6 @@ class UpdateTab(QtWidgets.QWidget):
 
         self.status_label = QtWidgets.QLabel("Ready to check GitHub.")
         self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet("color: #999; font-size: 11px;")
         layout.addWidget(self.status_label)
         self._refresh_current_label()
 
@@ -303,21 +266,10 @@ class UpdateTab(QtWidgets.QWidget):
             self._set_item(row, 3, status)
 
             button = QtWidgets.QPushButton(action)
+            button.setProperty("role", "primary")
             button.setProperty("installable", release.installable)
             button.setEnabled(release.installable and not self._busy)
             button.setCursor(QtCore.Qt.PointingHandCursor)
-            button.setStyleSheet("""
-                QPushButton {
-                    color: #FFF;
-                    background-color: #355b46;
-                    border: 1px solid #57836a;
-                    border-radius: 4px;
-                    padding: 5px 10px;
-                    font-weight: 600;
-                }
-                QPushButton:hover { background-color: #427257; }
-                QPushButton:disabled { color: #777; background-color: #404040; border-color: #555; }
-            """)
             button.clicked.connect(
                 lambda _checked=False, selected=release: self._confirm_install(selected)
             )

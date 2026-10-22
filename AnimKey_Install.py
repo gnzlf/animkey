@@ -26,6 +26,13 @@ REQUIRED_PACKAGE_FILES = (
     os.path.join("core", "toolbar.py"),
     os.path.join("mods", "maya_compat.py"),
     os.path.join("buttons", "animCrash.py"),
+    os.path.join("buttons", "tempPivot.py"),
+    os.path.join("buttons", "tempControls.py"),
+    os.path.join("buttons", "tempControlsUI.py"),
+    os.path.join("core", "temp_transform.py"),
+    os.path.join("core", "temp_shapes.py"),
+    os.path.join("data", "icons", "temp_pivot.svg"),
+    os.path.join("data", "icons", "temp_controls.svg"),
 )
 
 

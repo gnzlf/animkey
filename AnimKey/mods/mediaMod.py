@@ -140,7 +140,8 @@ BUTTON_ICONS = {
     "LKN": ICON_BTN_LKN,
     "CAM": ICON_BTN_CAM,
     "WS": ICON_BTN_WS,
-    "PIV": ICON_BTN_PIV,
+    "PIV": get_icon("temp_pivot.svg"),
+    "TMC": get_icon("temp_controls.svg"),
     "RUL": ICON_BTN_RUL,
     "S": get_icon("animkey_btn_save_128.png"),      # Save Animation
     # Tangent buttons

@@ -34,6 +34,8 @@ from AnimKey.mods.maya_compat import (
     wrap_instance as wrapInstance,
 )
 from AnimKey.mods.storage import atomic_write_json
+from AnimKey.core.window_style import apply_window_style, polish_tool_widgets, COMPACT_STYLESHEET
+from AnimKey.core.settings_style import GlassPanel
 
 Qt = QtCore.Qt
 QPoint = QtCore.QPoint
@@ -380,6 +382,9 @@ class WindowsPenInputBridge(_NATIVE_EVENT_FILTER_BASE):
             window_pos = QPoint(round(point.x / ratio), round(point.y / ratio))
             position = QPointF(canvas.mapFrom(window, window_pos))
             if kind == "press":
+                hovered = QtWidgets.QApplication.widgetAt(canvas.mapToGlobal(position.toPoint()))
+                if hovered is not None and hovered.window().objectName() == "AnimKey_DrawControls":
+                    return False, 0
                 if (not canvas.isVisible() or not canvas.isEnabled()
                         or canvas.testAttribute(Qt.WA_TransparentForMouseEvents)
                         or window.childAt(window_pos) is not canvas
@@ -883,7 +888,6 @@ class SketchboardData:
     def from_dict(self, data: dict, current_w: int, current_h: int):
         self.canvas_width = data.get("canvas_width", 1920)
         self.canvas_height = data.get("canvas_height", 1080)
-        spline = CatmullRomSpline()
         for fn_str, frame_entry in data.get("frames", {}).items():
             fn = int(fn_str)
             fd = FrameData(frame=fn)
@@ -921,7 +925,9 @@ class SketchboardData:
                         wy=pd.get("wy"),
                         wz=pd.get("wz"),
                     ))
-                s.compute_smoothed(spline, current_w, current_h, self.canvas_width, self.canvas_height)
+                # The renderer builds paths lazily at the actual viewport
+                # dimensions. Smoothing every saved frame here blocks opening
+                # large boards and immediately becomes stale after resize.
                 fd.strokes.append(s)
 
             self.frames[fn] = fd
@@ -1697,10 +1703,10 @@ class DrawingCanvas(QWidget):
         # Camera/pan-zoom state is frozen for the duration of a stroke. Querying
         # Maya here for every tablet sample was the largest source of input lag.
         if self.drawing:
-            return
+            return False
         token = self._current_view_token()
         if token == self._last_view_token:
-            return
+            return False
         self._last_view_token = token
         self._invalidate_frame_render_cache()
         fd = self.data.frames.get(self.current_frame)
@@ -1709,6 +1715,7 @@ class DrawingCanvas(QWidget):
                 self._invalidate_stroke(stroke)
         self._onion_cache.clear()
         self._rebuild_current_frame()
+        return True
 
     def _to_normalized(self, px, py, view_transform=None,
                        uniform_transform=None):
@@ -3042,6 +3049,13 @@ class MayaTimelineSync(QtCore.QObject):
     def update_keys(self):
         try:
             if not hasattr(cmds, 'objExists'): return
+            frames = self.data_ref.get_frame_numbers()
+            if not frames and not cmds.objExists(BRUSH_CONTAINER):
+                return
+            if cmds.objExists(BRUSH_CONTAINER + ".drawFrames"):
+                existing = cmds.keyframe(BRUSH_CONTAINER + ".drawFrames", query=True, timeChange=True) or []
+                if existing == [float(frame) for frame in frames]:
+                    return
             
             node = self._get_brush_key_node()
 
@@ -3049,17 +3063,8 @@ class MayaTimelineSync(QtCore.QObject):
             cmds.cutKey(node, attribute="drawFrames", clear=True)
             
             # Inyectar ticks en el timeline
-            for fn in self.data_ref.get_frame_numbers():
+            for fn in frames:
                 cmds.setKeyframe(node, attribute="drawFrames", time=(fn, fn), value=1)
-            
-            # Seleccionar el nodo para que Maya muestre los keyframes en el timeline
-            old_sel = cmds.ls(selection=True) or []
-            cmds.select(node, replace=True)
-            # Deferred: restaurar selección después de que Maya procese el UI
-            if old_sel:
-                cmds.evalDeferred(lambda: cmds.select(old_sel, replace=True) if cmds.objExists(old_sel[0]) else None)
-            else:
-                cmds.evalDeferred(lambda: cmds.select(clear=True))
                 
         except Exception:
             pass
@@ -3532,6 +3537,7 @@ class OnionSettingsDialog(QtWidgets.QDialog):
         self.canvas = canvas
         self.setStyleSheet(self._STYLE)
         self._build_ui()
+        apply_window_style(self)
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -3718,6 +3724,45 @@ def get_active_model_panel_widget(panel=None):
             return widget
     return None
 
+class DrawControlsWindow(QWidget):
+    """Settings' material shell, independent of the transparent viewport canvas."""
+
+    def __init__(self, board, parent=None):
+        super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint)
+        self.board = board
+        self.canvas = board.canvas
+        self._positioned = False
+        self.setObjectName("AnimKey_DrawControls")
+        self.setWindowTitle("AnimKey Draw")
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.container = GlassPanel(self)
+        outer.addWidget(self.container)
+        self.body_layout = QVBoxLayout(self.container)
+        self.body_layout.setContentsMargins(1, 1, 1, 1)
+        self.body_layout.setSpacing(0)
+        from AnimKey.core.settings import TitleBar
+        self.title_bar = TitleBar(self)
+        self.title_bar.findChild(QLabel, "settingsSubtitle").setText("Draw")
+        self.title_bar.minimize_btn.clicked.disconnect()
+        self.title_bar.minimize_btn.clicked.connect(board.toggle_sidebar)
+        self.title_bar.minimize_btn.setToolTip("Collapse / Expand drawing controls")
+        self.title_bar.maximize_btn.hide()
+        self.body_layout.addWidget(self.title_bar)
+        self.setMinimumWidth(700)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setCompositionMode(QPainter.CompositionMode_Source)
+        painter.fillRect(event.rect(), Qt.transparent)
+
+    def closeEvent(self, event):
+        if not getattr(self.board, "_closing", False):
+            self.board.close()
+        super().closeEvent(event)
+
+
 class SketchboardWindow(QWidget):
     _instance = None
 
@@ -3735,6 +3780,8 @@ class SketchboardWindow(QWidget):
         self.setAttribute(Qt.WA_AlwaysShowToolTips, True)
 
         if overlay and vp_widget:
+            # OpenGL viewports need a translucent top-level surface: ordinary
+            # QWidget children obscure Maya's native viewport backing store.
             self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.Tool)
             self.setAttribute(Qt.WA_TranslucentBackground)
             self.setAttribute(Qt.WA_NoSystemBackground, True)
@@ -3752,13 +3799,12 @@ class SketchboardWindow(QWidget):
 
         self._brush_overlay_enabled = True
         self._sidebar_collapsed = False
-        self._sidebar_anim = None
-        self._sidebar_opacity_effect = None
-        self._sidebar_full_height = 0
-        self._hud_width_hint = 0
         self._tablet_event_filter_installed = False
         self._native_pen_event_filter = None
         self._last_polled_frame = None
+        self._next_panel_refresh = 0.0
+        self._closing = False
+        self._ready = False
         self._timeline_keys_dirty = False
         self._scene_commit_timer = QTimer(self)
         self._scene_commit_timer.setSingleShot(True)
@@ -3782,6 +3828,7 @@ class SketchboardWindow(QWidget):
             # more main-thread time for high-frequency tablet events.
             self.sync_timer.start(33)
             self._sync_geometry()
+        self._ready = True
 
     def _install_tablet_event_filter(self):
         """Capture pen events that Windows routes to Maya's model panel."""
@@ -3846,6 +3893,12 @@ class SketchboardWindow(QWidget):
                 return False
         return False
 
+    def _is_controls_widget(self, widget):
+        try:
+            return isinstance(widget, QWidget) and widget.window() is self.hud_wrapper
+        except (AttributeError, RuntimeError):
+            return False
+
     def eventFilter(self, watched, event):
         """Route off-target tablet events into the visible drawing canvas.
 
@@ -3870,6 +3923,7 @@ class SketchboardWindow(QWidget):
             and getattr(self, "_brush_overlay_enabled", True)
             and not self.canvas.testAttribute(Qt.WA_TransparentForMouseEvents)
             and not self._is_canvas_widget(watched)
+            and not self._is_controls_widget(watched)
         ):
             global_pos = get_event_global_pos(event)
             if global_pos is not None:
@@ -3910,7 +3964,7 @@ class SketchboardWindow(QWidget):
         self.status_bar.setText(f"Frame: {curr} | Strokes: {len(fd.strokes) if fd else 0}")
 
     def _sync_geometry(self):
-        if not getattr(self, "_brush_overlay_enabled", True):
+        if self._closing or not getattr(self, "_brush_overlay_enabled", True):
             return
         # Do not run model-panel discovery or force an extra canvas repaint in
         # the middle of a stroke. Mouse/tablet events already repaint it.
@@ -3920,11 +3974,16 @@ class SketchboardWindow(QWidget):
         # Space/layout changes may replace the viewport widget even when the
         # logical panel stays locked. Reacquire that panel's drawing surface.
         try:
-            panel = self.model_panel if self.panel_locked else get_active_model_panel(self.model_panel)
-            self.viewport_parent = get_active_model_panel_widget(panel) if panel else None
-            if panel:
-                self.model_panel = panel
-                self.canvas.model_panel = panel
+            now = time.monotonic()
+            if now >= self._next_panel_refresh:
+                self._next_panel_refresh = now + 0.25
+                panel = self.model_panel if self.panel_locked else get_active_model_panel(self.model_panel)
+                old_visible = self.viewport_parent is not None and self.viewport_parent.isVisible()
+                if panel != self.model_panel or not old_visible:
+                    self.viewport_parent = get_active_model_panel_widget(panel) if panel else None
+                if panel:
+                    self.model_panel = panel
+                    self.canvas.model_panel = panel
         except (RuntimeError, TypeError):
             self.viewport_parent = None
 
@@ -3937,18 +3996,19 @@ class SketchboardWindow(QWidget):
                 if self.isVisible(): self.hide()
                 return
             else:
-                if not self.isVisible(): self.show()
+                if self._ready and not self.isVisible(): self.show()
         except RuntimeError:
             self.viewport_parent = None
             return
 
         try:
-            global_pos = self.viewport_parent.mapToGlobal(QPoint(0, 0))
             w, h = self.viewport_parent.width(), self.viewport_parent.height()
-            
-            if self.x() != global_pos.x() or self.y() != global_pos.y() or self.width() != w or self.height() != h:
-                self.setGeometry(global_pos.x(), global_pos.y(), w, h)
-            if hasattr(self, "canvas"):
+            position = self.viewport_parent.mapToGlobal(QPoint(0, 0))
+            if self.x() != position.x() or self.y() != position.y() or self.width() != w or self.height() != h:
+                self.setGeometry(position.x(), position.y(), w, h)
+            # Geometry, timeline and drawing events already invalidate the
+            # canvas. Request a repaint only when the camera actually changes.
+            if self.canvas._ensure_view_render_current():
                 self.canvas.update()
         except RuntimeError:
             self.viewport_parent = None
@@ -3956,7 +4016,12 @@ class SketchboardWindow(QWidget):
     def set_overlay_enabled(self, enabled):
         self._brush_overlay_enabled = bool(enabled)
         if not self._brush_overlay_enabled:
+            if hasattr(self, "sync_timer"):
+                self.sync_timer.stop()
+            self._remove_tablet_event_filter()
+            self._remove_native_pen_event_filter()
             self.hide()
+            self.hud_wrapper.hide()
             return
 
         if self.is_overlay:
@@ -3965,6 +4030,13 @@ class SketchboardWindow(QWidget):
                 return
         self.show()
         self.raise_()
+        self._position_floating_hud()
+        self.hud_wrapper.show()
+        self.hud_wrapper.raise_()
+        if self.is_overlay:
+            self._install_tablet_event_filter()
+            self._install_native_pen_event_filter()
+            self.sync_timer.start(33)
         self.canvas.update()
 
     def toggle_overlay_enabled(self):
@@ -3973,15 +4045,24 @@ class SketchboardWindow(QWidget):
 
     def toggle_passthrough(self, checked):
         self.canvas.pass_through_mode = checked
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, checked)
+        # A transparent QWidget alone still receives Windows hit tests as a
+        # top-level overlay. Navigation must pass input to Maya's native view.
+        input_flag = getattr(Qt, "WindowTransparentForInput", None)
+        if self.is_overlay and input_flag is not None:
+            visible = self.isVisible()
+            self.setWindowFlag(input_flag, bool(checked))
+            if visible:
+                self.show()
+                self.hud_wrapper.raise_()
         if checked:
             # Modo Navegación — el canvas ignora clicks, la toolbar sigue activa
             self.canvas.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-            self.toggle_mode_btn.setText("👁️ NAV")
+            self.toggle_mode_btn.setText("Navigate")
         else:
             # Modo Dibujo
             self.canvas.setAttribute(Qt.WA_TransparentForMouseEvents, False)
-            self.toggle_mode_btn.setText("🖌️ DRAW")
-        apply_brush_button_icon(self.toggle_mode_btn, "toggle", "D", icon_size=23)
+            self.toggle_mode_btn.setText("Navigate")
         self.canvas.update()
 
     def toggle_dim(self, checked):
@@ -3991,345 +4072,112 @@ class SketchboardWindow(QWidget):
     def toggle_lock(self, checked):
         self.panel_locked = checked
         if checked:
-            self.lock_btn.setText("🔒")
+            self.lock_btn.setText("Unlock viewport")
             self.lock_btn.setToolTip("Panel LOCKED - Click to unlock")
         else:
-            self.lock_btn.setText("🔓")
+            self.lock_btn.setText("Lock viewport")
             self.lock_btn.setToolTip("Panel FREE - Click to lock in this viewport")
 
-        apply_brush_button_icon(self.lock_btn, "lock", "L", icon_size=23)
 
     def toggle_sidebar(self):
         self._set_sidebar_collapsed(not self._sidebar_collapsed, animate=True)
-
-    def _ensure_sidebar_metrics(self):
-        if not hasattr(self, "sidebar_widget") or not hasattr(self, "hud_wrapper"):
-            return
-        try:
-            if self.sidebar_widget.layout():
-                self.sidebar_widget.layout().activate()
-            if self.hud_wrapper.layout():
-                self.hud_wrapper.layout().activate()
-        except Exception:
-            pass
-
-        sidebar_hint = self.sidebar_widget.sizeHint()
-        hud_hint = self.hud_wrapper.sizeHint()
-        self._sidebar_full_height = max(
-            int(getattr(self, "_sidebar_full_height", 0) or 0),
-            int(sidebar_hint.height()),
-            int(self.sidebar_widget.height()),
-            40,
-        )
-        self._hud_width_hint = max(
-            int(getattr(self, "_hud_width_hint", 0) or 0),
-            int(hud_hint.width()),
-            int(self.hud_wrapper.width()),
-        )
 
     def _position_floating_hud(self):
         if not hasattr(self, "hud_wrapper") or not hasattr(self, "status_bar_wrapper"):
             return
 
-        self._ensure_sidebar_metrics()
-        W, H = self.width(), self.height()
-
-        if self.hud_wrapper.layout():
-            try:
-                self.hud_wrapper.layout().activate()
-            except Exception:
-                pass
-
-        hud_w = max(self._hud_width_hint, self.hud_wrapper.sizeHint().width())
-        hud_h = max(1, self.hud_wrapper.sizeHint().height())
-        hud_x = int((W - hud_w) / 2)
-        hud_y = H - hud_h - 30 - 5
-        self.hud_wrapper.setGeometry(hud_x, hud_y, hud_w, hud_h)
-
-        sb_w = self.status_bar_wrapper.sizeHint().width()
-        sb_h = self.status_bar_wrapper.sizeHint().height()
-        sb_x = int((W - sb_w) / 2)
-        sb_y = H - sb_h - 6
-        self.status_bar_wrapper.setGeometry(sb_x, sb_y, sb_w, sb_h)
+        if self.hud_wrapper.isWindow():
+            self.hud_wrapper.adjustSize()
+            if not self.hud_wrapper._positioned:
+                from AnimKey.mods.maya_compat import screen_available_geometry
+                screen = screen_available_geometry(self)
+                position = self.mapToGlobal(QPoint(0, 0))
+                width, height = self.hud_wrapper.width(), self.hud_wrapper.height()
+                x = position.x() + (self.width() - width) // 2
+                y = position.y() + self.height() - height - 24
+                x = max(screen.left() + 8, min(x, screen.right() - width - 8))
+                y = max(screen.top() + 8, min(y, screen.bottom() - height - 8))
+                self.hud_wrapper.move(x, y)
+                self.hud_wrapper._positioned = True
+            return
 
     def _set_sidebar_collapsed(self, collapsed, animate=True):
-        if not hasattr(self, "sidebar_widget") or not hasattr(self, "sidebar_toggle_btn"):
-            return
-
-        self._ensure_sidebar_metrics()
         self._sidebar_collapsed = bool(collapsed)
-        self.sidebar_toggle_btn.setText("\u25b2" if collapsed else "\u25bc")
-        self.sidebar_toggle_btn.setToolTip("Expand toolbar" if collapsed else "Hide toolbar")
-        apply_brush_button_icon(self.sidebar_toggle_btn, "bar", "-", icon_size=12)
+        self.sidebar_widget.setVisible(not collapsed)
+        self.status_bar_wrapper.setVisible(not collapsed)
+        self._position_floating_hud()
 
-        old_anim = getattr(self, "_sidebar_anim", None)
-        if old_anim is not None:
-            try:
-                old_anim.stop()
-            except Exception:
-                pass
-
-        effect = getattr(self, "_sidebar_opacity_effect", None)
-        if not isinstance(effect, QtWidgets.QGraphicsOpacityEffect):
-            effect = QtWidgets.QGraphicsOpacityEffect(self.sidebar_widget)
-            self.sidebar_widget.setGraphicsEffect(effect)
-            self._sidebar_opacity_effect = effect
-
-        full_h = max(1, int(self._sidebar_full_height))
-        current_h = self.sidebar_widget.maximumHeight()
-        if collapsed:
-            if current_h <= 0 or current_h > 10000:
-                current_h = self.sidebar_widget.height() if self.sidebar_widget.height() > 0 else full_h
-        else:
-            if current_h <= 0 or current_h > 10000:
-                current_h = 0
-
-        self.sidebar_widget.setVisible(True)
-        self.sidebar_widget.setMinimumHeight(0)
-
-        if not animate:
-            self.sidebar_widget.setMaximumHeight(0 if collapsed else full_h)
-            effect.setOpacity(0.0 if collapsed else 1.0)
+    def showEvent(self, event):
+        super().showEvent(event)
+        if getattr(self, "_brush_overlay_enabled", False) and hasattr(self, "hud_wrapper"):
             self._position_floating_hud()
-            return
+            self.hud_wrapper.show()
+            self.hud_wrapper.raise_()
 
-        group = QtCore.QParallelAnimationGroup(self)
-        height_anim = QPropertyAnimation(self.sidebar_widget, b"maximumHeight")
-        opacity_anim = QPropertyAnimation(effect, b"opacity")
-
-        height_anim.setDuration(280)
-        height_anim.setStartValue(current_h)
-        height_anim.setEndValue(0 if collapsed else full_h)
-        height_anim.setEasingCurve(QEasingCurve.OutCubic)
-        height_anim.valueChanged.connect(lambda *_: self._position_floating_hud())
-
-        opacity_anim.setDuration(180 if collapsed else 220)
-        opacity_anim.setStartValue(effect.opacity())
-        opacity_anim.setEndValue(0.0 if collapsed else 1.0)
-        opacity_anim.setEasingCurve(QEasingCurve.OutCubic)
-
-        def finish():
-            if self._sidebar_collapsed:
-                self.sidebar_widget.setMaximumHeight(0)
-                effect.setOpacity(0.0)
-            else:
-                self.sidebar_widget.setMaximumHeight(full_h)
-                effect.setOpacity(1.0)
-            self._position_floating_hud()
-
-        group.addAnimation(height_anim)
-        group.addAnimation(opacity_anim)
-        group.finished.connect(finish)
-        self._sidebar_anim = group
-        group.start()
+    def hideEvent(self, event):
+        if hasattr(self, "hud_wrapper"):
+            self.hud_wrapper.hide()
+        super().hideEvent(event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._position_floating_hud()
 
     def _build_ui(self):
-        from AnimKey.mods.themes import ThemeManager
-        theme = ThemeManager.get_current_theme()
-
-        # Layout: el canvas ocupa el 100% de la ventana
+        # The drawing surface never receives native blur. All controls live
+        # in their own Settings-style material window above the viewport.
         main_layout = QVBoxLayout(self)
-        main_layout.setSpacing(0)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        
+        main_layout.setSpacing(0)
         self.canvas = DrawingCanvas()
         self.canvas.model_panel = self.model_panel
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         main_layout.addWidget(self.canvas, 1)
-
         self.timeline = MayaTimelineSync(self.canvas.data)
 
-        # ── Status bar flotante ──────────────────────────────────
-        self.status_bar_wrapper = QWidget(self)
-        sb_layout = QHBoxLayout(self.status_bar_wrapper)
-        sb_layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.status_bar = QLabel("Frame: 1 | Strokes: 0")
-        self.status_bar.setAlignment(Qt.AlignCenter)
-        self.status_bar.setStyleSheet(
-            "background-color: rgba(22,24,32,0.82);"
-            "color: rgba(200,210,230,0.9);"
-            f"font-family: {theme['font_family']};"
-            f"font-size: {theme['font_size_normal']};"
-            "padding: 3px 14px;"
-            "border-radius: 10px;"
-            "border: 1px solid rgba(0,0,0,0.6);"
-            "font-weight: 500;"
-        )
-        sb_layout.addWidget(self.status_bar)
-
-        # ── HUD Overlay Flotante ─────────────────────────────────
-        self.hud_wrapper = QWidget(self)
-        hud_v_layout = QVBoxLayout(self.hud_wrapper)
-        hud_v_layout.setContentsMargins(0, 0, 0, 0)
-        hud_v_layout.setSpacing(0)
-
-        # ── Una sola barra contenedora ───────────────────────────
+        self.hud_wrapper = DrawControlsWindow(self, get_maya_main_window())
+        body = self.hud_wrapper.body_layout
         self.sidebar_widget = QFrame()
-        self.sidebar_widget.setObjectName("main_toolbar")
-        self.sidebar_widget.setStyleSheet(
-            "QFrame#main_toolbar {"
-            "    background-color: rgba(30,32,42,0.78);"
-            "    border-radius: 14px;"
-            "    border: 1px solid rgba(0,0,0,0.65);"
-            "}"
-        )
-        bar_layout = QHBoxLayout(self.sidebar_widget)
-        bar_layout.setSpacing(6)
-        bar_layout.setContentsMargins(10, 6, 10, 6)
-
-        # ── ToolPanel (sin fondo propio, vive dentro de la barra) ─
+        self.sidebar_widget.setObjectName("drawTools")
+        tools = QHBoxLayout(self.sidebar_widget)
+        tools.setContentsMargins(12, 0, 12, 6)
         self.tool_panel = ToolPanel()
-        self.tool_panel.setAutoFillBackground(False)
-        self.tool_panel.setStyleSheet("QWidget { background-color: transparent; }")
-        bar_layout.addWidget(self.tool_panel)
+        self.tool_panel.color_btn.setProperty("preserveMaterialStyle", True)
+        tools.addWidget(self.tool_panel)
+        body.addWidget(self.sidebar_widget)
 
-        # ── Botones exclusivos del modo overlay ──────────────────
-        if self.is_overlay:
-            # Divisor
-            div = QFrame()
-            div.setFrameShape(QFrame.VLine)
-            div.setFixedWidth(1)
-            div.setFixedHeight(22)
-            div.setStyleSheet("background: rgba(255,255,255,0.10); border: none;")
-            bar_layout.addWidget(div)
-
-            overlay_btn_style = (
-                "QPushButton {"
-                "    background-color: rgba(42,45,56,0.88);"
-                "    color: rgba(200,210,230,0.85);"
-                "    border-radius: 7px;"
-                "    border: 1px solid rgba(255,255,255,0.10);"
-                "    font-size: 11px;"
-                "    font-weight: 600;"
-                "    padding: 0px;"
-                "}"
-                "QPushButton:hover {"
-                "    background-color: rgba(255,255,255,0.10);"
-                "    border: 1px solid rgba(255,255,255,0.18);"
-                "}"
-                "QPushButton:checked {"
-                "    background-color: rgba(80,140,255,0.24);"
-                "    border: 1px solid rgba(100,160,255,0.78);"
-                "}"
-                "QPushButton:pressed {"
-                "    background-color: rgba(80,140,255,0.25);"
-                "}"
-            )
-
-            self.toggle_mode_btn = QPushButton("🖌️ DRAW")
-            self.toggle_mode_btn.setCheckable(True)
-            self.toggle_mode_btn.setChecked(False)
-            self.toggle_mode_btn.setFixedSize(34, 28)
-            self.toggle_mode_btn.setCursor(Qt.PointingHandCursor)
-            self.toggle_mode_btn.setToolTip("Toggle Draw/Navigation Mode")
-            apply_brush_button_icon(self.toggle_mode_btn, "toggle", "D", icon_size=23)
-            self.toggle_mode_btn.setStyleSheet(overlay_btn_style)
-            self.toggle_mode_btn.toggled.connect(self.toggle_passthrough)
-            bar_layout.addWidget(self.toggle_mode_btn)
-
-            self.dim_bg_btn = QCheckBox("Dim")
-            self.dim_bg_btn.setCursor(Qt.PointingHandCursor)
-            self.dim_bg_btn.setToolTip("Dim viewport for better trace visibility")
-            self.dim_bg_btn.setStyleSheet(
-                "QCheckBox {"
-                "    color: rgba(200,210,230,0.7);"
-                f"   font-size: {theme['font_size_normal']};"
-                "    font-weight: 600;"
-                "    background: transparent;"
-                "    spacing: 5px;"
-                "}"
-                "QCheckBox::indicator {"
-                "    width: 13px; height: 13px;"
-                "    border-radius: 4px;"
-                "    border: 1px solid rgba(255,255,255,0.18);"
-                "    background: rgba(255,255,255,0.05);"
-                "}"
-                "QCheckBox::indicator:checked {"
-                "    background: rgba(80,140,255,0.7);"
-                "    border: 1px solid rgba(100,160,255,0.6);"
-                "}"
-            )
-            self.dim_bg_btn.toggled.connect(self.toggle_dim)
-            bar_layout.addWidget(self.dim_bg_btn)
-
-            self.lock_btn = QPushButton("🔓")
-            self.lock_btn.setFixedSize(28, 28)
-            self.lock_btn.setCheckable(True)
-            self.lock_btn.setChecked(False)
-            self.lock_btn.setCursor(Qt.PointingHandCursor)
-            self.lock_btn.setToolTip("Panel FREE - Click to lock in this viewport")
-            apply_brush_button_icon(self.lock_btn, "lock", "L", icon_size=23)
-            self.lock_btn.setStyleSheet(overlay_btn_style + "QPushButton { padding: 0; }")
-            self.lock_btn.toggled.connect(self.toggle_lock)
-            bar_layout.addWidget(self.lock_btn)
-
-            # Divisor antes de cerrar
-            div2 = QFrame()
-            div2.setFrameShape(QFrame.VLine)
-            div2.setFixedWidth(1)
-            div2.setFixedHeight(22)
-            div2.setStyleSheet("background: rgba(255,255,255,0.10); border: none;")
-            bar_layout.addWidget(div2)
-
-            self.close_overlay_btn = QPushButton("✕")
-            self.close_overlay_btn.setFixedSize(28, 28)
-            self.close_overlay_btn.setCursor(Qt.PointingHandCursor)
-            self.close_overlay_btn.setToolTip("Close Board")
-            apply_brush_button_icon(self.close_overlay_btn, "delete", "X", icon_size=23)
-            self.close_overlay_btn.setStyleSheet(
-                "QPushButton {"
-                "    background-color: transparent;"
-                "    color: rgba(220,80,80,0.8);"
-                "    border-radius: 7px;"
-                "    border: 1px solid transparent;"
-                "    font-size: 12px; font-weight: 700;"
-                "}"
-                "QPushButton:hover {"
-                "    background-color: rgba(220,60,60,0.18);"
-                "    border: 1px solid rgba(220,80,80,0.35);"
-                "    color: rgba(255,100,100,1.0);"
-                "}"
-            )
-            self.close_overlay_btn.clicked.connect(self.close)
-            bar_layout.addWidget(self.close_overlay_btn)
-
-        hud_v_layout.addWidget(self.sidebar_widget)
-
-        # ── Pestaña colapsar/expandir ────────────────────────────
-        self.sidebar_toggle_btn = QPushButton("▼")
-        self.sidebar_toggle_btn.setFixedSize(40, 14)
-        self.sidebar_toggle_btn.setCursor(Qt.PointingHandCursor)
-        apply_brush_button_icon(self.sidebar_toggle_btn, "bar", "-", icon_size=12)
-        self.sidebar_toggle_btn.setStyleSheet(
-            "QPushButton {"
-            "    background-color: rgba(30,32,42,0.78);"
-            "    color: rgba(180,190,210,0.6);"
-            "    border-bottom-left-radius: 7px;"
-            "    border-bottom-right-radius: 7px;"
-            "    font-size: 8px; font-weight: bold;"
-            "    border: 1px solid rgba(0,0,0,0.65);"
-            "    border-top: none;"
-            "}"
-            "QPushButton:hover {"
-            "    color: rgba(200,220,255,0.9);"
-            "}"
-        )
-        self.sidebar_toggle_btn.clicked.connect(self.toggle_sidebar)
-
-        toggle_wrapper = QHBoxLayout()
-        toggle_wrapper.setContentsMargins(0, 0, 0, 0)
-        toggle_wrapper.addStretch()
-        toggle_wrapper.addWidget(self.sidebar_toggle_btn)
-        toggle_wrapper.addStretch()
-
-        toggle_container = QWidget()
-        toggle_container.setLayout(toggle_wrapper)
-        hud_v_layout.addWidget(toggle_container)
+        self.status_bar_wrapper = QFrame()
+        self.status_bar_wrapper.setObjectName("settingsFooter")
+        footer = QHBoxLayout(self.status_bar_wrapper)
+        footer.setContentsMargins(18, 8, 18, 10)
+        footer.setSpacing(12)
+        self.toggle_mode_btn = QPushButton("Navigate")
+        self.toggle_mode_btn.setCheckable(True)
+        self.toggle_mode_btn.setToolTip("Let mouse clicks pass through to Maya")
+        self.toggle_mode_btn.toggled.connect(self.toggle_passthrough)
+        footer.addWidget(self.toggle_mode_btn)
+        self.dim_bg_btn = QCheckBox("Dim viewport")
+        self.dim_bg_btn.toggled.connect(self.toggle_dim)
+        footer.addWidget(self.dim_bg_btn)
+        self.lock_btn = QPushButton("Lock viewport")
+        self.lock_btn.setCheckable(True)
+        self.lock_btn.toggled.connect(self.toggle_lock)
+        footer.addWidget(self.lock_btn)
+        footer.addStretch()
+        self.status_bar = QLabel("Frame: 1 | Strokes: 0")
+        self.status_bar.setProperty("muted", True)
+        footer.addWidget(self.status_bar)
+        body.addWidget(self.status_bar_wrapper)
+        self.sidebar_toggle_btn = self.hud_wrapper.title_bar.minimize_btn
+        self.close_overlay_btn = self.hud_wrapper.title_bar.close_btn
+        polish_tool_widgets(self.hud_wrapper.container)
+        self.hud_wrapper.setStyleSheet(COMPACT_STYLESHEET + """
+            QFrame#drawTools QPushButton[role="icon"]:checked {
+                background: rgba(22,127,240,80); border-color: #70b7ff;
+            }
+        """)
+        apply_window_style(self.hud_wrapper, polish=False, paint=False,
+                           panel=self.hud_wrapper.container)
 
     def _connect_signals(self):
         tp = self.tool_panel
@@ -4409,10 +4257,14 @@ class SketchboardWindow(QWidget):
     def _sync_timeline(self):
         try:
             curr = int(cmds.currentTime(query=True))
-            self.canvas.set_frame(curr)
+            # The first Show/resize warms the canvas at its actual viewport
+            # dimensions; do not rasterize the saved board at a temporary size.
+            self.canvas.current_frame = curr
+            self._last_polled_frame = curr
+            fd = self.canvas.data.frames.get(curr)
+            self.status_bar.setText(f"Frame: {curr} | Strokes: {len(fd.strokes) if fd else 0}")
         except:
             pass
-        self.timeline.update_keys()
 
     def _save_scene_session(self):
         save_brush_data_to_scene(self.canvas.data)
@@ -4440,8 +4292,6 @@ class SketchboardWindow(QWidget):
         self.canvas.data = data
         self.canvas._invalidate_frame_render_cache()
         self.timeline.data_ref = self.canvas.data
-        self.canvas.set_frame(self.canvas.current_frame)
-        self.timeline.update_keys()
         frame_count = len(self.canvas.data.get_frame_numbers())
         self.status_bar.setText(f"Loaded scene drawings: {frame_count} frame(s)")
         return True
@@ -4901,6 +4751,7 @@ class SketchboardWindow(QWidget):
 
     def closeEvent(self, event):
         global _instance
+        self._closing = True
         self._remove_tablet_event_filter()
         self._remove_native_pen_event_filter()
         try:
@@ -4921,6 +4772,9 @@ class SketchboardWindow(QWidget):
         SketchboardWindow._instance = None
         if _instance is self:
             _instance = None
+        if hasattr(self, "hud_wrapper"):
+            self.hud_wrapper.close()
+            self.hud_wrapper.deleteLater()
         super().closeEvent(event)
 
     def keyPressEvent(self, event):
@@ -4995,8 +4849,7 @@ def launch():
     win = SketchboardWindow(overlay=True)
     SketchboardWindow._instance = win
     _instance = win
-    win.show()
-    win.raise_()
+    win.set_overlay_enabled(True)
     return win
 
 if __name__ == "__main__":
@@ -5058,5 +4911,4 @@ def execute():
             
     _instance = SketchboardWindow(overlay=True)
     SketchboardWindow._instance = _instance
-    _instance.show()
-    _instance.raise_()
+    _instance.set_overlay_enabled(True)
