@@ -3749,8 +3749,17 @@ class DrawControlsWindow(QWidget):
         self.title_bar.minimize_btn.clicked.connect(board.toggle_sidebar)
         self.title_bar.minimize_btn.setToolTip("Collapse / Expand drawing controls")
         self.title_bar.maximize_btn.hide()
+        self.title_bar.setFixedHeight(34)
+        header = self.title_bar.layout()
+        header.setContentsMargins(12, 2, 8, 2)
+        header.setSpacing(8)
+        titles = header.itemAt(0).layout()
+        titles.setDirection(QtWidgets.QBoxLayout.LeftToRight)
+        titles.setSpacing(7)
+        for button in (self.title_bar.minimize_btn, self.title_bar.close_btn):
+            button.setFixedSize(24, 24)
         self.body_layout.addWidget(self.title_bar)
-        self.setMinimumWidth(700)
+        self.setMinimumWidth(740)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -3906,6 +3915,9 @@ class SketchboardWindow(QWidget):
         only redirects events landing in an unobstructed canvas area.  Toolbar
         controls and Navigation mode retain their normal Maya/Qt behavior.
         """
+        if watched is getattr(self, "status_bar", None) and event.type() == QtCore.QEvent.ToolTip:
+            # Keep the compact header from growing for long tool instructions.
+            self.status_bar.setToolTip(self.status_bar.text())
         tablet_events = (
             int(QtCore.QEvent.TabletPress),
             int(QtCore.QEvent.TabletMove),
@@ -4140,17 +4152,18 @@ class SketchboardWindow(QWidget):
         self.sidebar_widget = QFrame()
         self.sidebar_widget.setObjectName("drawTools")
         tools = QHBoxLayout(self.sidebar_widget)
-        tools.setContentsMargins(12, 0, 12, 6)
+        tools.setContentsMargins(8, 0, 8, 4)
         self.tool_panel = ToolPanel()
+        self.tool_panel.setFixedHeight(38)
         self.tool_panel.color_btn.setProperty("preserveMaterialStyle", True)
         tools.addWidget(self.tool_panel)
         body.addWidget(self.sidebar_widget)
 
         self.status_bar_wrapper = QFrame()
-        self.status_bar_wrapper.setObjectName("settingsFooter")
+        self.status_bar_wrapper.setObjectName("drawStatusBar")
         footer = QHBoxLayout(self.status_bar_wrapper)
-        footer.setContentsMargins(18, 8, 18, 10)
-        footer.setSpacing(12)
+        footer.setContentsMargins(0, 0, 0, 0)
+        footer.setSpacing(8)
         self.toggle_mode_btn = QPushButton("Navigate")
         self.toggle_mode_btn.setCheckable(True)
         self.toggle_mode_btn.setToolTip("Let mouse clicks pass through to Maya")
@@ -4166,12 +4179,17 @@ class SketchboardWindow(QWidget):
         footer.addStretch()
         self.status_bar = QLabel("Frame: 1 | Strokes: 0")
         self.status_bar.setProperty("muted", True)
+        self.status_bar.setFixedWidth(144)
+        self.status_bar.installEventFilter(self)
         footer.addWidget(self.status_bar)
-        body.addWidget(self.status_bar_wrapper)
+        header = self.hud_wrapper.title_bar.layout()
+        header.takeAt(1)  # Replace the title bar's spacer with the compact options.
+        header.insertWidget(1, self.status_bar_wrapper, 1)
         self.sidebar_toggle_btn = self.hud_wrapper.title_bar.minimize_btn
         self.close_overlay_btn = self.hud_wrapper.title_bar.close_btn
         polish_tool_widgets(self.hud_wrapper.container)
         self.hud_wrapper.setStyleSheet(COMPACT_STYLESHEET + """
+            QLabel#settingsTitle { font-size: 12px; }
             QFrame#drawTools QPushButton[role="icon"]:checked {
                 background: rgba(22,127,240,80); border-color: #70b7ff;
             }

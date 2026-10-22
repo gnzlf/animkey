@@ -36,6 +36,15 @@ assert window.mask().contains(window.rect().center())
 assert surface.active, "Native acrylic must be active for this Windows test"
 handle = int(window.winId())
 assert window.property("nativeBlurHandle") == handle
+assert window.property("nativeFrameHandle") == handle
+import ctypes
+from ctypes import wintypes
+dwm = ctypes.WinDLL("dwmapi")
+dwm.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD,
+                                     ctypes.c_void_p, wintypes.DWORD]
+native_frame = wintypes.BOOL()
+assert dwm.DwmGetWindowAttribute(handle, 1, ctypes.byref(native_frame), ctypes.sizeof(native_frame)) == 0
+assert not native_frame.value, "The compositor must not draw a square non-client frame"
 for _ in range(3):
     window.hide()
     window.show()

@@ -65,6 +65,16 @@ source checkout was loaded instead, Update locates the existing Maya installatio
 and reloads that installed copy after upgrading or downgrading. The source
 checkout is kept untouched.
 
+### AnimKey 1.2.2
+
+- Fix Maya crashes when refreshing, floating or closing the toolbar. Controls
+  stay inside Maya's dock; the additional native acrylic toolbar window is
+  disabled in Maya. Tool windows retain their dark frosted material.
+- Refresh waits until the current UI callback finishes, coalesces repeated
+  requests and stops pending animations and previews before rebuilding.
+- Flash Buttons return to floating circles without a square background.
+- Draw uses a compact horizontal control bar with a combined header.
+
 ### AnimKey 1.2.1
 
 - Dark frosted glass windows and toolbar, with native Windows blur, rounded

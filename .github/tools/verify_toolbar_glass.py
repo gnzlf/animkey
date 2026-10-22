@@ -109,14 +109,16 @@ floating_layout.addWidget(workspace)
 floating.show()
 app.processEvents()
 app.processEvents()
-assert glass.parentWidget() is floating
+assert glass.parentWidget() is glass.anchor
+assert glass.windowHandle().transientParent() is floating.windowHandle()
 assert glass.geometry().topLeft() == glass.anchor.mapToGlobal(QtCore.QPoint())
 workspace.setParent(owner)
 layout.addWidget(workspace)
 workspace.show()
 app.processEvents()
 app.processEvents()
-assert glass.parentWidget() is owner
+assert glass.parentWidget() is glass.anchor
+assert glass.windowHandle().transientParent() is owner.windowHandle()
 floating.close()
 
 

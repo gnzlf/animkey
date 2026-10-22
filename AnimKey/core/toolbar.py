@@ -239,7 +239,7 @@ class ToolbarPanViewport(QtWidgets.QFrame):
         if app is not None:
             app.installEventFilter(self)
             self._app_filter_installed = True
-        self.destroyed.connect(self._remove_app_filter)
+        # QObject removes its event filters automatically during destruction.
 
     def is_panning(self):
         return self._is_panning
@@ -684,7 +684,7 @@ class ToolbarHorizontalScroller(QtWidgets.QFrame):
         if app is not None:
             app.installEventFilter(self)
             self._app_filter_installed = True
-        self.destroyed.connect(self._remove_app_filter)
+        # QObject removes its event filters automatically during destruction.
 
     def widget(self):
         return self._content_widget
@@ -1028,7 +1028,6 @@ class ToolbarGifPreviewController(QtCore.QObject):
             button.removeEventFilter(self)
             button.installEventFilter(self)
             button.setMouseTracking(True)
-            button.destroyed.connect(lambda *_: self._forget_button(button))
             self._button_to_gif[button] = gif_path
             return True
         except Exception:
@@ -1057,6 +1056,14 @@ class ToolbarGifPreviewController(QtCore.QObject):
         self._hover_button = None
         self._hide_preview()
 
+    def dispose(self):
+        self.hide()
+        for button in self._button_to_gif:
+            if _qt_object_is_alive(button):
+                button.removeEventFilter(self)
+        self._button_to_gif.clear()
+        self.deleteLater()
+
     def _forget_button(self, button):
         self._button_to_gif.pop(button, None)
         if self._hover_button is button:
@@ -1066,7 +1073,7 @@ class ToolbarGifPreviewController(QtCore.QObject):
 
     def _show_current_preview(self):
         button = self._hover_button
-        if button is None or not button.isVisible():
+        if not _qt_object_is_alive(button) or not button.isVisible():
             return
         try:
             if not button.rect().contains(button.mapFromGlobal(QtGui.QCursor.pos())):
@@ -1431,8 +1438,40 @@ class AnimKeyToolbar:
             self.show()
     
     def reload(self):
-        """Reload the toolbar"""
+        """Rebuild after the current Qt click/menu callback has returned."""
+        if getattr(self, "_reload_pending", False):
+            return
+        self._reload_pending = True
+        import maya.utils
+        maya.utils.executeDeferred(self._reload_at_idle)
+
+    def _dispose_toolbar_ui(self):
+        """Stop Python callbacks before Maya destroys its native dock widgets."""
+        for animation in getattr(self, "_btn_anims", {}).values():
+            if _qt_object_is_alive(animation):
+                animation.stop()
+        self._btn_anims = {}
+        controller = getattr(self, "_gif_preview_controller", None)
+        if _qt_object_is_alive(controller):
+            controller.dispose()
+        strip = getattr(self, "toolbar_scroll_area", None)
+        if _qt_object_is_alive(strip):
+            strip._end_pan()
+            strip._remove_app_filter()
+        glass = getattr(self, "_material_glass", None)
+        if _qt_object_is_alive(glass):
+            glass.dispose()
+        self._material_glass = None
+
+    def _reload_at_idle(self):
+        try:
+            self._rebuild_toolbar()
+        finally:
+            self._reload_pending = False
+
+    def _rebuild_toolbar(self):
         self._hide_toolbar_gif_preview()
+        self._dispose_toolbar_ui()
         try:
             ui.cleanup_animkey_runtime(full=True)
         except Exception:

@@ -71,6 +71,27 @@ def verify(name, factory):
     app.processEvents()
     if isinstance(window, gimbalFixer.GimbalFixerWindow):
         window.refresh_data()
+    if isinstance(window, flashbuttons.FlashButtonsPanel):
+        # Flash has floating circular buttons with no shared rectangular body.
+        image = window.grab().toImage()
+        window.grab().save(str(output / (name + ".png")))
+        check(not hasattr(window, "_material_surface"), name + ": no rectangular glass base")
+        check(image.pixelColor(10, window.height() // 2).alpha() == 0,
+              name + ": transparent space around buttons")
+        for button in window.buttons:
+            button_image = button.grab().toImage()
+            check(button.width() == button.height(), name + ": circular proportions")
+            check(button_image.pixelColor(1, 1).alpha() == 0,
+                  name + ": no square background behind circle")
+            check(button_image.pixelColor(button.rect().center()).alpha() > 0,
+                  name + ": painted circle")
+        check(window.lock_btn.geometry().bottom() < window.button_container.geometry().top(),
+              name + ": lock control fits above button board")
+        window.close()
+        app.processEvents()
+        checks.append(name)
+        print("PASS " + name, flush=True)
+        return
     surface = window._material_surface
     if isinstance(window, (animCrash.RecoveryWindow,
                            retimer.RetimerWindow, animCleaner.AnimCleanerWindow)):
@@ -78,15 +99,23 @@ def verify(name, factory):
     if args.native:
         check(surface.active, name + ": Windows acrylic enabled")
         check(window.property("nativeBlurHandle") == int(window.winId()), name + ": cached HWND")
+        check(window.property("nativeFrameHandle") == int(window.winId()), name + ": no native outer frame")
     check(bool(window.windowFlags() & QtCore.Qt.FramelessWindowHint), name + ": frameless")
     check(window.testAttribute(QtCore.Qt.WA_TranslucentBackground), name + ": alpha")
-    check(not window.mask().contains(QtCore.QPoint(0, 0)), name + ": no square corner")
+    corners = (QtCore.QPoint(0, 0), QtCore.QPoint(window.width() - 1, 0),
+               QtCore.QPoint(0, window.height() - 1),
+               QtCore.QPoint(window.width() - 1, window.height() - 1))
+    check(all(not window.mask().contains(point) for point in corners),
+          name + ": all four exterior corners clipped")
     center = QtCore.QPoint(window.width() // 2, window.height() // 2)
     check(window.mask().contains(center), name + ": visible body")
     pixmap = window.grab()
     pixmap.save(str(output / (name + ".png")))
     image = pixmap.toImage()
-    check(image.pixelColor(0, 0).alpha() == 0, name + ": transparent corner pixels")
+    image_corners = ((0, 0), (image.width() - 1, 0), (0, image.height() - 1),
+                     (image.width() - 1, image.height() - 1))
+    check(all(image.pixelColor(x, y).alpha() == 0 for x, y in image_corners),
+          name + ": all four exterior corner pixels transparent")
     check(image.pixelColor(center).alpha() > 0, name + ": painted body")
     for widget in window.findChildren(QtWidgets.QAbstractButton):
         if widget.isVisible() and widget.text().strip() and widget.width() > 40:

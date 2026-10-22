@@ -82,6 +82,9 @@ class DrawWindowTests(unittest.TestCase):
         self.assertFalse(bool(window.property("materialSurface")))
         self.assertEqual(window.tool_panel.styleSheet(), "")
         self.assertIs(palette.canvas, window.canvas)
+        self.assertLessEqual(palette.height(), 90)
+        self.assertGreaterEqual(palette.width() / palette.height(), 8)
+        self.assertIs(window.status_bar_wrapper.parentWidget(), palette.title_bar)
 
     def test_saved_frames_are_not_all_smoothed_while_loading(self):
         data = brush.SketchboardData()

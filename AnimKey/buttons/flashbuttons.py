@@ -341,6 +341,9 @@ class FlashButton(QPushButton):
         
         self.setFixedSize(size, size)
         self.setCursor(Qt.PointingHandCursor)
+        # The custom painter draws a circle. Inherited QPushButton QSS otherwise
+        # paints a rectangular button underneath it before paintEvent runs.
+        self.setStyleSheet("QPushButton { background: transparent; border: none; padding: 0; min-height: 0; }")
         
         # Menú contextual
         self.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -1191,8 +1194,9 @@ class FlashButtonsPanel(QWidget):
         
         self.setMouseTracking(True)
 
-        from AnimKey.core.window_style import apply_window_style
-        apply_window_style(self)
+        # This is a free-floating collection of circular buttons, rather than
+        # a rectangular tool window. Keep the space between them transparent.
+        self.setStyleSheet("FlashButtonsPanel { background: transparent; border: none; }")
     
     def setup_ui(self):
         """Configura la interfaz de usuario"""

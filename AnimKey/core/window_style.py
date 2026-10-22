@@ -112,7 +112,7 @@ class MaterialSurface(QtCore.QObject):
         window.setProperty("materialSurface", True)
         window.installEventFilter(self)
 
-    def _sync_region(self):
+    def _sync_region(self, force=False):
         key = (self.window.width(), self.window.height(),
                getattr(self.window, "_tail_height", 0),
                getattr(self.window, "_tail_width", 16),
@@ -123,7 +123,7 @@ class MaterialSurface(QtCore.QObject):
             self._path = window_path(self.window)
             self._region = QtGui.QRegion(self._path.toFillPolygon().toPolygon())
             self._shape_key = key
-        if self.window.mask() != self._region:
+        if force or self.window.mask() != self._region:
             self.window.setMask(self._region)
 
     def eventFilter(self, watched, event):
@@ -138,8 +138,10 @@ class MaterialSurface(QtCore.QObject):
                     polish_tool_widgets(watched)
                     watched.setStyleSheet(COMPACT_STYLESHEET if self.compact else STYLESHEET)
         if kind == QtCore.QEvent.Show:
-            self._sync_region()
             self.active = apply_native_backdrop(watched)
+            # Reapply after composition setup: the HWND may have been recreated
+            # while Qt still reports the same cached mask.
+            self._sync_region(force=True)
             if self.panel is not None:
                 self.panel.backdrop_active = self.active
                 self.panel.update()

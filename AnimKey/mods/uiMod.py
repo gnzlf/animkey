@@ -172,11 +172,8 @@ def close_animkey_tool_windows(
         except Exception:
             pass
 
-    if force_close:
-        try:
-            QtWidgets.QApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
-        except Exception:
-            pass
+    # Let Qt process deferred deletion after the current button/window event.
+    # Flushing it here can destroy widgets that are still dispatching that event.
 
 
 def cleanup_animkey_runtime(except_widget=None, full=False):
