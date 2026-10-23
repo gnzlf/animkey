@@ -65,6 +65,17 @@ source checkout was loaded instead, Update locates the existing Maya installatio
 and reloads that installed copy after upgrading or downgrading. The source
 checkout is kept untouched.
 
+### AnimKey 1.2.3
+
+- Improve Windows glass compatibility, with a cached, blurred application
+  backdrop when native composition is unavailable or transparency is disabled.
+- Clip native window corners in physical pixels at different display scales.
+  Magnetically anchored panels keep a rounded body without pointed tails;
+  detaching them preserves their mask immediately.
+- Use neutral dark grey for the toolbar, controls and default Tweener slider.
+  Keep native toolbar rehosting disabled in Maya to preserve dock stability.
+- Stop pending toolbar animations and previews during a full runtime unload.
+
 ### AnimKey 1.2.2
 
 - Fix Maya crashes when refreshing, floating or closing the toolbar. Controls

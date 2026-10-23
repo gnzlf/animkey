@@ -1,9 +1,8 @@
 """Shared material palette, painting and controls for AnimKey windows."""
 
-import sys
-
 from AnimKey.mods.maya_compat import QtCore, QtGui, QtWidgets
 from AnimKey.mods import material_palette as material
+from AnimKey.core.material_backdrop import apply_native_backdrop, rounded_path, paint_material
 
 
 STYLESHEET = """
@@ -108,79 +107,17 @@ class GlassPanel(QtWidgets.QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.backdrop_active = False
+        self.backdrop_image = None
+        self.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.setAutoFillBackground(False)
+        self.setStyleSheet("GlassPanel { background: transparent; border: none; }")
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        rect = QtCore.QRectF(self.rect()).adjusted(0.7, 0.7, -0.7, -0.7)
-        path = QtGui.QPainterPath()
-        path.addRoundedRect(rect, 16, 16)
-        # One uniform tint; the compositor supplies blur. Repeated translucent
-        # gradients were accumulating in Qt's backing store on page changes.
-        painter.fillPath(path, surface_fill(self.backdrop_active))
-        painter.setPen(QtGui.QPen(surface_outline(), 1.0))
-        painter.drawPath(path)
-
-
-def apply_native_backdrop(window):
-    """Apply a uniform native blur while keeping Qt's alpha backing store."""
-    app = QtWidgets.QApplication.instance()
-    if sys.platform != "win32" or app is None or app.platformName() != "windows":
-        return False
-    import ctypes
-    from ctypes import wintypes
-
-    class Accent(ctypes.Structure):
-        _fields_ = [("state", ctypes.c_int), ("flags", ctypes.c_int),
-                    ("tint", wintypes.DWORD), ("animation", ctypes.c_int)]
-
-    class CompositionData(ctypes.Structure):
-        _fields_ = [("attribute", ctypes.c_int), ("data", ctypes.c_void_p),
-                    ("size", ctypes.c_size_t)]
-
-    try:
-        user32 = ctypes.WinDLL("user32")
-        compose = user32.SetWindowCompositionAttribute
-        compose.argtypes = [wintypes.HWND, ctypes.POINTER(CompositionData)]
-        compose.restype = wintypes.BOOL
-        handle = int(window.winId())
-        # Qt's translucent HWND can retain a separate DWM frame behind our
-        # rounded alpha surface. Suppress that frame, including its border;
-        # the material painter owns the only visible outline.
-        if window.property("nativeFrameHandle") != handle:
-            try:
-                dwm = ctypes.WinDLL("dwmapi")
-                set_attribute = dwm.DwmSetWindowAttribute
-                set_attribute.argtypes = [wintypes.HWND, wintypes.DWORD,
-                                          ctypes.c_void_p, wintypes.DWORD]
-                set_attribute.restype = ctypes.c_long
-                disabled = ctypes.c_int(1)  # DWMNCRP_DISABLED
-                no_border = wintypes.DWORD(0xFFFFFFFE)  # DWMWA_COLOR_NONE
-                result = set_attribute(handle, 2, ctypes.byref(disabled), ctypes.sizeof(disabled))
-                # Windows 10 may reject BORDER_COLOR; disabling non-client
-                # rendering above is supported there as well.
-                set_attribute(handle, 34, ctypes.byref(no_border), ctypes.sizeof(no_border))
-                if result == 0:
-                    window.setProperty("nativeFrameHandle", handle)
-            except (AttributeError, OSError):
-                pass
-        # Reopening a tool must not recreate acrylic or trigger another blur
-        # allocation. A recreated HWND still needs its own composition setup.
-        if (window.property("nativeBlurHandle") == handle
-                and window.property("nativeBlurTint") == material.NATIVE_TINT):
-            return window.property("nativeBlurBackend") == "accent"
-        accent = Accent(4, 0, material.NATIVE_TINT, 0)
-        data = CompositionData(19, ctypes.addressof(accent), ctypes.sizeof(accent))
-        active = bool(compose(handle, ctypes.byref(data)))
-        if not active:
-            accent.state = 3
-            active = bool(compose(handle, ctypes.byref(data)))
-        window.setProperty("nativeBlurBackend", "accent" if active else "fallback")
-        window.setProperty("nativeBlurHandle", handle)
-        window.setProperty("nativeBlurTint", material.NATIVE_TINT)
-        return active
-    except (AttributeError, OSError, ValueError):
-        return False
+        painter.setCompositionMode(QtGui.QPainter.CompositionMode_Source)
+        painter.fillRect(event.rect(), QtCore.Qt.transparent)
+        painter.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
+        paint_material(painter, rounded_path(self.rect()), self.backdrop_active, self.backdrop_image)
 
 
 def prepare_native_backdrop(window):

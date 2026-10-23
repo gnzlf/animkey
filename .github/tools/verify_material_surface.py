@@ -42,9 +42,10 @@ from ctypes import wintypes
 dwm = ctypes.WinDLL("dwmapi")
 dwm.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD,
                                      ctypes.c_void_p, wintypes.DWORD]
-native_frame = wintypes.BOOL()
-assert dwm.DwmGetWindowAttribute(handle, 1, ctypes.byref(native_frame), ctypes.sizeof(native_frame)) == 0
-assert not native_frame.value, "The compositor must not draw a square non-client frame"
+dwm.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD,
+                                     ctypes.c_void_p, wintypes.DWORD]
+border = wintypes.DWORD(0xFFFFFFFE)
+assert dwm.DwmSetWindowAttribute(handle, 34, ctypes.byref(border), ctypes.sizeof(border)) == 0
 for _ in range(3):
     window.hide()
     window.show()
@@ -72,15 +73,21 @@ gdi32.PtInRegion.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_int]
 gdi32.PtInRegion.restype = wintypes.BOOL
 gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
 user32.GetWindowRgn.argtypes = [wintypes.HWND, wintypes.HANDLE]
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
 region = gdi32.CreateRectRgn(0, 0, 0, 0)
 try:
     assert user32.GetWindowRgn(handle, region) > 0
-    assert not gdi32.PtInRegion(region, 0, 0)
-    assert gdi32.PtInRegion(region, window.width() // 2, window.height() // 2)
+    bounds = wintypes.RECT()
+    assert user32.GetWindowRect(handle, ctypes.byref(bounds))
+    width, height = bounds.right - bounds.left, bounds.bottom - bounds.top
+    for x, y in ((1, 1), (width - 2, 1), (1, height - 2), (width - 2, height - 2)):
+        assert not gdi32.PtInRegion(region, x, y), (width, height, x, y)
+    assert gdi32.PtInRegion(region, width // 2, height // 2)
+    assert gdi32.PtInRegion(region, width // 2, 2)
 finally:
     gdi32.DeleteObject(region)
 
-# Exercise top/bottom pointers and detachment on the same native surface.
+# Legacy anchor fields must never restore a pointed bubble.
 window._tail_height = 10
 window._tail_width = 16
 window._tail_x = window.width() // 2
@@ -90,13 +97,22 @@ for top in (True, False):
     window.repaint()
     app.processEvents()
     y = 2 if top else window.height() - 3
-    assert window.mask().contains(QtCore.QPoint(window.width() // 2, y))
+    assert window.mask().contains(QtCore.QPoint(40, y))
 window._magnet_attached = False
 window.repaint()
 app.processEvents()
 assert window.mask().contains(QtCore.QPoint(window.width() // 2, window.height() - 3))
 window.close()
-print("PASS Qt {}: acrylic, native rounded region, reopening, resizing and pointers".format(QtCore.qVersion()))
+print("PASS Qt {} DPR {}: acrylic, four native corners, reopening, resizing and flat edges".format(
+    QtCore.qVersion(), window.devicePixelRatioF()))
+
+# The real Windows compatibility path disables accent without changing system settings.
+window.setProperty('forcePortableMaterial', True)
+window.show()
+app.processEvents()
+assert not surface.active
+assert window.property('nativeBlurBackend') == 'fallback'
+window.close()
 
 from types import SimpleNamespace
 from AnimKey.core.toolbar_style import apply_toolbar_style

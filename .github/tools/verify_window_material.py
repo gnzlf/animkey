@@ -149,14 +149,15 @@ def verify(name, factory):
         window._disable_buttons()
         check(all(not button.isEnabled() for button in window.order_buttons), name + ": disabled state")
     if isinstance(window, uiMod.ContextPopupWindow):
-        # The pointer, body margins and native region must track attachment.
+        # Magnetic anchoring keeps a flat edge and rounded mask during detachment.
         window._tail_on_top = True
         window._tail_x = window.width() // 2
         window._set_body_margins()
         window.repaint()
         app.processEvents()
-        check(window.mask().contains(QtCore.QPoint(window.width() // 2, 2)), name + ": top pointer")
+        check(window.mask().contains(QtCore.QPoint(40, 2)), name + ": flat top edge")
         window.detach_from_anchor()
+        check(not window.mask().contains(QtCore.QPoint(0, 0)), name + ": detached corner stays clipped")
         window.repaint()
         app.processEvents()
         check(window.layout().contentsMargins().top() == 1, name + ": detached margins")
@@ -180,7 +181,7 @@ def verify(name, factory):
 
 with mock.patch.object(uiMod, "close_animkey_tool_windows"), \
      mock.patch.object(uiMod, "get_maya_main_window", return_value=None), \
-     mock.patch.object(configMod, "get_setting", side_effect=lambda key, default=None: default), \
+     mock.patch.object(configMod, "get_setting", side_effect=lambda key, default=None: False if key == 'check_updates' else default), \
      mock.patch.object(configMod, "get_user_folder_path", return_value=str(output / "preferences")):
     for name, factory in (
         ("settings", settings.SettingsWindow),

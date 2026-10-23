@@ -2260,8 +2260,8 @@ class AnimKeyToolbar:
         
         # Define slider mode options with colors (name, description, color)
         self._tween_mode_options = [
-            ("Tweener", "Interpolate between keyframes", QColor(0, 200, 255)),          # Cyan
-            ("Tweener World Space", "Tween in world space", QColor(0, 200, 255)),       # Cyan
+            ("Tweener", "Interpolate between keyframes", QColor(190, 190, 190)),
+            ("Tweener World Space", "Tween in world space", QColor(190, 190, 190)),
             ("Blend to Buffer", "Blend to stored buffer", QColor(130, 80, 255)),        # Purple
             ("Blend to Default", "Blend to default values", QColor(130, 80, 255)),      # Purple
             ("Blend to Ease", "Blend with easing curve", QColor(180, 100, 255)),        # Light Purple
@@ -2289,7 +2289,7 @@ class AnimKeyToolbar:
             return_to_origin=True
         )
         self.tween_slider.setMinimumWidth(int(200 * float(self.config.get("toolbar_scale", 1.0))))  # Compact for toolbar
-        self.tween_slider.set_accent_color(QColor(0, 200, 255))  # Cyan for Tweener
+        self.tween_slider.set_accent_color(QColor(190, 190, 190))
         self._connect_slider_geometry_refresh(self.tween_slider)
         
         # Store original/default value for reset
@@ -3574,7 +3574,7 @@ class AnimKeyToolbar:
             self.tween_slider.setValue(50)
             self.tween_slider.origin = 50
             self._tween_slider_original_value = 50
-            color = QColor(0, 200, 255)  # Cyan like original
+            color = QColor(190, 190, 190)
         elif mode == "Push/Pull":
             self.tween_slider.setMinimum(-100)
             self.tween_slider.setMaximum(100)

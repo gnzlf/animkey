@@ -8,7 +8,8 @@ even where Qt paints transparent pixels.
 import re
 
 from AnimKey.mods.maya_compat import QtCore, QtGui, QtWidgets
-from AnimKey.core.settings_style import STYLESHEET, apply_native_backdrop, surface_fill, surface_outline
+from AnimKey.core.settings_style import STYLESHEET, GlassPanel, apply_native_backdrop
+from AnimKey.core.material_backdrop import rounded_path, sync_native_region, capture_widget_backdrop, paint_material
 
 
 COMPACT_STYLESHEET = STYLESHEET + """
@@ -40,7 +41,7 @@ def polish_tool_widgets(root):
                 return match.group(0)
             widget.setStyleSheet(re.sub(r"(?<![-\w])color:\s*(#[0-9a-fA-F]{6}|#[0-9a-fA-F]{3})(?=[;\s}])",
                                        readable_neutral, widget.styleSheet()))
-        elif widget.styleSheet():
+        elif widget.styleSheet() and not isinstance(widget, GlassPanel):
             widget.setStyleSheet("")
         if type(widget) in (QtWidgets.QWidget, QtWidgets.QFrame, QtWidgets.QStackedWidget):
             if not isinstance(widget, QtWidgets.QFrame) or widget.frameShape() not in (
@@ -67,26 +68,8 @@ def polish_tool_widgets(root):
 
 
 def window_path(window):
-    """Rounded body, optionally including a tool's existing anchor pointer."""
-    tail = getattr(window, "_tail_height", 0)
-    attached = getattr(window, "_magnet_attached", True)
-    tail = tail if attached else 0
-    top = bool(tail and getattr(window, "_tail_on_top", False))
-    rect = QtCore.QRectF(window.rect()).adjusted(0.7, tail + 0.7 if top else 0.7,
-                                              -0.7, -0.7 if top else -tail - 0.7)
-    path = QtGui.QPainterPath()
-    path.addRoundedRect(rect, 16, 16)
-    if tail:
-        center = max(24, min(getattr(window, "_tail_x", window.width() // 2), window.width() - 24))
-        half = getattr(window, "_tail_width", 16) / 2.0
-        base = rect.top() if top else rect.bottom()
-        pointer = QtGui.QPainterPath()
-        pointer.moveTo(center - half, base + (1 if top else -1))
-        pointer.lineTo(center, base - tail if top else base + tail)
-        pointer.lineTo(center + half, base + (1 if top else -1))
-        pointer.closeSubpath()
-        path = path.united(pointer)
-    return path
+    """One smooth rounded body, including when a popup is magnetically anchored."""
+    return rounded_path(window.rect())
 
 
 class MaterialSurface(QtCore.QObject):
@@ -104,8 +87,13 @@ class MaterialSurface(QtCore.QObject):
         self._styled = False
         self._region = None
         self._shape_key = None
-        self._path = None
+        self._path = window_path(window)
         self.active = False
+        self._backdrop_image = None
+        self._capturing = False
+        self._capture_timer = QtCore.QTimer(self)
+        self._capture_timer.setSingleShot(True)
+        self._capture_timer.timeout.connect(self._capture_backdrop)
         window.setAttribute(QtCore.Qt.WA_TranslucentBackground)
         window.setWindowFlags(window.windowFlags() | QtCore.Qt.FramelessWindowHint
                               | QtCore.Qt.NoDropShadowWindowHint)
@@ -125,6 +113,23 @@ class MaterialSurface(QtCore.QObject):
             self._shape_key = key
         if force or self.window.mask() != self._region:
             self.window.setMask(self._region)
+        sync_native_region(self.window, force=force)
+
+    @QtCore.Slot()
+    def _capture_backdrop(self):
+        if self.active or not self.window.isVisible() or self._capturing:
+            return
+        self._capturing = True
+        try:
+            self._backdrop_image = capture_widget_backdrop(self.window)
+            self.window.setProperty('materialBackdropMode',
+                                    'portable' if self._backdrop_image is not None else 'translucent')
+            if self.panel is not None:
+                self.panel.backdrop_image = self._backdrop_image
+                self.panel.update()
+            self.window.update()
+        finally:
+            self._capturing = False
 
     def eventFilter(self, watched, event):
         kind = event.type()
@@ -142,24 +147,35 @@ class MaterialSurface(QtCore.QObject):
             # Reapply after composition setup: the HWND may have been recreated
             # while Qt still reports the same cached mask.
             self._sync_region(force=True)
+            watched.setProperty('materialBackdropMode', 'native' if self.active else 'translucent')
+            if not self.active:
+                self._capture_timer.start(0)
             if self.panel is not None:
                 self.panel.backdrop_active = self.active
                 self.panel.update()
         elif kind == QtCore.QEvent.Resize:
             self._sync_region()
+            if not self.active and watched.isVisible():
+                self._capture_timer.start(100)
+        elif kind == QtCore.QEvent.Move:
+            if not self.active and watched.isVisible() and not self._capturing:
+                self._capture_timer.start(100)
+        elif kind == QtCore.QEvent.Hide:
+            self._capture_timer.stop()
+            self._backdrop_image = None
+            if self.panel is not None:
+                self.panel.backdrop_image = None
+        elif kind in tuple(value for value in (
+                getattr(QtCore.QEvent, 'ScreenChangeInternal', None),
+                getattr(QtCore.QEvent, 'DevicePixelRatioChange', None)) if value is not None):
+            self._sync_region(force=True)
         elif kind == QtCore.QEvent.Paint:
-            # Tail placement can change without a resize when a popup detaches.
-            self._sync_region()
             if self.paint:
                 painter = QtGui.QPainter(watched)
                 painter.setCompositionMode(QtGui.QPainter.CompositionMode_Source)
                 painter.fillRect(event.rect(), QtCore.Qt.transparent)
                 painter.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
-                painter.setRenderHint(QtGui.QPainter.Antialiasing)
-                path = self._path
-                painter.fillPath(path, surface_fill(self.active))
-                painter.setPen(QtGui.QPen(surface_outline(), 1.0))
-                painter.drawPath(path)
+                paint_material(painter, self._path, self.active, self._backdrop_image)
                 painter.end()
                 return True
         return False

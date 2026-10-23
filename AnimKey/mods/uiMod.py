@@ -68,13 +68,13 @@ class AnimKeyColors:
     TEXT_MUTED = QColor(100, 100, 115)
     
     # Slider specific
-    SLIDER_TRACK = QColor(8, 12, 19, 100)
-    SLIDER_FILL = QColor(0, 180, 230)
-    SLIDER_HANDLE = QColor(189, 201, 218)
-    SLIDER_HANDLE_BORDER = QColor(225, 233, 245)
+    SLIDER_TRACK = QColor(14, 14, 14, 110)
+    SLIDER_FILL = QColor(182, 182, 182)
+    SLIDER_HANDLE = QColor(202, 202, 202)
+    SLIDER_HANDLE_BORDER = QColor(232, 232, 232)
     
     # Dot button states
-    DOT_INACTIVE = QColor(111, 126, 148)
+    DOT_INACTIVE = QColor(125, 125, 125)
     DOT_HOVER = QColor(0, 220, 255)
     DOT_ACTIVE = QColor(130, 255, 180)
     DOT_GLOW = QColor(0, 200, 255, 100)
@@ -263,6 +263,7 @@ def cleanup_animkey_runtime(except_widget=None, full=False):
             from AnimKey.core.toolbar import AnimKeyToolbar
             instance = AnimKeyToolbar.get_instance()
             if instance is not None:
+                _safe_call(instance._dispose_toolbar_ui)
                 _safe_call(instance._remove_scene_callbacks)
         except Exception:
             pass
@@ -429,7 +430,7 @@ class IlluminatedDotButton(QWidget):
         self._is_near = False
         self._pulse_phase = 0.0
         self._parent_slider = parent
-        self._accent_color = QColor(0, 200, 255)  # Default cyan
+        self._accent_color = QColor(190, 190, 190)  # Neutral default
         
         # Size configuration - Compact for toolbar
         self.dot_radius = 5
@@ -628,7 +629,7 @@ class ValueTooltip(QWidget):
         self.setFixedSize(50, 30)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self._opacity = 0.0
-        self._accent_color = QColor(0, 200, 255)
+        self._accent_color = QColor(190, 190, 190)
         
         self._fade_animation = QPropertyAnimation(self, b"opacity")
         self._fade_animation.setDuration(150)
@@ -926,7 +927,7 @@ class DropdownLabel(QWidget):
         # Default options if none provided
         if options is None:
             self._options = [
-                ("Tween", "Interpolate between keyframes", QColor(0, 200, 255)),        # Cyan
+                ("Tween", "Interpolate between keyframes", QColor(190, 190, 190)),
                 ("Blend to Frame", "Blend to a specific frame", QColor(255, 150, 50)),  # Orange
                 ("Blend to Ease", "Blend with easing curve", QColor(180, 100, 255)),    # Purple
                 ("Push/Pull", "Push or pull animation values", QColor(100, 220, 130)),  # Green
@@ -936,7 +937,7 @@ class DropdownLabel(QWidget):
         
         # Color mapping
         self._color_map = {opt[0]: opt[2] for opt in self._options}
-        self._current_color = self._color_map.get(text, AnimKeyColors.ACCENT_PRIMARY)
+        self._current_color = self._color_map.get(text, QColor(190, 190, 190))
         
         self.setFixedWidth(120)
         self.setFixedHeight(22)  # Compact for toolbar
@@ -1106,7 +1107,7 @@ class AnimKeySlider(QWidget):
         self._dots_enabled = show_dots  # Store whether to show dots (renamed to avoid conflict)
         self._dots_opacity = 1.0 if show_dots else 0.0
         self._display_value = origin
-        self._accent_color = QColor(0, 200, 255)  # Default cyan like original
+        self._accent_color = QColor(190, 190, 190)  # Neutral default; individual tools can supply an accent
         
         # Dimensions - Compact for toolbar
         self.slider_height = 6
@@ -2488,7 +2489,7 @@ class DragDropReorderManager(QtCore.QObject):
 class ContextPopupWindow(QtWidgets.QWidget):
     """
     Base class for context-menu style popups anchored to a button.
-    Provides the rounded frameless window and speech-bubble tail.
+    Provides a rounded frameless window with optional magnetic anchoring.
     """
     def __init__(self, anchor_button=None, parent=None):
         if parent is None:
@@ -2500,7 +2501,7 @@ class ContextPopupWindow(QtWidgets.QWidget):
         self.setWindowFlags(QtCore.Qt.Tool | QtCore.Qt.FramelessWindowHint | QtCore.Qt.NoDropShadowWindowHint)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
         
-        self._tail_height = 10
+        self._tail_height = 0
         self._tail_width = 16
         self._tail_x = 0
         self._tail_on_top = False  # False = tail at bottom, True = tail at top
@@ -2597,7 +2598,6 @@ class ContextPopupWindow(QtWidgets.QWidget):
             return
         self._magnet_attached = False
         self._set_body_margins()
-        self.clearMask()
         self.update()
 
     def animkey_auto_hide(self):

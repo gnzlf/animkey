@@ -16,35 +16,35 @@ def button_stylesheet(accent=None, icon=False):
             font-family: 'Segoe UI'; font-size: 11px;
         }}
         QPushButton:hover {{ background: {hover}; border-color: {accent}; color: #ffffff; }}
-        QPushButton:pressed {{ background: {pressed}; border-color: #687a93; }}
+        QPushButton:pressed {{ background: {pressed}; border-color: #777777; }}
         QPushButton:checked, QPushButton[materialActive="true"] {{
-            background: rgba(76,132,190,70); border-color: {accent}; color: #f0f6ff;
+            background: rgba(125,125,125,58); border-color: {accent}; color: #f4f4f4;
         }}
-        QPushButton:disabled {{ color: #9aa4b5; background: rgba(0,0,0,20); border-color: rgba(222,233,250,25); }}
-        QToolTip {{ background: #202631; color: #edf1f7; border: 1px solid #56657a; padding: 6px; border-radius: 5px; }}
-    """.format(bg="rgba(255,255,255,14)", text=material.TEXT, border="rgba(222,233,250,65)",
+        QPushButton:disabled {{ color: #a4a4a4; background: rgba(0,0,0,20); border-color: rgba(232,232,232,25); }}
+        QToolTip {{ background: #252525; color: #eeeeee; border: 1px solid #5b5b5b; padding: 6px; border-radius: 5px; }}
+    """.format(bg="rgba(255,255,255,14)", text=material.TEXT, border="rgba(232,232,232,55)",
                hover="rgba(255,255,255,30)", pressed="rgba(0,0,0,45)", accent=accent, padding=padding)
 
 
 STRIP_STYLESHEET = """
 QFrame#AnimKeyToolbarPanStrip {
-    background: rgba(20,23,30,170);
-    border: 1px solid rgba(222,233,250,94); border-radius: 12px;
+    background: rgba(27,27,27,205);
+    border: 1px solid rgba(232,232,232,75); border-radius: 12px;
 }
 QWidget#toolbar_content { background: transparent; border: none; }
 """
 
 CONTENT_STYLESHEET = """
-QWidget { background: transparent; color: #edf1f7; font-family: 'Segoe UI'; font-size: 11px; }
+QWidget { background: transparent; color: #eeeeee; font-family: 'Segoe UI'; font-size: 11px; }
 QSpinBox, QDoubleSpinBox, QLineEdit {
-    background: rgba(8,12,19,85); color: #edf1f7; border: 1px solid rgba(222,233,250,65);
-    border-radius: 7px; padding: 2px 4px; min-height: 0; selection-background-color: #32587f;
+    background: rgba(14,14,14,100); color: #eeeeee; border: 1px solid rgba(232,232,232,55);
+    border-radius: 7px; padding: 2px 4px; min-height: 0; selection-background-color: #5a5a5a;
 }
-QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus { border-color: #8fc5ff; }
+QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus { border-color: #c7c7c7; }
 QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
     width: 13px; background: transparent; border: none;
 }
-QSpinBox::up-button:hover, QSpinBox::down-button:hover, QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover { background: #313a48; }
+QSpinBox::up-button:hover, QSpinBox::down-button:hover, QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover { background: #393939; }
 """
 
 
