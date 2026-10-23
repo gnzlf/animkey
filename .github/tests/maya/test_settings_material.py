@@ -145,8 +145,9 @@ class MaterialSettingsTests(unittest.TestCase):
         self.assertEqual(before, after)
         sample = after.pixelColor(10, 120)
         self.assertGreater(sample.alpha(), 0)
-        self.assertLess(sample.alpha(), 128)
-        self.assertLess(max(sample.red(), sample.green(), sample.blue()), 40)
+        self.assertLess(sample.alpha(), 220)
+        self.assertGreater(min(sample.red(), sample.green(), sample.blue()), 80)
+        self.assertLess(max(sample.red(), sample.green(), sample.blue()), 160)
 
     def test_all_lazy_tabs_render_and_preserve_state(self):
         window = self._window()

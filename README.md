@@ -65,6 +65,17 @@ source checkout was loaded instead, Update locates the existing Maya installatio
 and reloads that installed copy after upgrading or downgrading. The source
 checkout is kept untouched.
 
+### AnimKey 1.2.4
+
+- Paint frosted glass inside the rounded Qt alpha surface. Disable the separate
+  Windows backdrop that could draw a square canvas outside the curved corners.
+- Include Maya's GPU viewport image in the application backdrop instead of
+  relying only on QWidget rendering, which could leave the glass black or flat.
+  Blur the cached image offscreen on open, move and resize; no continuous
+  viewport readback or desktop capture is used.
+- Use a lighter neutral grey so windows and the toolbar stand out from Maya.
+  Keep text contrast and translucent rounded controls.
+
 ### AnimKey 1.2.3
 
 - Improve Windows glass compatibility, with a cached, blurred application

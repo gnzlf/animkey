@@ -121,8 +121,7 @@ class GlassPanel(QtWidgets.QFrame):
 
 
 def prepare_native_backdrop(window):
-    # Keep WA_TranslucentBackground enabled for the lifetime of the HWND.
-    # Switching to an uninitialised non-alpha backing store left tab ghosts.
+    # Compatibility entry point: retain Qt alpha and disable the native canvas.
     return apply_native_backdrop(window)
 
 

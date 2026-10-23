@@ -1,4 +1,4 @@
-"""Dark translucent controls over a native frosted toolbar surface."""
+"""Neutral grey translucent controls sharing the tool windows' frosted style."""
 
 import re
 
@@ -28,7 +28,7 @@ def button_stylesheet(accent=None, icon=False):
 
 STRIP_STYLESHEET = """
 QFrame#AnimKeyToolbarPanStrip {
-    background: rgba(27,27,27,205);
+    background: rgba(112,112,112,200);
     border: 1px solid rgba(232,232,232,75); border-radius: 12px;
 }
 QWidget#toolbar_content { background: transparent; border: none; }

@@ -1,18 +1,18 @@
 """Shared dark material colors, independent of Qt and Maya."""
 
-SURFACE = "#202020"
-CONTROL = "#2c2c2c"
-HOVER = "#393939"
-PRESSED = "#202020"
-BORDER = "#575757"
-TEXT = "#eeeeee"
+SURFACE = "#7a7a7a"
+CONTROL = "#555555"
+HOVER = "#727272"
+PRESSED = "#4b4b4b"
+BORDER = "#a2a2a2"
+TEXT = "#f7f7f7"
 SECONDARY = "#cecece"
 MUTED = "#aaaaaa"
 ACCENT = "#c7c7c7"
 
-# Dark glass: keep about a third of the blurred backdrop visible. The former
-# dark layers compounded to over 90% opacity, hiding the glass entirely.
-NATIVE_TINT = 0x891C1C1C
-SURFACE_RGBA = (28, 28, 28, 64)
-FALLBACK_RGBA = (30, 30, 30, 175)
-OUTLINE_RGBA = (232, 232, 232, 80)
+# One Qt tint over an application backdrop. The blurred image keeps real
+# alpha, so its rectangular canvas can never appear behind the rounded body.
+BACKDROP_OPACITY = 0.94
+SURFACE_RGBA = (122, 122, 122, 155)
+FALLBACK_RGBA = (122, 122, 122, 180)
+OUTLINE_RGBA = (245, 245, 245, 100)

@@ -55,6 +55,30 @@ class MaterialCompatibilityTests(unittest.TestCase):
         values = [image.pixelColor(x, image.height() // 2).red() for x in range(30, image.width() - 30)]
         self.assertLess(max(values) - min(values), 80)
 
+    def test_blurred_body_has_real_alpha_and_no_rectangular_canvas(self):
+        self.show()
+        image = self.window.grab().toImage()
+        alpha = image.pixelColor(image.width() // 2, image.height() // 2).alpha()
+        self.assertGreater(alpha, 150)
+        self.assertLess(alpha, 255)
+        for point in ((0, 0), (image.width() - 1, 0), (0, image.height() - 1),
+                      (image.width() - 1, image.height() - 1)):
+            self.assertEqual(image.pixelColor(*point).alpha(), 0)
+
+    def test_gpu_viewport_image_is_composited_before_blurring(self):
+        viewport = QtGui.QImage(20, 20, QtGui.QImage.Format_ARGB32)
+        viewport.fill(QtGui.QColor('#d62f36'))
+        area = QtCore.QRect(0, 0, self.owner.width(), self.owner.height())
+        with mock.patch.object(material_backdrop, '_maya_viewport_images',
+                               return_value=iter([(area, viewport)])):
+            surface = self.show()
+        color = surface._backdrop_image.pixelColor(100, 80)
+        self.assertGreater(color.red(), 180)
+        self.assertLess(color.green(), 80)
+
+    def test_opengl_content_is_not_required_for_plain_qt_windows(self):
+        self.assertEqual(list(material_backdrop._maya_viewport_images(self.owner, self.owner.rect())), [])
+
     def test_rounded_mask_survives_detaching_before_the_next_paint(self):
         with mock.patch.object(uiMod, 'close_animkey_tool_windows'):
             popup = uiMod.ContextPopupWindow(parent=self.owner)

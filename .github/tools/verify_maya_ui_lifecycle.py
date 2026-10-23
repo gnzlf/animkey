@@ -71,8 +71,9 @@ def step():
         window.show()
         window.move(120 + cycle * 3, 160 + cycle * 2)
         window.resize(780 + (cycle % 3) * 10, 760)
-        # Let the owned compatibility capture run before movement/close/refresh.
-        QtCore.QTimer.singleShot(180, close_and_reload)
+        # Let the owned viewport readback and blur finish before close/refresh.
+        delay = int(os.environ.get('ANIMKEY_LIFECYCLE_HOLD_MS', '250')) if cycle == 0 else 250
+        QtCore.QTimer.singleShot(delay, close_and_reload)
     except Exception:
         finish(traceback.format_exc())
 
@@ -83,9 +84,13 @@ def close_and_reload():
         bar = toolbar.animkey_toolbar
         window = state['window']
         mode = window.property('materialBackdropMode')
-        report['materials'].append({'window': type(window).__name__, 'mode': mode})
-        if os.environ.get('ANIMKEY_TEST_PORTABLE_GLASS') == '1':
-            assert mode == 'portable', 'Compatibility capture did not run: ' + str(mode)
+        report['materials'].append({'window': type(window).__name__, 'mode': mode,
+                                   'viewports': window.property('materialViewportCount')})
+        assert mode == 'portable', 'Application backdrop did not run: ' + str(mode)
+        assert window.property('nativeBlurBackend') == 'qt'
+        assert window._material_surface._backdrop_image is not None
+        if cycle in (0, 4):
+            window.grab().save(str(OUTPUT / ('material-{}.png'.format(cycle))))
         assert not window.mask().contains(QtCore.QPoint(0, 0))
         assert window.mask().contains(QtCore.QPoint(40, 2))
         close_buttons = [b for b in window.findChildren(QtWidgets.QAbstractButton)
@@ -124,6 +129,8 @@ def start():
         cmds.currentTime(12)
         cmds.select(node)
         state['scene'] = scene_stamp()
+        from AnimKey.mods.maya_compat import get_maya_main_window
+        get_maya_main_window().setWindowTitle('AnimKey frosted material validation - isolated test')
         QtCore.QTimer.singleShot(500, step)
     except Exception:
         finish(traceback.format_exc())

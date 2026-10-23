@@ -101,18 +101,22 @@ def luminance(rgb):
     channels = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in channels]
     return sum(a * b for a, b in zip(channels, (0.2126, 0.7152, 0.0722)))
 
-# White behind both native acrylic tint and Qt overlay is the brightest case.
-fill = surface_fill(True)
-alpha = fill.alphaF()
-tint = material_palette.NATIVE_TINT
-native_alpha = (tint >> 24) / 255.0
-native_rgb = (tint & 255, (tint >> 8) & 255, (tint >> 16) & 255)
-blurred_white = tuple(v * native_alpha + 255 * (1 - native_alpha) for v in native_rgb)
-background = tuple(v * alpha + b * (1 - alpha) for v, b in zip(fill.getRgb()[:3], blurred_white))
-transmission = (1 - alpha) * (1 - native_alpha)
-assert 0.30 <= transmission <= 0.55, "The frosted backdrop must remain visibly translucent"
+# Check the application-rendered material over Maya's usual dark neutral UI.
+from AnimKey.core.material_backdrop import paint_material, rounded_path
+backdrop = QtGui.QImage(120, 100, QtGui.QImage.Format_ARGB32_Premultiplied)
+backdrop.fill(QtGui.QColor(68, 68, 68))
+preview = QtGui.QImage(backdrop.size(), QtGui.QImage.Format_ARGB32_Premultiplied)
+preview.fill(QtCore.Qt.transparent)
+painter = QtGui.QPainter(preview)
+paint_material(painter, rounded_path(preview.rect()), image=backdrop)
+painter.end()
+color = preview.pixelColor(60, 50)
+assert 180 < color.alpha() < 255, 'Glass must retain real transparency'
+a = color.alphaF()
+background = tuple(c * a + 68 * (1 - a) for c in color.getRgb()[:3])
+assert min(background) >= 88, 'Material must stand out from the Maya background'
 text = QtGui.QColor(material_palette.TEXT).getRgb()[:3]
 contrast = (luminance(text) + 0.05) / (luminance(background) + 0.05)
 assert contrast >= 4.5, contrast
-print("PASS toolbar: controls, fixed geometry, {:.0%} backdrop transmission and contrast {:.2f}:1".format(transmission, contrast))
+print('PASS toolbar: controls, fixed geometry, neutral grey and contrast {:.2f}:1'.format(contrast))
 workspace.close()

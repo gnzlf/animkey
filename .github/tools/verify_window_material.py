@@ -97,7 +97,8 @@ def verify(name, factory):
                            retimer.RetimerWindow, animCleaner.AnimCleanerWindow)):
         check(not window.container.styleSheet(), name + ": legacy container style removed")
     if args.native:
-        check(surface.active, name + ": Windows acrylic enabled")
+        check(not surface.active and window.property('nativeBlurBackend') == 'qt',
+              name + ": no rectangular native backdrop")
         check(window.property("nativeBlurHandle") == int(window.winId()), name + ": cached HWND")
         check(window.property("nativeFrameHandle") == int(window.winId()), name + ": no native outer frame")
     check(bool(window.windowFlags() & QtCore.Qt.FramelessWindowHint), name + ": frameless")

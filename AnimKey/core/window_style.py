@@ -1,8 +1,8 @@
 """Apply Settings' material to tool windows without changing their behavior.
 
-The native window region and the painted surface use the same rounded path.
-This also clips Windows' acrylic, which otherwise fills the rectangular HWND
-even where Qt paints transparent pixels.
+The native hit region and the painted surface share a rounded silhouette.
+Glass is painted inside that alpha surface; no separate DWM backdrop can
+fill the rectangular canvas behind it.
 """
 
 import re

@@ -1,4 +1,4 @@
-"""Check material geometry and Windows blur on Qt6 without launching Maya."""
+"""Check the rounded alpha surface and disabled DWM canvas on Windows/Qt."""
 
 import os
 from pathlib import Path
@@ -33,7 +33,8 @@ app.processEvents()
 assert button.styleSheet() == ""
 assert not window.mask().contains(QtCore.QPoint(0, 0))
 assert window.mask().contains(window.rect().center())
-assert surface.active, "Native acrylic must be active for this Windows test"
+assert not surface.active, 'A separate native backdrop must never hide our alpha corners'
+assert window.property('nativeBlurBackend') == 'qt'
 handle = int(window.winId())
 assert window.property("nativeBlurHandle") == handle
 assert window.property("nativeFrameHandle") == handle
@@ -51,7 +52,7 @@ for _ in range(3):
     window.show()
     app.processEvents()
     assert int(window.winId()) == handle
-    assert apply_native_backdrop(window)
+    assert not apply_native_backdrop(window)
     assert apply_window_style(window) is surface
 window.resize(520, 380)
 app.processEvents()
@@ -103,15 +104,15 @@ window.repaint()
 app.processEvents()
 assert window.mask().contains(QtCore.QPoint(window.width() // 2, window.height() - 3))
 window.close()
-print("PASS Qt {} DPR {}: acrylic, four native corners, reopening, resizing and flat edges".format(
+print("PASS Qt {} DPR {}: Qt glass, four native corners, reopening, resizing and flat edges".format(
     QtCore.qVersion(), window.devicePixelRatioF()))
 
-# The real Windows compatibility path disables accent without changing system settings.
+# The same renderer is used regardless of the former native compatibility switch.
 window.setProperty('forcePortableMaterial', True)
 window.show()
 app.processEvents()
 assert not surface.active
-assert window.property('nativeBlurBackend') == 'fallback'
+assert window.property('nativeBlurBackend') == 'qt'
 window.close()
 
 from types import SimpleNamespace
@@ -135,7 +136,7 @@ apply_toolbar_style(toolbar)
 app.processEvents()
 app.processEvents()
 glass = toolbar._material_glass
-assert glass.surface.active and glass.isVisible()
+assert not glass.surface.active and glass.isVisible()
 assert strip.parentWidget() is glass
 assert not owner.property("nativeBlurBackend")
 owner.move(130, 150)

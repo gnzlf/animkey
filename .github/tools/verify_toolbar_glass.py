@@ -1,4 +1,4 @@
-"""Test the docked toolbar's actual Windows acrylic surface and lifecycle."""
+"""Test the standalone toolbar's frosted Qt surface and ownership lifecycle."""
 
 import os
 from pathlib import Path
@@ -68,7 +68,7 @@ apply_toolbar_style(toolbar)
 app.processEvents()
 app.processEvents()
 glass = toolbar._material_glass
-assert glass.isVisible() and glass.surface.active
+assert glass.isVisible() and not glass.surface.active
 assert not owner.property("nativeBlurBackend"), "Maya's parent must never receive acrylic"
 assert strip.parentWidget() is glass
 assert not uiMod._is_animkey_tool_window(glass), "Opening another tool must preserve the toolbar"
@@ -125,21 +125,12 @@ floating.close()
 def capture_and_finish():
     # Only capture this test's own surface pixels, excluding the user's apps.
     glass.grab().save(str(output / "toolbar-alpha.png"))
-    import ctypes
-    from ctypes import wintypes
-    user32 = ctypes.WinDLL("user32")
-    user32.GetForegroundWindow.restype = wintypes.HWND
-    own_handles = (int(owner.winId()), int(glass.winId()))
-    if user32.GetForegroundWindow() in own_handles:
-        rect = glass.frameGeometry()
-        glass.screen().grabWindow(0, rect.x(), rect.y(), rect.width(), rect.height()).save(str(output / "toolbar-composited.png"))
-        print("Captured compositor over the test's colored backdrop", flush=True)
     workspace.deleteLater()
     QtWidgets.QApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
     QtWidgets.QApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
     assert not is_qt_object_valid(glass), "Deleting the dock must destroy its native surface"
     owner.close()
-    print("PASS native toolbar: acrylic, alignment, resize, hide/show, minimize, clicks and cleanup", flush=True)
+    print("PASS Qt toolbar: alignment, resize, hide/show, minimize, clicks and cleanup", flush=True)
     app.quit()
 
 
