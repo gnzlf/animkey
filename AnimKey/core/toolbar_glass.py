@@ -31,7 +31,7 @@ class ToolbarGlass(QtWidgets.QWidget):
         layout.setSpacing(0)
         strip.setParent(self)
         layout.addWidget(strip)
-        self.surface = apply_window_style(self, polish=False)
+        self.surface = apply_window_style(self, polish=False, auto_fade=False)
         self._watch_ancestors()
         self.sync()
 

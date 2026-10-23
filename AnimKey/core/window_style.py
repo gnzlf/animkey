@@ -73,10 +73,14 @@ def window_path(window):
 
 
 class MaterialSurface(QtCore.QObject):
-    """A per-window painter; no application-wide filters or repaint timers."""
+    """Owned glass updates and proximity fade, without application-wide filters."""
+
+    IDLE_OPACITY = 0.5
+    NEAR_MARGIN = 28
+    CAPTURE_INTERVAL_MS = 33
 
     def __init__(self, window, polish=True, paint=True, panel=None, compact=True,
-                 defer_polish=False):
+                 defer_polish=False, auto_fade=True):
         super().__init__(window)
         self.window = window
         self.polish = polish
@@ -84,6 +88,7 @@ class MaterialSurface(QtCore.QObject):
         self.panel = panel
         self.compact = compact
         self.defer_polish = defer_polish
+        self.auto_fade = auto_fade
         self._styled = False
         self._region = None
         self._shape_key = None
@@ -91,14 +96,68 @@ class MaterialSurface(QtCore.QObject):
         self.active = False
         self._backdrop_image = None
         self._capturing = False
+        self._capture_count = 0
+        self._capture_duration_ms = 0
+        self._opacity_target = None
         self._capture_timer = QtCore.QTimer(self)
         self._capture_timer.setSingleShot(True)
         self._capture_timer.timeout.connect(self._capture_backdrop)
+        self._proximity_timer = QtCore.QTimer(self)
+        self._proximity_timer.setInterval(80)
+        self._proximity_timer.timeout.connect(self._update_proximity)
+        self._opacity_animation = QtCore.QPropertyAnimation(window, b'windowOpacity', self)
+        self._opacity_animation.setDuration(150)
+        self._opacity_animation.setEasingCurve(QtCore.QEasingCurve.OutCubic)
         window.setAttribute(QtCore.Qt.WA_TranslucentBackground)
         window.setWindowFlags(window.windowFlags() | QtCore.Qt.FramelessWindowHint
                               | QtCore.Qt.NoDropShadowWindowHint)
         window.setProperty("materialSurface", True)
         window.installEventFilter(self)
+
+    def _schedule_capture(self, immediate=False):
+        if self.active or self._capturing or not self.window.isVisible():
+            return
+        # Throttle rather than debounce: later moves must not postpone an
+        # already queued frame until the animator releases the mouse.
+        if not self._capture_timer.isActive():
+            # The first frame can include Maya's cold renderer/import cost;
+            # do not turn that one-off delay into another long frozen frame.
+            cost = self._capture_duration_ms if self._capture_count > 1 else 0
+            delay = 0 if immediate else max(self.CAPTURE_INTERVAL_MS,
+                                            cost)
+            self._capture_timer.start(delay)
+
+    def _belongs_to_window(self, widget):
+        while widget is not None:
+            if widget is self.window:
+                return True
+            widget = widget.parentWidget()
+        return False
+
+    def _wants_full_opacity(self):
+        if not self.auto_fade or self.window.isModal():
+            return True
+        rect = self.window.frameGeometry().adjusted(-self.NEAR_MARGIN, -self.NEAR_MARGIN,
+                                                    self.NEAR_MARGIN, self.NEAR_MARGIN)
+        return (rect.contains(QtGui.QCursor.pos())
+                or self._belongs_to_window(QtWidgets.QWidget.mouseGrabber())
+                or self._belongs_to_window(QtWidgets.QApplication.activePopupWidget()))
+
+    @QtCore.Slot()
+    def _update_proximity(self, animate=True):
+        if not self.window.isVisible():
+            return
+        target = 1.0 if self._wants_full_opacity() else self.IDLE_OPACITY
+        if target == self._opacity_target:
+            return
+        self._opacity_target = target
+        self._opacity_animation.stop()
+        if animate:
+            self._opacity_animation.setStartValue(self.window.windowOpacity())
+            self._opacity_animation.setEndValue(target)
+            self._opacity_animation.start()
+        else:
+            self.window.setWindowOpacity(target)
 
     def _sync_region(self, force=False):
         key = (self.window.width(), self.window.height(),
@@ -120,8 +179,11 @@ class MaterialSurface(QtCore.QObject):
         if self.active or not self.window.isVisible() or self._capturing:
             return
         self._capturing = True
+        elapsed = QtCore.QElapsedTimer()
+        elapsed.start()
         try:
             self._backdrop_image = capture_widget_backdrop(self.window)
+            self._capture_count += 1
             self.window.setProperty('materialBackdropMode',
                                     'portable' if self._backdrop_image is not None else 'translucent')
             if self.panel is not None:
@@ -129,6 +191,7 @@ class MaterialSurface(QtCore.QObject):
                 self.panel.update()
             self.window.update()
         finally:
+            self._capture_duration_ms = elapsed.elapsed()
             self._capturing = False
 
     def eventFilter(self, watched, event):
@@ -148,20 +211,30 @@ class MaterialSurface(QtCore.QObject):
             # while Qt still reports the same cached mask.
             self._sync_region(force=True)
             watched.setProperty('materialBackdropMode', 'native' if self.active else 'translucent')
-            if not self.active:
-                self._capture_timer.start(0)
+            self._schedule_capture(immediate=True)
+            self._opacity_target = None
+            self._update_proximity(animate=False)
+            if self.auto_fade and not watched.isModal():
+                self._proximity_timer.start()
             if self.panel is not None:
                 self.panel.backdrop_active = self.active
                 self.panel.update()
         elif kind == QtCore.QEvent.Resize:
             self._sync_region()
-            if not self.active and watched.isVisible():
-                self._capture_timer.start(100)
+            self._schedule_capture()
         elif kind == QtCore.QEvent.Move:
-            if not self.active and watched.isVisible() and not self._capturing:
-                self._capture_timer.start(100)
+            self._schedule_capture()
+        elif kind in (QtCore.QEvent.Enter, QtCore.QEvent.Leave):
+            if self.auto_fade and not watched.isModal():
+                self._update_proximity()
+                # Legacy tool handlers animated both states to 1.0. The shared
+                # material now owns the one opacity animation for the window.
+                return True
         elif kind == QtCore.QEvent.Hide:
             self._capture_timer.stop()
+            self._proximity_timer.stop()
+            self._opacity_animation.stop()
+            self._opacity_target = None
             self._backdrop_image = None
             if self.panel is not None:
                 self.panel.backdrop_image = None

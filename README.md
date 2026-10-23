@@ -65,6 +65,17 @@ source checkout was loaded instead, Update locates the existing Maya installatio
 and reloads that installed copy after upgrading or downgrading. The source
 checkout is kept untouched.
 
+### AnimKey 1.2.5
+
+- Restore floating tool windows to 50% opacity when the mouse moves away and
+  full opacity when it approaches. Keep owned dropdowns and mouse drags fully
+  visible; modal dialogs and the toolbar keep their normal opacity.
+- Update the frosted backdrop during continuous window movement and resizing,
+  instead of postponing every update until movement stops. Throttle captures
+  according to their cost and stop viewport reads when the window is idle.
+- Cancel proximity checks, opacity animations and pending backdrop work when
+  a tool hides or closes.
+
 ### AnimKey 1.2.4
 
 - Paint frosted glass inside the rounded Qt alpha surface. Disable the separate

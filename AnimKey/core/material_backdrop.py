@@ -204,8 +204,8 @@ def capture_widget_backdrop(window):
             viewport_count += 1
         painter.end()
         window.setProperty('materialViewportCount', viewport_count)
-        # Cache the blur only after Show/Move/Resize. No per-frame viewport
-        # readbacks, global filters, screenshot files or scene modifications.
+        # The caller throttles Show/Move/Resize updates. An idle window never
+        # polls the viewport, and capture cannot modify the animation scene.
         blurred = _blur_image(captured)
         image = QtGui.QImage(window.size(), QtGui.QImage.Format_ARGB32_Premultiplied)
         image.fill(QtCore.Qt.transparent)

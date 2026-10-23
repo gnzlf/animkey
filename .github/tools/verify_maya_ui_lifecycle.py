@@ -71,10 +71,40 @@ def step():
         window.show()
         window.move(120 + cycle * 3, 160 + cycle * 2)
         window.resize(780 + (cycle % 3) * 10, 760)
+        if os.environ.get('ANIMKEY_TEST_LIVE_MATERIAL') == '1':
+            state['motion_frames_before'] = window._material_surface._capture_count
+            state['motion_moves'] = 0
+            state['motion_clock'] = QtCore.QElapsedTimer()
+            state['motion_clock'].start()
+            timer = QtCore.QTimer(window)
+            state['motion_timer'] = timer
+            timer.setInterval(12)
+            timer.timeout.connect(advance_motion)
+            timer.start()
+            return
         # Let the owned viewport readback and blur finish before close/refresh.
         delay = int(os.environ.get('ANIMKEY_LIFECYCLE_HOLD_MS', '250')) if cycle == 0 else 250
         QtCore.QTimer.singleShot(delay, close_and_reload)
     except Exception:
+        finish(traceback.format_exc())
+
+
+def advance_motion():
+    try:
+        window = state['window']
+        state['motion_moves'] += 1
+        window.move(120 + state['motion_moves'] * 3, 160 + state['cycle'] * 2)
+        if state['motion_clock'].elapsed() >= 1500:
+            state['motion_timer'].stop()
+            surface = window._material_surface
+            state['motion_frames'] = surface._capture_count - state['motion_frames_before']
+            report['last_motion'] = {'frames': state['motion_frames'],
+                                     'moves': state['motion_moves'],
+                                     'capture_ms': surface._capture_duration_ms}
+            assert state['motion_frames'] >= 2, 'Backdrop stayed frozen throughout movement'
+            QtCore.QTimer.singleShot(100, close_and_reload)
+    except Exception:
+        state['motion_timer'].stop()
         finish(traceback.format_exc())
 
 
@@ -85,7 +115,9 @@ def close_and_reload():
         window = state['window']
         mode = window.property('materialBackdropMode')
         report['materials'].append({'window': type(window).__name__, 'mode': mode,
-                                   'viewports': window.property('materialViewportCount')})
+                                   'viewports': window.property('materialViewportCount'),
+                                   'moving_frames': state.get('motion_frames'),
+                                   'capture_ms': window._material_surface._capture_duration_ms})
         assert mode == 'portable', 'Application backdrop did not run: ' + str(mode)
         assert window.property('nativeBlurBackend') == 'qt'
         assert window._material_surface._backdrop_image is not None
