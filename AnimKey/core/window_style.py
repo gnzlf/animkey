@@ -9,7 +9,7 @@ import re
 
 from AnimKey.mods.maya_compat import QtCore, QtGui, QtWidgets
 from AnimKey.core.settings_style import STYLESHEET, GlassPanel, apply_native_backdrop
-from AnimKey.core.material_backdrop import rounded_path, sync_native_region, capture_widget_backdrop, paint_material
+from AnimKey.core.material_backdrop import rounded_path, sync_native_region, capture_application_backdrop, paint_material
 
 
 COMPACT_STYLESHEET = STYLESHEET + """
@@ -77,7 +77,7 @@ class MaterialSurface(QtCore.QObject):
 
     IDLE_OPACITY = 0.5
     NEAR_MARGIN = 28
-    CAPTURE_INTERVAL_MS = 33
+    CAPTURE_SETTLE_MS = 180
 
     def __init__(self, window, polish=True, paint=True, panel=None, compact=True,
                  defer_polish=False, auto_fade=True):
@@ -95,6 +95,8 @@ class MaterialSurface(QtCore.QObject):
         self._path = window_path(window)
         self.active = False
         self._backdrop_image = None
+        self._backdrop_cache = None
+        self._reproject_count = 0
         self._capturing = False
         self._capture_count = 0
         self._capture_duration_ms = 0
@@ -117,15 +119,19 @@ class MaterialSurface(QtCore.QObject):
     def _schedule_capture(self, immediate=False):
         if self.active or self._capturing or not self.window.isVisible():
             return
-        # Throttle rather than debounce: later moves must not postpone an
-        # already queued frame until the animator releases the mouse.
-        if not self._capture_timer.isActive():
-            # The first frame can include Maya's cold renderer/import cost;
-            # do not turn that one-off delay into another long frozen frame.
-            cost = self._capture_duration_ms if self._capture_count > 1 else 0
-            delay = 0 if immediate else max(self.CAPTURE_INTERVAL_MS,
-                                            cost)
-            self._capture_timer.start(delay)
+        # Restart after every move/resize: never read Maya's GPU while dragging.
+        # The cached, already blurred owner supplies the moving glass instead.
+        self._capture_timer.start(0 if immediate else self.CAPTURE_SETTLE_MS)
+
+    def _reproject_backdrop(self):
+        if self._backdrop_cache is None:
+            return
+        self._backdrop_image = self._backdrop_cache.render(self.window)
+        self._reproject_count += 1
+        if self.panel is not None:
+            self.panel.backdrop_image = self._backdrop_image
+            self.panel.update()
+        self.window.update()
 
     def _belongs_to_window(self, widget):
         while widget is not None:
@@ -178,18 +184,20 @@ class MaterialSurface(QtCore.QObject):
     def _capture_backdrop(self):
         if self.active or not self.window.isVisible() or self._capturing:
             return
+        # A held drag can pause longer than the debounce interval. Wait for
+        # release as well, including native/custom title-bar mouse grabs.
+        if QtWidgets.QApplication.mouseButtons() != QtCore.Qt.NoButton:
+            self._capture_timer.start(self.CAPTURE_SETTLE_MS)
+            return
         self._capturing = True
         elapsed = QtCore.QElapsedTimer()
         elapsed.start()
         try:
-            self._backdrop_image = capture_widget_backdrop(self.window)
+            self._backdrop_cache = capture_application_backdrop(self.window)
+            self._reproject_backdrop()
             self._capture_count += 1
             self.window.setProperty('materialBackdropMode',
                                     'portable' if self._backdrop_image is not None else 'translucent')
-            if self.panel is not None:
-                self.panel.backdrop_image = self._backdrop_image
-                self.panel.update()
-            self.window.update()
         finally:
             self._capture_duration_ms = elapsed.elapsed()
             self._capturing = False
@@ -221,8 +229,10 @@ class MaterialSurface(QtCore.QObject):
                 self.panel.update()
         elif kind == QtCore.QEvent.Resize:
             self._sync_region()
+            self._reproject_backdrop()
             self._schedule_capture()
         elif kind == QtCore.QEvent.Move:
+            self._reproject_backdrop()
             self._schedule_capture()
         elif kind in (QtCore.QEvent.Enter, QtCore.QEvent.Leave):
             if self.auto_fade and not watched.isModal():
@@ -236,6 +246,7 @@ class MaterialSurface(QtCore.QObject):
             self._opacity_animation.stop()
             self._opacity_target = None
             self._backdrop_image = None
+            self._backdrop_cache = None
             if self.panel is not None:
                 self.panel.backdrop_image = None
         elif kind in tuple(value for value in (

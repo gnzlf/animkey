@@ -65,6 +65,14 @@ source checkout was loaded instead, Update locates the existing Maya installatio
 and reloads that installed copy after upgrading or downgrading. The source
 checkout is kept untouched.
 
+### AnimKey 1.2.6
+
+- Remove repeated GPU readbacks and blur work from window dragging and resizing.
+  Pan a cached, half-resolution application backdrop immediately as the window
+  moves; refresh the scene snapshot once movement stops and the mouse is released.
+- Preserve rounded transparent corners, neutral grey glass and the proximity
+  fade (50% away, full opacity nearby). Release the cached image on hide/close.
+
 ### AnimKey 1.2.5
 
 - Restore floating tool windows to 50% opacity when the mouse moves away and

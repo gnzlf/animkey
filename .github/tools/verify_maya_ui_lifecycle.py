@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sys
 import traceback
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 OUTPUT = Path(os.environ['ANIMKEY_LIFECYCLE_OUTPUT']).resolve()
@@ -38,6 +39,9 @@ def record(message):
     (OUTPUT/'progress.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
 
 def finish(error=None):
+    patch = state.pop('motion_mouse_patch', None)
+    if patch is not None:
+        patch.stop()
     if error: report['error'] = error
     report['passed'] = error is None
     report['animation_before'] = state['scene']
@@ -72,15 +76,8 @@ def step():
         window.move(120 + cycle * 3, 160 + cycle * 2)
         window.resize(780 + (cycle % 3) * 10, 760)
         if os.environ.get('ANIMKEY_TEST_LIVE_MATERIAL') == '1':
-            state['motion_frames_before'] = window._material_surface._capture_count
-            state['motion_moves'] = 0
-            state['motion_clock'] = QtCore.QElapsedTimer()
-            state['motion_clock'].start()
-            timer = QtCore.QTimer(window)
-            state['motion_timer'] = timer
-            timer.setInterval(12)
-            timer.timeout.connect(advance_motion)
-            timer.start()
+            # Warm the snapshot once; no GPU capture is permitted during motion.
+            QtCore.QTimer.singleShot(350, start_motion)
             return
         # Let the owned viewport readback and blur finish before close/refresh.
         delay = int(os.environ.get('ANIMKEY_LIFECYCLE_HOLD_MS', '250')) if cycle == 0 else 250
@@ -89,20 +86,59 @@ def step():
         finish(traceback.format_exc())
 
 
+def start_motion():
+    try:
+        surface = state['window']._material_surface
+        if surface._capture_count == 0 and state.get('warmup_attempts', 0) < 30:
+            state['warmup_attempts'] = state.get('warmup_attempts', 0) + 1
+            QtCore.QTimer.singleShot(100, start_motion)
+            return
+        assert surface._backdrop_image is not None, 'No backdrop: captures={}, pending={}, buttons={}'.format(
+            surface._capture_count, surface._capture_timer.isActive(), QtWidgets.QApplication.mouseButtons())
+        state['warmup_attempts'] = 0
+        state['motion_frames_before'] = surface._reproject_count
+        state['motion_captures_before'] = surface._capture_count
+        state['motion_moves'] = 0
+        state['move_costs_ms'] = []
+        # Model an actual held drag without sending input to the user's desktop.
+        state['motion_mouse_patch'] = mock.patch.object(QtWidgets.QApplication, 'mouseButtons',
+                                                       return_value=QtCore.Qt.LeftButton)
+        state['motion_mouse_patch'].start()
+        state['motion_clock'] = QtCore.QElapsedTimer()
+        state['motion_clock'].start()
+        timer = QtCore.QTimer(state['window'])
+        state['motion_timer'] = timer
+        timer.setInterval(12)
+        timer.setTimerType(QtCore.Qt.PreciseTimer)
+        timer.timeout.connect(advance_motion)
+        timer.start()
+    except Exception:
+        finish(traceback.format_exc())
+
+
 def advance_motion():
     try:
         window = state['window']
         state['motion_moves'] += 1
-        window.move(120 + state['motion_moves'] * 3, 160 + state['cycle'] * 2)
-        if state['motion_clock'].elapsed() >= 1500:
+        cost = QtCore.QElapsedTimer()
+        cost.start()
+        window.move(150 + state['motion_moves'] * 3, 160 + state['cycle'] * 2)
+        state['move_costs_ms'].append(cost.nsecsElapsed() / 1000000)
+        if state['motion_clock'].elapsed() >= 1500 and state['motion_moves'] >= 10:
             state['motion_timer'].stop()
+            state.pop('motion_mouse_patch').stop()
             surface = window._material_surface
-            state['motion_frames'] = surface._capture_count - state['motion_frames_before']
+            state['motion_frames'] = surface._reproject_count - state['motion_frames_before']
+            costs = sorted(state['move_costs_ms'])
             report['last_motion'] = {'frames': state['motion_frames'],
                                      'moves': state['motion_moves'],
+                                     'gpu_captures': surface._capture_count - state['motion_captures_before'],
+                                     'move_p95_ms': costs[int(len(costs) * .95)],
+                                     'move_max_ms': max(costs),
                                      'capture_ms': surface._capture_duration_ms}
             assert state['motion_frames'] >= 2, 'Backdrop stayed frozen throughout movement'
-            QtCore.QTimer.singleShot(100, close_and_reload)
+            assert report['last_motion']['gpu_captures'] == 0, 'Movement performed expensive GPU captures'
+            QtCore.QTimer.singleShot(350, close_and_reload)
     except Exception:
         state['motion_timer'].stop()
         finish(traceback.format_exc())
@@ -118,6 +154,9 @@ def close_and_reload():
                                    'viewports': window.property('materialViewportCount'),
                                    'moving_frames': state.get('motion_frames'),
                                    'capture_ms': window._material_surface._capture_duration_ms})
+        if os.environ.get('ANIMKEY_TEST_LIVE_MATERIAL') == '1':
+            report['materials'][-1]['motion'] = report['last_motion'].copy()
+            assert window._material_surface._capture_count == state['motion_captures_before'] + 1
         assert mode == 'portable', 'Application backdrop did not run: ' + str(mode)
         assert window.property('nativeBlurBackend') == 'qt'
         assert window._material_surface._backdrop_image is not None

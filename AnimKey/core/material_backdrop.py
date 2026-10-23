@@ -158,7 +158,7 @@ def _maya_viewport_images(source, area):
             continue
 
 
-def _blur_image(image):
+def _blur_image(image, radius=12):
     """Blur an image offscreen; never attach a graphics effect to Maya widgets."""
     small = image.scaled(max(1, image.width() // 4), max(1, image.height() // 4),
                          QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation)
@@ -166,7 +166,7 @@ def _blur_image(image):
     item = QtWidgets.QGraphicsPixmapItem(QtGui.QPixmap.fromImage(small))
     scene.addItem(item)
     effect = QtWidgets.QGraphicsBlurEffect()
-    effect.setBlurRadius(12)
+    effect.setBlurRadius(radius)
     effect.setBlurHints(QtWidgets.QGraphicsBlurEffect.QualityHint)
     item.setGraphicsEffect(effect)
     blurred = QtGui.QImage(small.size(), QtGui.QImage.Format_ARGB32_Premultiplied)
@@ -178,25 +178,60 @@ def _blur_image(image):
                           QtCore.Qt.SmoothTransformation)
 
 
-def capture_widget_backdrop(window):
-    """Blur the owning application's Qt and viewport pixels, never the desktop."""
+class ApplicationBackdrop:
+    """A bounded, half-resolution application snapshot that is cheap to pan."""
+
+    def __init__(self, source, image, size):
+        # Keep the Python wrapper alive. Maya owns the native main window, but
+        # its temporary shiboken wrapper can otherwise vanish after capture.
+        self._source = source
+        self.image = image
+        self.size = QtCore.QSize(size)
+
+    def render(self, window):
+        # No grab, GPU readback or blur is allowed on this movement path.
+        source = self._source
+        try:
+            origin = source.mapFromGlobal(window.mapToGlobal(QtCore.QPoint()))
+            area = QtCore.QRect(origin, window.size()).intersected(QtCore.QRect(QtCore.QPoint(), self.size))
+            image = QtGui.QImage(window.size(), QtGui.QImage.Format_ARGB32_Premultiplied)
+            image.fill(QtCore.Qt.transparent)
+            if not area.isEmpty():
+                sx = self.image.width() / self.size.width()
+                sy = self.image.height() / self.size.height()
+                sample = QtCore.QRectF(area.x() * sx, area.y() * sy,
+                                      area.width() * sx, area.height() * sy)
+                painter = QtGui.QPainter(image)
+                painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
+                painter.drawImage(QtCore.QRectF(area.translated(-origin)), self.image, sample)
+                painter.end()
+            return image
+        except RuntimeError:
+            return None
+
+
+def capture_application_backdrop(window):
+    """Read and blur the owner once; callers defer this until movement settles."""
     from AnimKey.mods.maya_compat import get_maya_main_window
     source = window.parentWidget()
     source = source.window() if source is not None else get_maya_main_window()
     if source is None or source is window or not source.isVisible() or source.isMinimized():
         return None
-    origin = source.mapFromGlobal(window.mapToGlobal(QtCore.QPoint()))
-    area = QtCore.QRect(origin, window.size()).intersected(source.rect())
+    area = source.rect()
     if area.isEmpty():
         return None
     try:
         captured = source.grab(area).toImage()
         if captured.isNull():
             return None
-        captured = captured.scaled(area.size(), QtCore.Qt.IgnoreAspectRatio,
+        # Cache the whole owner so movement only changes the sampled position.
+        # Half resolution bounds memory and is sufficient for frosted glass.
+        size = QtCore.QSize(max(1, area.width() // 2), max(1, area.height() // 2))
+        captured = captured.scaled(size, QtCore.Qt.IgnoreAspectRatio,
                                    QtCore.Qt.SmoothTransformation)
         captured.setDevicePixelRatio(1.0)
         painter = QtGui.QPainter(captured)
+        painter.scale(size.width() / area.width(), size.height() / area.height())
         painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
         viewport_count = 0
         for bounds, viewport in _maya_viewport_images(source, area):
@@ -204,17 +239,15 @@ def capture_widget_backdrop(window):
             viewport_count += 1
         painter.end()
         window.setProperty('materialViewportCount', viewport_count)
-        # The caller throttles Show/Move/Resize updates. An idle window never
-        # polls the viewport, and capture cannot modify the animation scene.
-        blurred = _blur_image(captured)
-        image = QtGui.QImage(window.size(), QtGui.QImage.Format_ARGB32_Premultiplied)
-        image.fill(QtCore.Qt.transparent)
-        painter = QtGui.QPainter(image)
-        painter.drawImage(area.topLeft() - origin, blurred)
-        painter.end()
-        return image
+        return ApplicationBackdrop(source, _blur_image(captured, radius=6), area.size())
     except RuntimeError:
         return None
+
+
+def capture_widget_backdrop(window):
+    """Compatibility helper for callers that need one window-sized image."""
+    backdrop = capture_application_backdrop(window)
+    return backdrop.render(window) if backdrop is not None else None
 
 
 def paint_material(painter, path, active=False, image=None):

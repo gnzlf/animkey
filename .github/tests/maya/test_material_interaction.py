@@ -1,6 +1,7 @@
 """Proximity fading and backdrop frames while the tool is still moving."""
 from pathlib import Path
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -8,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from AnimKey.mods.maya_compat import QtCore, QtGui, QtWidgets, shiboken, is_qt_object_valid
 APP = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 from AnimKey.core.window_style import apply_window_style
+from AnimKey.core import window_style
 
 
 def wait(milliseconds):
@@ -104,13 +106,65 @@ class MaterialInteractionTests(unittest.TestCase):
     def test_backdrop_updates_during_continuous_movement_not_only_after_release(self):
         surface = self.show()
         before = surface._capture_count
+        frames = surface._reproject_count
         original = surface._backdrop_image.pixelColor(110, 80)
-        for step in range(50):
-            self.window.move(100 + step * 4, 100)
-            wait(8)
-        self.assertGreaterEqual(surface._capture_count - before, 3)
+        real_capture = window_style.capture_application_backdrop
+        def slow_capture(window):
+            time.sleep(.1)  # Simulate a slow GPU without requiring one in CI.
+            return real_capture(window)
+        durations = []
+        with mock.patch.object(window_style, 'capture_application_backdrop', side_effect=slow_capture) as capture:
+            for step in range(50):
+                started = time.perf_counter()
+                self.window.move(100 + step * 4, 100)
+                durations.append((time.perf_counter() - started) * 1000)
+                wait(8)
+            capture.assert_not_called()
+            self.assertEqual(surface._capture_count, before)
+            self.assertGreaterEqual(surface._reproject_count - frames, 45)
+            self.assertLess(sorted(durations)[int(len(durations) * .95)], 50)
+            current = surface._backdrop_image.pixelColor(110, 80)
+            self.assertGreater(abs(original.red() - current.red()), 25)
+            wait(surface.CAPTURE_SETTLE_MS + 140)
+            self.assertEqual(capture.call_count, 1)
+        self.assertEqual(surface._capture_count, before + 1)
+
+    def test_paused_drag_waits_for_mouse_release_before_reading_the_gpu(self):
+        surface = self.show()
+        before = surface._capture_count
+        with mock.patch.object(QtWidgets.QApplication, 'mouseButtons', return_value=QtCore.Qt.LeftButton):
+            self.window.move(200, 120)
+            wait(surface.CAPTURE_SETTLE_MS * 2 + 50)
+            self.assertEqual(surface._capture_count, before)
+            self.assertTrue(surface._capture_timer.isActive())
+        wait(surface.CAPTURE_SETTLE_MS + 50)
+        self.assertEqual(surface._capture_count, before + 1)
+
+    def test_resize_and_moving_outside_owner_only_sample_existing_cache(self):
+        surface = self.show()
+        before = surface._capture_count
+        self.window.resize(260, 190)
+        self.window.move(0, 0)
+        self.assertEqual(surface._backdrop_image.size(), self.window.size())
+        self.assertEqual(surface._backdrop_image.pixelColor(0, 0).alpha(), 0)
+        self.assertEqual(surface._capture_count, before)
+        self.assertGreater(surface._backdrop_image.pixelColor(150, 100).alpha(), 0)
+
+    def test_owner_changes_are_captured_once_after_movement_settles(self):
+        surface = self.show()
+        before = surface._capture_count
+        original = surface._backdrop_image.pixelColor(110, 80)
+        viewport = QtGui.QImage(20, 20, QtGui.QImage.Format_ARGB32)
+        viewport.fill(QtGui.QColor('#20e030'))
+        from AnimKey.core import material_backdrop
+        with mock.patch.object(material_backdrop, '_maya_viewport_images',
+                               side_effect=lambda *args: iter([(self.owner.rect(), viewport)])):
+            self.window.move(120, 100)
+            self.assertEqual(surface._capture_count, before)
+            wait(surface.CAPTURE_SETTLE_MS + 80)
         current = surface._backdrop_image.pixelColor(110, 80)
-        self.assertGreater(abs(original.red() - current.red()), 25)
+        self.assertGreater(current.green() - original.green(), 100)
+        self.assertEqual(surface._capture_count, before + 1)
 
     def test_idle_window_does_not_continuously_read_the_viewport(self):
         surface = self.show()
@@ -125,6 +179,7 @@ class MaterialInteractionTests(unittest.TestCase):
         self.window.hide()
         self.assertFalse(surface._capture_timer.isActive())
         self.assertFalse(surface._proximity_timer.isActive())
+        self.assertIsNone(surface._backdrop_cache)
         self.cursor.return_value = self.window.frameGeometry().center()
         self.window.show()
         APP.processEvents()
