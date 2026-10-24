@@ -2596,8 +2596,8 @@ class AnimKeyToolbar:
             ("LKN", "Link Objects", link_objects_execute, "#b48ead"),      # Purple - Link Objects
             ("CAM", "Follow Cam", follow_cam_execute, "#5e81ac"),          # Dark Blue - Follow Cam
             ("WS", "World Space — Click: copy frame | Shift: paste | Ctrl: Auto | Right-click: ranges", copy_worldspace_execute, "#a3be8c"),
-            ("PIV", "Temp Pivot | Shift: Last Object | Ctrl: Center | Ctrl+Shift: World | Alt: Edit | Ctrl+Alt: Reset", temp_pivot_quick_execute, "#5bc0be"),
-            ("TMC", "Temp Controls | Ctrl: Relative | Shift: Object | Alt: Toggle + Bake | Shift+Alt: Panel", temp_controls_execute, "#5bc0be"),
+            ("PIV", "Temp Pivot | Right click: Options Window | Shift: Last Object | Ctrl: Center | Ctrl+Shift: World | Alt: Edit | Ctrl+Alt: Reset", temp_pivot_quick_execute, "#5bc0be"),
+            ("TMC", "Temp Controls | Right click: Settings Window | Ctrl: Relative | Shift: Object | Alt: Toggle + Bake | Shift+Alt: Panel", temp_controls_execute, "#5bc0be"),
             ("RUL", "Micro Move", None, "#ebcb8b"),                        # Yellow - Micro Move (callback set separately)
         ]
         

@@ -12,6 +12,7 @@ import math
 from AnimKey.mods.maya_compat import (
     QtCore, QtGui, QtWidgets, screen_available_geometry,
     wrap_instance as wrapInstance,
+    get_maya_font,
 )
 
 QApplication = QtWidgets.QApplication
@@ -37,6 +38,7 @@ QPainterPath = QtGui.QPainterPath
 
 from AnimKey.mods.themes import ThemeManager
 from AnimKey.mods import styleMod as style
+from AnimKey.mods import material_palette as material
 from AnimKey.core.window_style import apply_window_style
 
 
@@ -71,7 +73,7 @@ class AnimKeyColors:
     SLIDER_TRACK = QColor(14, 14, 14, 110)
     SLIDER_FILL = QColor(182, 182, 182)
     SLIDER_HANDLE = QColor(202, 202, 202)
-    SLIDER_HANDLE_BORDER = QColor(232, 232, 232)
+    SLIDER_HANDLE_BORDER = QColor(material.BORDER)
     
     # Dot button states
     DOT_INACTIVE = QColor(125, 125, 125)
@@ -602,7 +604,7 @@ class IlluminatedDotButton(QWidget):
         gradient.setColorAt(1, dot_color)
         
         painter.setBrush(gradient)
-        painter.setPen(QPen(dot_color.darker(120), 1))
+        painter.setPen(QPen(QColor(material.BORDER), 1))
         radius = self.dot_radius + (self._glow_intensity if self._is_hovered else 0.0)
         painter.drawEllipse(QtCore.QPointF(center), radius, radius)
         
@@ -691,7 +693,9 @@ class ValueTooltip(QWidget):
         
         # Draw text
         painter.setPen(AnimKeyColors.TEXT_PRIMARY)
-        font = QFont("Segoe UI", 10, QFont.Bold)
+        font = QFont(self.font())
+        font.setPointSize(10)
+        font.setBold(True)
         painter.setFont(font)
         painter.drawText(rect, Qt.AlignCenter, f"{self.value}%")
 
@@ -760,7 +764,8 @@ class MenuItemWidget(QWidget):
         
         # Option name
         painter.setPen(AnimKeyColors.TEXT_PRIMARY if self._is_hovered else AnimKeyColors.TEXT_SECONDARY)
-        font = QFont("Segoe UI", 9)
+        font = QFont(self.font())
+        font.setPointSize(9)
         font.setWeight(QFont.Medium if self._is_hovered else QFont.Normal)
         painter.setFont(font)
         
@@ -769,7 +774,8 @@ class MenuItemWidget(QWidget):
         
         # Description
         painter.setPen(AnimKeyColors.TEXT_MUTED)
-        font = QFont("Segoe UI", 7)
+        font = QFont(self.font())
+        font.setPointSize(7)
         painter.setFont(font)
         
         desc_rect = QRect(rect.x() + 22, rect.y() + 16, rect.width() - 24, 12)
@@ -791,7 +797,10 @@ class ModernDropdownMenu(QWidget):
     
     def __init__(self, options, parent=None):
         super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+        self.setFont(get_maya_font())
         self.setAttribute(Qt.WA_TranslucentBackground)
+        from AnimKey.core.window_reveal import apply_window_reveal
+        apply_window_reveal(self)
         
         self._options = options
         self._width = 200
@@ -871,6 +880,9 @@ class ModernDropdownMenu(QWidget):
         """Show menu at position, opening upward"""
         # Adjust position to open upward (above the label)
         adjusted_pos = QPoint(pos.x(), pos.y() - self._height)
+        screen = screen_available_geometry(self,pos)
+        adjusted_pos.setX(max(screen.left(),min(adjusted_pos.x(),screen.right()-self.width()+1)))
+        adjusted_pos.setY(max(screen.top(),min(adjusted_pos.y(),screen.bottom()-self.height()+1)))
         self.move(adjusted_pos)
         self.show()
         self.setFocus()
@@ -959,6 +971,9 @@ class DropdownLabel(QWidget):
     
     def set_options(self, options):
         """Update the options list"""
+        self._menu.close()
+        self._menu.deleteLater()
+        self._menu_visible = False
         self._options = options
         self._color_map = {opt[0]: opt[2] for opt in self._options}
         self._menu = ModernDropdownMenu(self._options, self)
@@ -1032,9 +1047,8 @@ class DropdownLabel(QWidget):
         gradient.setColorAt(1, bg_color)
         painter.fillPath(path, gradient)
         
-        # Border with accent color
-        border_color = self._current_color if (self._is_hovered or self._menu_visible) else QColor(theme["border_color"])
-        painter.setPen(QPen(border_color, 1))
+        # Keep the outline muted; the inset accent line identifies the mode.
+        painter.setPen(QPen(QColor(material.BORDER), 1))
         painter.drawPath(path)
         
         # Accent line on left
@@ -1046,7 +1060,8 @@ class DropdownLabel(QWidget):
         
         # Text
         painter.setPen(self._current_color if self._is_hovered else QColor(theme["text_primary"]))
-        font = QFont("Segoe UI", 9)
+        font = QFont(self.font())
+        font.setPointSize(9)
         font.setWeight(QFont.Medium)
         painter.setFont(font)
         
@@ -1543,7 +1558,7 @@ class AnimKeySlider(QWidget):
         # because this custom slider does not use Qt's QSlider stylesheet.
         body = QtCore.QRectF(self.rect()).adjusted(0.5, 1.5, -0.5, -1.5)
         painter.setBrush(QColor(255, 255, 255, 12))
-        painter.setPen(QPen(QColor(222, 233, 250, 60), 1))
+        painter.setPen(QPen(QColor(material.BORDER), 1))
         painter.drawRoundedRect(body, 9, 9)
         # Use display_value for smooth animation rendering
         display_val = self._display_value if hasattr(self, '_display_value') else self._value
@@ -1562,7 +1577,7 @@ class AnimKeySlider(QWidget):
         
         painter.fillPath(track_path, track_gradient)
         painter.setBrush(Qt.NoBrush)
-        painter.setPen(QPen(QColor(70, 80, 95), 1))
+        painter.setPen(QPen(QColor(material.BORDER), 1))
         painter.drawPath(track_path)
         
         # Draw origin marker (subtle line where slider returns to)
@@ -1647,7 +1662,9 @@ class AnimKeySlider(QWidget):
         # Draw value text when dragging
         if self._is_dragging:
             painter.setPen(AnimKeyColors.TEXT_PRIMARY)
-            font = QFont("Segoe UI", 8, QFont.Bold)
+            font = QFont(self.font())
+            font.setPointSize(8)
+            font.setBold(True)
             painter.setFont(font)
             value_text = f"{int(display_val)}%"
             painter.drawText(
@@ -1755,7 +1772,7 @@ class AnimKeySliderWithButtons(QtWidgets.QWidget):
         self.container.setStyleSheet(f'''
             QWidget {{
                 background-color: {theme["bg_secondary"]};
-                border: 1px solid {theme["border_color"]};
+                border: 1px solid {material.BORDER};
                 border-radius: 4px;
             }}
         ''')
@@ -1875,7 +1892,7 @@ class HoverButton(QtWidgets.QPushButton):
         painter = QtWidgets.QStylePainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.translate(self.width() / 2.0, self.height() / 2.0)
-        scale = 0.94 + 0.06 * self._hover_amount
+        scale = 0.90 + 0.10 * self._hover_amount
         painter.scale(scale, scale)
         painter.translate(-self.width() / 2.0, -self.height() / 2.0)
         painter.drawControl(QtWidgets.QStyle.CE_PushButton, option)
@@ -2638,6 +2655,7 @@ class ContextPopupWindow(QtWidgets.QWidget):
             QtWidgets.QSlider,
             QtWidgets.QScrollBar,
             QtWidgets.QAbstractItemView,
+            QtWidgets.QTabBar,
         )
         widget = obj if isinstance(obj, QtWidgets.QWidget) else None
         while widget is not None and widget is not self:

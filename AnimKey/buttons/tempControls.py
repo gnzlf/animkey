@@ -317,8 +317,12 @@ def _build(system):
     previous = None
     if family == 1:
         space = _space(system, members[0])
-        master = _new_control(system, "Group_Ctrl#", space, 7, shapes.dimension(_sources(system))*1.4)
-        cmds.xform(master, worldSpace=True, translation=tf.center(_sources(system)))
+        motion = _pack(system, cmds.createNode("transform", name="GroupMotion#", parent=space))
+        tf.message(system, "groupMotion", motion)
+        positions = [list(tf.world(n))[12:15] for n in _sources(system)]
+        center = [sum(p[i] for p in positions) / len(positions) for i in range(3)]
+        cmds.xform(motion, worldSpace=True, translation=center)
+        master = _new_control(system, "Group_Ctrl#", motion, 7, shapes.dimension(_sources(system))*1.4)
         tf.message(system,"master",master)
     for record in members:
         source = _first(record,"source")
@@ -387,9 +391,40 @@ def _fk_orientation(system, orient, reference):
     cmds.connectAttr(decompose+".outputRotate",orient+".rotate")
 
 
+def _bake_group_follow(system, samples):
+    """Recover the original averaged follow, with an independent baked driver.
+
+    Only constrain a scratch node while the rig's original inputs are active.
+    Remove it before attaching controls, so selected parent/child rigs cannot
+    feed their driven animation back into the group. The master stays zeroed.
+    """
+    motion = _first(system, "groupMotion")
+    if not motion:  # Older scene systems retain their existing hierarchy.
+        return
+    scratch = cmds.duplicate(motion, parentOnly=True, inputConnections=False,
+                             name="AnimKey_GroupFollowSolve#")[0]
+    constraint = None
+    try:
+        constraint = cmds.parentConstraint(*(_sources(system) + [scratch]), maintainOffset=True)[0]
+        with tf.sampling():
+            for frame, _ in samples:
+                cmds.currentTime(frame, edit=True)
+                tf.keyed_world(motion, tf.world(scratch), frame)
+        rotations = cmds.listConnections(motion + '.rotate', source=True, destination=False,
+                                         type='animCurve') or []
+        if rotations:
+            cmds.filterCurve(rotations, filter='euler')
+    finally:
+        if constraint and cmds.objExists(constraint):
+            cmds.delete(constraint)
+        cmds.delete(scratch)
+
+
 def _bake_controls(system, samples):
     members = records(system)
     family = cmds.getAttr(system+".systemID")
+    if family == 1:
+        _bake_group_follow(system, samples)
     with tf.sampling():
         for frame, matrices in samples:
             cmds.currentTime(frame,edit=True)
@@ -493,7 +528,7 @@ def _detach(system):
         cmds.setAttr(control+".visibility",False)
 
 
-def _bake_rig(system, samples):
+def _bake_rig(system, samples, parent_samples):
     """Bake to an owned override layer; preserve all prior animation graphs."""
     layer = cmds.animLayer("TempControls_Bake_AnimKey#",override=True)
     tf.message(system,"bakeLayers",layer,multi=True)
@@ -501,23 +536,32 @@ def _bake_rig(system, samples):
     attrs_by_record = [json.loads(tf.string(r,"channels")) for r in members]
     previous_selection = cmds.ls(selection=True,long=True) or []
     solvers = []
+    solver_parents = []
     try:
         for record, attrs in zip(members,attrs_by_record):
             source = _first(record,"source")
             solver = cmds.duplicate(source,parentOnly=True,inputConnections=False,name="AnimKey_BakeSolve#")[0]
+            solvers.append(solver)
             for attr in tf.TR:
                 cmds.setAttr(solver+"."+attr,lock=False)
-            solvers.append(solver)
+            # Solve against captured parent matrices. Maya can leave a freshly
+            # keyed layer one evaluation behind when its child is solved in
+            # the same frame; an independent parent avoids that dependency.
+            parent = cmds.createNode("transform",name="AnimKey_BakeParentSolve#")
+            solver_parents.append(parent)
+            solver = cmds.parent(solver,parent,relative=True)[0]
+            solvers[-1] = solver
             for attr in attrs:
                 cmds.animLayer(layer,edit=True,attribute=source+"."+attr)
         with tf.sampling():
-            for frame, matrices in samples:
+            for (frame, matrices), (_, parents) in zip(samples,parent_samples):
                 cmds.currentTime(frame,edit=True)
                 # Parent rig objects can themselves be driven in this bake.
                 ordered = sorted(range(len(members)),key=lambda i: _first(members[i],"source").count("|"))
                 for i in ordered:
                     source = _first(members[i],"source")
                     solver = solvers[i]
+                    cmds.xform(solver_parents[i],worldSpace=True,matrix=parents[i])
                     tf.apply_world(solver,matrices[i])
                     for attr in attrs_by_record[i]:
                         cmds.setKeyframe(source,attribute=attr,animLayer=layer,time=frame,
@@ -531,8 +575,11 @@ def _bake_rig(system, samples):
             cmds.delete(layer)
         raise
     finally:
-        if solvers:
-            cmds.delete(solvers)
+        if solver_parents:
+            cmds.delete(solver_parents)
+        leftover = [s for s in solvers if cmds.objExists(s)]
+        if leftover:
+            cmds.delete(leftover)
         if previous_selection:
             cmds.select(previous_selection,replace=True)
     return layer
@@ -540,7 +587,7 @@ def _bake_rig(system, samples):
 
 def create(node=None, name=None, system=0, space=0, positionSpace=None,
            orientationSpace=None, relative=None, color=(.2,.85,.75),
-           bake_frames=False, aim_distance=None, restoreDefaultProperties=False):
+           bake_frames=True, aim_distance=None, restoreDefaultProperties=False):
     """Create systems (0 Simple, 1 Group, 2 Aim, 3 FK); return their DAG paths."""
     if isinstance(system,str):
         system = SYSTEMS.index(system)
@@ -617,14 +664,25 @@ def set_enabled(system, enabled, revert=False):
             _attach(system)
         else:
             samples = None
+            parent_samples = None
             if not revert:
                 nodes = _sources(system)
-                frames = tf.times(nodes+controls(system),frames=cmds.getAttr(system+".bakeFrames"))
-                samples = tf.capture(nodes,frames)
+                # Final transfer always captures every displayed frame, even
+                # for systems created by older versions in sparse Keys mode.
+                frames = tf.times(nodes+controls(system),frames=True)
+                parents = [(cmds.listRelatives(n,parent=True,fullPath=True) or [None])[0] for n in nodes]
+                # Capture sources and their parent spaces in one evaluation
+                # pass, before disconnecting any temporary driver.
+                captured = tf.capture(nodes+[p for p in parents if p],frames)
+                samples = [(frame,matrices[:len(nodes)]) for frame,matrices in captured]
+                parent_samples = []
+                for frame,matrices in captured:
+                    iterator = iter(matrices[len(nodes):])
+                    parent_samples.append((frame,[next(iterator) if p else list(om.MMatrix()) for p in parents]))
             _detach(system)
             if samples:
                 try:
-                    _bake_rig(system,samples)
+                    _bake_rig(system,samples,parent_samples)
                 except Exception:
                     _attach(system)
                     raise

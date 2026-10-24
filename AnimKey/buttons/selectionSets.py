@@ -2172,6 +2172,9 @@ class FlowContainer(QtWidgets.QWidget):
 
     def __init__(self):
         super(FlowContainer, self).__init__()
+        self.setProperty("materialContainer",True)
+        self.setAutoFillBackground(False)
+        self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent,False)
         self.buttons = []
         self.active_color_filters = []
         self.manual_mode = True
@@ -3134,7 +3137,6 @@ class FlowContainer(QtWidgets.QWidget):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
         if self.layout_mode == "board":
-            painter.fillRect(self.rect(), QtGui.QColor("#333333"))
             if not self._background_pixmap.isNull():
                 painter.setOpacity(self.background_opacity)
                 zoom = max(0.05, float(self.board_zoom or 1.0))
@@ -3434,22 +3436,29 @@ class TabPage(QtWidgets.QWidget):
         
         # Scroll + container
         self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.scroll.setStyleSheet("""
             QScrollArea {
-                background-color: #333333;
-                border: 1px solid #333333;
+                background: transparent;
+                border: none;
                 border-radius: 6px;
             }
         """)
         
         self.container = FlowContainer()
-        self.container.setStyleSheet("background-color: #333333;")
+        self.container.setStyleSheet("background: transparent;")
         self.container.layout_mode_changed.connect(self._sync_layout_mode_buttons)
         self.container.selection_changed.connect(self._update_set_visibility_button)
         self.container.colors_changed.connect(self._rebuild_color_filter_dots)
         self.scroll.setWidget(self.container)
+        # QScrollArea.setWidget enables auto-fill on its content. Undo that
+        # for both layers so the window's material remains visible on resize.
+        for canvas in (self.scroll.viewport(),self.container):
+            canvas.setProperty("materialContainer",True)
+            canvas.setAutoFillBackground(False)
+            canvas.setAttribute(QtCore.Qt.WA_OpaquePaintEvent,False)
         self.scroll.viewport().installEventFilter(self)
         self.container.installEventFilter(self)
         self._update_set_visibility_button()

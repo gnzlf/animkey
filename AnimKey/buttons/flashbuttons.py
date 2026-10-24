@@ -15,8 +15,9 @@ import random
 from AnimKey.mods.storage import atomic_write_json, read_json
 
 from AnimKey.mods.maya_compat import (
-    QtCore, QtGui, QtWidgets, execute_qt, wrap_instance as wrapInstance,
+    QtCore, QtGui, QtWidgets, execute_qt, is_qt_object_valid, wrap_instance as wrapInstance,
 )
+from AnimKey.core.window_reveal import apply_window_reveal
 
 Qt = QtCore.Qt
 QApplication = QtWidgets.QApplication
@@ -1179,6 +1180,9 @@ class FlashButtonsPanel(QWidget):
         self.hide_timer = QTimer(self)
         self.hide_timer.timeout.connect(self.check_mouse_position)
         self.hide_timer.setInterval(50)
+        self.fade_animation = QPropertyAnimation(self, b"windowOpacity", self)
+        self.fade_animation.setDuration(200)
+        self.fade_animation.setEasingCurve(QEasingCurve.OutCubic)
         
         # Configurar UI
         self.setup_ui()
@@ -1194,9 +1198,56 @@ class FlashButtonsPanel(QWidget):
         
         self.setMouseTracking(True)
 
-        # This is a free-floating collection of circular buttons, rather than
-        # a rectangular tool window. Keep the space between them transparent.
+        # Paint the circular palette directly into the alpha surface; no
+        # rectangular backing widget or native backdrop sits behind it.
         self.setStyleSheet("FlashButtonsPanel { background: transparent; border: none; }")
+        apply_window_reveal(self)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setCompositionMode(QPainter.CompositionMode_Source)
+        painter.fillRect(event.rect(), Qt.transparent)
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        painter.setRenderHint(QPainter.Antialiasing)
+        center = QtCore.QPointF(self.rect().center())
+        radius = min(self.width(), self.height()) / 2 - 4
+        gradient = QRadialGradient(center, radius)
+        for stop, alpha in ((0, 215), (.5, 195), (.78, 125), (.92, 35), (1, 0)):
+            gradient.setColorAt(stop, QColor(32, 32, 32, alpha))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(gradient)
+        painter.drawEllipse(center, radius, radius)
+
+    def _stop_panel_animations(self):
+        self.hide_timer.stop()
+        self.fade_animation.stop()
+        for button in self.buttons:
+            for name in ('_panel_animation', '_panel_animation_timer', '_edit_timer'):
+                animation = getattr(button, name, None)
+                if is_qt_object_valid(animation):
+                    animation.stop()
+
+    def _animate_button(self, button, start, end, delay=0):
+        animation = getattr(button, '_panel_animation', None)
+        if not is_qt_object_valid(animation):
+            animation = QPropertyAnimation(button, b"geometry", button)
+            button._panel_animation = animation
+            timer = QTimer(button)
+            timer.setSingleShot(True)
+            timer.timeout.connect(animation.start)
+            button._panel_animation_timer = timer
+        animation.stop()
+        button._panel_animation_timer.stop()
+        animation.setDuration(300)
+        animation.setStartValue(start)
+        animation.setEndValue(end)
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+        button._panel_animation_timer.start(delay)
+
+    def hideEvent(self, event):
+        self._stop_panel_animations()
+        self.is_visible = False
+        super().hideEvent(event)
     
     def setup_ui(self):
         """Configura la interfaz de usuario"""
@@ -1404,19 +1455,17 @@ class FlashButtonsPanel(QWidget):
         
         # Mostrar el botón con animación
         button.show()
-        animation = QPropertyAnimation(button, b"geometry")
         center = self.button_container.rect().center()
         start_geo = QRect(center.x(), center.y(), 0, 0)
         end_geo = QRect(int(container_center_x + x), int(container_center_y + y), self.button_size, self.button_size)
         
-        animation.setDuration(300)
-        animation.setStartValue(start_geo)
-        animation.setEndValue(end_geo)
-        animation.setEasingCurve(QEasingCurve.OutBack)
-        animation.start()
+        self._animate_button(button, start_geo, end_geo)
         
         # Abrir editor después de la animación
-        QTimer.singleShot(350, lambda: self.edit_button(button.button_id))
+        button._edit_timer = QTimer(button)
+        button._edit_timer.setSingleShot(True)
+        button._edit_timer.timeout.connect(lambda: self.edit_button(button.button_id))
+        button._edit_timer.start(350)
         
         self.save_config()
     
@@ -1571,6 +1620,7 @@ class FlashButtonsPanel(QWidget):
     
     def show_panel(self):
         """Muestra el panel con animación"""
+        self._stop_panel_animations()
         self.is_visible = True
         self.mouse_inside = True
         self.show()
@@ -1579,11 +1629,8 @@ class FlashButtonsPanel(QWidget):
         self.hide_timer.start()
         
         # Animación de opacidad
-        self.fade_animation = QPropertyAnimation(self, b"windowOpacity")
-        self.fade_animation.setDuration(300)
         self.fade_animation.setStartValue(0.0)
         self.fade_animation.setEndValue(1.0)
-        self.fade_animation.setEasingCurve(QEasingCurve.OutCubic)
         self.fade_animation.start()
         
         # Animar botones desde el centro
@@ -1592,7 +1639,6 @@ class FlashButtonsPanel(QWidget):
         for i, button in enumerate(self.buttons):
             button.show()
             
-            animation = QPropertyAnimation(button, b"geometry")
             start_geo = QRect(center.x(), center.y(), 0, 0)
             
             if button.button_id in self.button_positions:
@@ -1602,12 +1648,7 @@ class FlashButtonsPanel(QWidget):
                 end_geo = button.geometry()
                 end_geo.setSize(QSize(self.button_size, self.button_size))
             
-            animation.setDuration(500)
-            animation.setStartValue(start_geo)
-            animation.setEndValue(end_geo)
-            animation.setEasingCurve(QEasingCurve.OutElastic)
-            
-            QTimer.singleShot(i * 50, animation.start)
+            self._animate_button(button, start_geo, end_geo, delay=i * 35)
     
     def hide_panel(self):
         """Oculta el panel inmediatamente"""

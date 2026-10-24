@@ -3745,21 +3745,22 @@ class DrawControlsWindow(QWidget):
         from AnimKey.core.settings import TitleBar
         self.title_bar = TitleBar(self)
         self.title_bar.findChild(QLabel, "settingsSubtitle").setText("Draw")
+        self.title_bar.findChild(QLabel, "settingsSubtitle").hide()
+        self.title_bar.title_label.setText("Draw")
         self.title_bar.minimize_btn.clicked.disconnect()
         self.title_bar.minimize_btn.clicked.connect(board.toggle_sidebar)
         self.title_bar.minimize_btn.setToolTip("Collapse / Expand drawing controls")
         self.title_bar.maximize_btn.hide()
-        self.title_bar.setFixedHeight(34)
+        self.title_bar.setFixedHeight(40)
         header = self.title_bar.layout()
-        header.setContentsMargins(12, 2, 8, 2)
-        header.setSpacing(8)
+        header.setContentsMargins(10, 2, 8, 2)
+        header.setSpacing(6)
         titles = header.itemAt(0).layout()
         titles.setDirection(QtWidgets.QBoxLayout.LeftToRight)
         titles.setSpacing(7)
         for button in (self.title_bar.minimize_btn, self.title_bar.close_btn):
             button.setFixedSize(24, 24)
         self.body_layout.addWidget(self.title_bar)
-        self.setMinimumWidth(740)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -4070,11 +4071,11 @@ class SketchboardWindow(QWidget):
         if checked:
             # Modo Navegación — el canvas ignora clicks, la toolbar sigue activa
             self.canvas.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-            self.toggle_mode_btn.setText("Navigate")
+            self.toggle_mode_btn.setText("Nav")
         else:
             # Modo Dibujo
             self.canvas.setAttribute(Qt.WA_TransparentForMouseEvents, False)
-            self.toggle_mode_btn.setText("Navigate")
+            self.toggle_mode_btn.setText("Nav")
         self.canvas.update()
 
     def toggle_dim(self, checked):
@@ -4084,10 +4085,10 @@ class SketchboardWindow(QWidget):
     def toggle_lock(self, checked):
         self.panel_locked = checked
         if checked:
-            self.lock_btn.setText("Unlock viewport")
+            self.lock_btn.setText("Unlock")
             self.lock_btn.setToolTip("Panel LOCKED - Click to unlock")
         else:
-            self.lock_btn.setText("Lock viewport")
+            self.lock_btn.setText("Lock")
             self.lock_btn.setToolTip("Panel FREE - Click to lock in this viewport")
 
 
@@ -4148,31 +4149,36 @@ class SketchboardWindow(QWidget):
         self.timeline = MayaTimelineSync(self.canvas.data)
 
         self.hud_wrapper = DrawControlsWindow(self, get_maya_main_window())
-        body = self.hud_wrapper.body_layout
         self.sidebar_widget = QFrame()
         self.sidebar_widget.setObjectName("drawTools")
         tools = QHBoxLayout(self.sidebar_widget)
-        tools.setContentsMargins(8, 0, 8, 4)
+        tools.setContentsMargins(0, 0, 0, 0)
         self.tool_panel = ToolPanel()
-        self.tool_panel.setFixedHeight(38)
+        self.tool_panel.setFixedHeight(36)
+        self.tool_panel.layout().setContentsMargins(0, 0, 0, 0)
+        self.tool_panel.layout().setSpacing(4)
+        self.tool_panel.size_slider.setFixedWidth(88)
         self.tool_panel.color_btn.setProperty("preserveMaterialStyle", True)
         tools.addWidget(self.tool_panel)
-        body.addWidget(self.sidebar_widget)
 
         self.status_bar_wrapper = QFrame()
         self.status_bar_wrapper.setObjectName("drawStatusBar")
         footer = QHBoxLayout(self.status_bar_wrapper)
         footer.setContentsMargins(0, 0, 0, 0)
-        footer.setSpacing(8)
-        self.toggle_mode_btn = QPushButton("Navigate")
+        footer.setSpacing(6)
+        self.toggle_mode_btn = QPushButton("Nav")
+        self.toggle_mode_btn.setFixedWidth(42)
         self.toggle_mode_btn.setCheckable(True)
         self.toggle_mode_btn.setToolTip("Let mouse clicks pass through to Maya")
         self.toggle_mode_btn.toggled.connect(self.toggle_passthrough)
         footer.addWidget(self.toggle_mode_btn)
-        self.dim_bg_btn = QCheckBox("Dim viewport")
+        self.dim_bg_btn = QCheckBox("Dim")
+        self.dim_bg_btn.setToolTip("Dim the viewport behind the drawing")
         self.dim_bg_btn.toggled.connect(self.toggle_dim)
         footer.addWidget(self.dim_bg_btn)
-        self.lock_btn = QPushButton("Lock viewport")
+        self.lock_btn = QPushButton("Lock")
+        self.lock_btn.setFixedWidth(56)
+        self.lock_btn.setToolTip("Keep drawing attached to the current viewport")
         self.lock_btn.setCheckable(True)
         self.lock_btn.toggled.connect(self.toggle_lock)
         footer.addWidget(self.lock_btn)
@@ -4183,15 +4189,16 @@ class SketchboardWindow(QWidget):
         self.status_bar.installEventFilter(self)
         footer.addWidget(self.status_bar)
         header = self.hud_wrapper.title_bar.layout()
-        header.takeAt(1)  # Replace the title bar's spacer with the compact options.
-        header.insertWidget(1, self.status_bar_wrapper, 1)
+        header.takeAt(1)  # Put tools and options beside the drag handle.
+        header.insertWidget(1, self.sidebar_widget)
+        header.insertWidget(2, self.status_bar_wrapper, 1)
         self.sidebar_toggle_btn = self.hud_wrapper.title_bar.minimize_btn
         self.close_overlay_btn = self.hud_wrapper.title_bar.close_btn
         polish_tool_widgets(self.hud_wrapper.container)
         self.hud_wrapper.setStyleSheet(COMPACT_STYLESHEET + """
             QLabel#settingsTitle { font-size: 12px; }
             QFrame#drawTools QPushButton[role="icon"]:checked {
-                background: rgba(22,127,240,80); border-color: #70b7ff;
+                background: rgba(22,127,240,80); border-color: #424242;
             }
         """)
         apply_window_style(self.hud_wrapper, polish=False, paint=False,

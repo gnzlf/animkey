@@ -60,7 +60,7 @@ THEMES = {
         "glow_color": "rgba(102, 153, 204, 0.1)",
         
         # Font
-        "font_family": "Segoe UI, Tahoma, sans-serif",
+        "font_family": "sans-serif",
         "font_size_small": "10px",
         "font_size_normal": "11px",
         "font_size_large": "13px",
@@ -85,6 +85,8 @@ class ThemeManager:
         """Returns the current theme dictionary with any custom overrides applied"""
         theme = THEMES.get(cls._current_theme, THEMES["maya_classic"]).copy()
         theme.update(cls._custom_overrides)
+        from AnimKey.mods.maya_compat import get_maya_font_family
+        theme["font_family"] = get_maya_font_family()
         return theme
     
     @classmethod

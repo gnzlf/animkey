@@ -65,6 +65,21 @@ source checkout was loaded instead, Update locates the existing Maya installatio
 and reloads that installed copy after upgrading or downgrading. The source
 checkout is kept untouched.
 
+### AnimKey 1.2.7
+
+- Unify the toolbar and floating tools with neutral grey glass, compact Brush
+  controls, a round Flash Buttons background and stronger button hover feedback.
+  Use Maya's own UI font and animate windows and slider menus upward on opening.
+- Keep the Selection Sets canvas transparent in Row and Board modes, including
+  resizing, new tabs and custom background images.
+- Restore Temp Controls group following and frame-by-frame baking, including
+  selected parent/child hierarchies. Organize the tool into Create, Controls and
+  Tools, with switches, a display-size slider and working tab navigation.
+- Move Temp Pivot options into its own window. Right clicks on Temp Controls
+  and Temp Pivot open their settings directly, without nested menus.
+- Fix Follow Cam viewport selection in split and four-panel layouts, even when
+  panels share a camera, and restore previous views when replacing a follow cam.
+
 ### AnimKey 1.2.6
 
 - Remove repeated GPU readbacks and blur work from window dragging and resizing.

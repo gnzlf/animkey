@@ -1,11 +1,12 @@
-"""Creation popup, persistent systems panel and menus for Temp Controls."""
+"""Creation and system settings windows for Temp Controls."""
 import json
 import os
 import maya.cmds as cmds
 import maya.api.OpenMaya as om
 
-from AnimKey.mods.maya_compat import QtCore, QtGui, QtWidgets, execute_qt, get_maya_main_window
-from AnimKey.mods.uiMod import ContextPopupWindow
+from AnimKey.mods.maya_compat import QtCore, QtGui, QtWidgets, get_maya_main_window
+from AnimKey.mods.uiMod import ContextPopupWindow, screen_available_geometry
+from AnimKey.core.settings_style import SettingsSwitch, WindowControl
 from AnimKey.buttons import tempControls as tc
 from AnimKey.core import temp_transform as tf
 from AnimKey.core import temp_shapes as shapes
@@ -20,94 +21,157 @@ def _run(callback,*args,**kwargs):
 
 
 class TempControlsWindow(ContextPopupWindow):
+    def _set_body_margins(self):
+        if self.layout():
+            self.layout().setContentsMargins(18,16,18,16)
+
     def __init__(self,anchor_button=None,panel=False):
         super().__init__(anchor_button=anchor_button,parent=get_maya_main_window())
         self.setObjectName("AnimKey_TempControls")
-        self.setWindowTitle("Temp Controls Panel" if panel else "Create Temp Control")
-        self.resize(410,620)
+        self.setWindowTitle("AnimKey Temp Controls")
+        self.resize(460,min(700,max(480,screen_available_geometry(self).height()-64)))
         self.callbacks = []
         self.refreshing = False
+        self._closed = False
+        self._appearance_signature = ()
+        self._appearance_base = {}
+        self._pending_system_selection = None
         self.saved_selection = [tf.NodeRef(n) for n in tf.transforms()]
+        self.refresh_timer = QtCore.QTimer(self)
+        self.refresh_timer.setSingleShot(True)
+        self.refresh_timer.timeout.connect(self.refresh)
         outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(12,16,12,20)
+        outer.setContentsMargins(18,16,18,16)
+        outer.setSpacing(12)
         header = QtWidgets.QHBoxLayout()
-        title = QtWidgets.QLabel("TEMP CONTROLS")
-        title.setStyleSheet("font-weight: bold; color: #5bc0be; font-size: 14px;")
-        header.addWidget(title)
+        titles = QtWidgets.QVBoxLayout()
+        titles.setSpacing(1)
+        title = QtWidgets.QLabel("Temp Controls")
+        title.setObjectName("settingsTitle")
+        titles.addWidget(title)
+        subtitle = QtWidgets.QLabel("AnimKey")
+        subtitle.setObjectName("settingsSubtitle")
+        titles.addWidget(subtitle)
+        header.addLayout(titles)
         header.addStretch()
-        close = QtWidgets.QPushButton("×")
-        close.setFixedSize(24,24)
+        close = WindowControl("close","Close",self)
         close.clicked.connect(self.close)
         header.addWidget(close)
         outer.addLayout(header)
         self.tabs = QtWidgets.QTabWidget()
-        outer.addWidget(self.tabs)
+        self.tabs.setObjectName("tempControlTabs")
+        outer.addWidget(self.tabs,1)
         self._creation_tab()
         self._panel_tab()
-        self.tabs.setCurrentIndex(1 if panel else 0)
-        self.status = QtWidgets.QLabel("Select rig controls in the order you want to control them.")
-        self.status.setWordWrap(True)
+        self._tools_tab()
+        outer.addWidget(self.finish_group)
+        self.status = self._note("Select rig controls in Maya to create a temporary control.")
         outer.addWidget(self.status)
+        self.tabs.currentChanged.connect(self._tab_changed)
+        self.tabs.setCurrentIndex(1 if panel else 0)
+        self._tab_changed()
         self.callbacks.append(om.MEventMessage.addEventCallback("SelectionChanged",self._selection_changed))
         for event in ("Undo","Redo"):
-            self.callbacks.append(om.MEventMessage.addEventCallback(event,self._defer_refresh))
+            self.callbacks.append(om.MEventMessage.addEventCallback(event,self._undo_refresh))
         for event in (om.MSceneMessage.kBeforeNew,om.MSceneMessage.kBeforeOpen):
             self.callbacks.append(om.MSceneMessage.addCallback(event,lambda *_: self.close()))
         self.refresh()
 
+    def _note(self,text):
+        label = QtWidgets.QLabel(text)
+        label.setProperty("muted",True)
+        label.setWordWrap(True)
+        return label
+
+    def _page(self,title):
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        layout.setContentsMargins(4,8,12,8)
+        layout.setSpacing(14)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setWidget(page)
+        self.tabs.addTab(scroll,title)
+        return layout
+
+    def _group(self,title,layout):
+        group = QtWidgets.QGroupBox(title)
+        body = QtWidgets.QVBoxLayout(group)
+        body.setContentsMargins(2,4,2,4)
+        body.setSpacing(8)
+        layout.addWidget(group)
+        return group,body
+
+    def _form(self,layout):
+        form = QtWidgets.QFormLayout()
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(8)
+        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        layout.addLayout(form)
+        return form
+
     def _combo(self,items):
         widget = QtWidgets.QComboBox()
         widget.addItems(items)
+        widget.setSizePolicy(QtWidgets.QSizePolicy.Expanding,QtWidgets.QSizePolicy.Fixed)
         return widget
 
-    def _button(self,title,callback,layout):
+    def _button(self,title,callback,layout,role=None):
         button = QtWidgets.QPushButton(title)
-        button.clicked.connect(lambda *_: self._action(callback))
+        if role:
+            button.setProperty("role",role)
+        button.clicked.connect(lambda *_:self._action(callback))
         layout.addWidget(button)
         return button
 
     def _action(self,callback):
+        if self.refreshing or self._closed:
+            return
         result = _run(callback)
         self.refresh()
         return result
 
     def _creation_tab(self):
-        tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab,"Create")
-        layout = QtWidgets.QVBoxLayout(tab)
-        form = QtWidgets.QFormLayout()
+        layout = self._page("Create")
+        _,setup = self._group("New control",layout)
+        form = self._form(setup)
         self.label = QtWidgets.QLineEdit()
-        self.label.setPlaceholderText("Optional Label")
+        self.label.setPlaceholderText("Automatic name")
         self.family = self._combo(tc.SYSTEMS)
+        form.addRow("System",self.family)
+        form.addRow("Name",self.label)
+        self.help = self._note("")
+        setup.addWidget(self.help)
+        _,space = self._group("Space",layout)
+        form = self._form(space)
         self.position = self._combo(tc.SPACES)
         self.orientation = self._combo(tc.SPACES)
-        self.lock_space = QtWidgets.QCheckBox("Link position and orientation")
+        form.addRow("Position",self.position)
+        form.addRow("Orientation",self.orientation)
+        self.lock_space = SettingsSwitch("Link position and orientation")
         self.lock_space.setChecked(True)
         self.orientation.setEnabled(False)
-        self.bake = self._combo(("Bake Keys","Bake Frames"))
-        if cmds.optionVar(exists="AnimKeyTempBakeFrames"):
-            self.bake.setCurrentIndex(int(bool(cmds.optionVar(query="AnimKeyTempBakeFrames"))))
-        self.bake.setToolTip("Keys: sample existing key times. Frames: sample every frame, including dependency animation.")
-        self.defaults = QtWidgets.QCheckBox("Reset Properties")
-        self.defaults.setToolTip("Recompute shape, size and orientation for this system instead of recalling saved appearance.")
+        space.addWidget(self.lock_space)
+        _,options = self._group("Options",layout)
+        self.sample_frames = SettingsSwitch("Preserve motion on every frame")
+        self.sample_frames.setChecked(True)
+        self.sample_frames.setToolTip("Recommended for animated parents and constraints. Turning this off samples existing keys only; the final Bake still preserves every frame.")
+        options.addWidget(self.sample_frames)
+        self.defaults = SettingsSwitch("Reset control appearance")
+        self.defaults.setToolTip("Use a fresh shape, size and orientation instead of the saved appearance.")
+        options.addWidget(self.defaults)
+        self.aim_row = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(self.aim_row)
+        form.setContentsMargins(0,0,0,0)
         self.distance = QtWidgets.QDoubleSpinBox()
         self.distance.setRange(0,100000)
         self.distance.setSpecialValueText("Automatic")
-        self.distance.setEnabled(False)
-        form.addRow("Label",self.label)
-        form.addRow("System",self.family)
-        form.addRow("Position",self.position)
-        form.addRow("Orientation",self.orientation)
-        form.addRow("",self.lock_space)
-        form.addRow("Baking",self.bake)
-        form.addRow("Aim Distance",self.distance)
-        form.addRow("",self.defaults)
-        layout.addLayout(form)
-        self.help = QtWidgets.QLabel()
-        self.help.setWordWrap(True)
-        layout.addWidget(self.help)
-        self._button("Create Temp Control",self._create,layout).setMinimumHeight(34)
+        form.addRow("Aim distance",self.distance)
+        options.addWidget(self.aim_row)
         layout.addStretch()
+        self._button("Create Temp Control",self._create,layout,"primary").setMinimumHeight(34)
         self.family.currentIndexChanged.connect(self._filter_spaces)
         self.position.currentIndexChanged.connect(self._position_changed)
         self.lock_space.toggled.connect(self._lock_changed)
@@ -121,12 +185,14 @@ class TempControlsWindow(ContextPopupWindow):
                 combo.model().item(i).setEnabled(i not in excluded)
             if combo.currentIndex() in excluded:
                 combo.setCurrentIndex(0)
-        self.distance.setEnabled(family == 2)
-        descriptions = ("One independent control per source.",
-                        "A master and a subcontrol per source. Master scale changes spacing.",
-                        "Base, Aim and Pole Vector controls, with IK and an animatable Twist channel.",
-                        "An ordered FK chain with World, Parent and Local orientation modes.")
-        self.help.setText(descriptions[family]+"\nRelative / Grab Release: the last selected object supplies the space. Object: follows the rig parent. Child: follows the original animation.")
+        self.aim_row.setVisible(family == 2)
+        descriptions = ("One independent control for each selected object.",
+                        "A master follows the group animation. Add offsets without losing the original movement.",
+                        "Base, Aim and Pole Vector controls with IK and an animatable Twist.",
+                        "An ordered FK chain with World, Parent or Local orientation.")
+        self.help.setText(descriptions[family])
+        for combo in (self.position,self.orientation):
+            combo.setToolTip("Relative / Grab Release uses the last selected object as the reference. Object follows the original parent; Child follows the original animation.")
 
     def _position_changed(self,index):
         if self.lock_space.isChecked():
@@ -141,77 +207,134 @@ class TempControlsWindow(ContextPopupWindow):
         nodes = [r.name() for r in self.saved_selection if r.name()]
         result = tc.create(node=nodes,name=self.label.text().strip() or None,system=self.family.currentIndex(),
                            positionSpace=self.position.currentIndex(),orientationSpace=self.orientation.currentIndex(),
-                           bake_frames=self.bake.currentIndex() == 1,aim_distance=self.distance.value() or None,
+                           bake_frames=self.sample_frames.isChecked(),aim_distance=self.distance.value() or None,
                            restoreDefaultProperties=self.defaults.isChecked())
         self.tabs.setCurrentIndex(1)
-        self.status.setText("Created {} system(s). Select a control to edit its properties.".format(len(result)))
+        self.refresh()
+        self.status.setText("Created {} system(s). Select controls in Maya to edit them individually.".format(len(result)))
         return result
 
     def _panel_tab(self):
-        tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab,"Systems")
-        layout = QtWidgets.QVBoxLayout(tab)
+        layout = self._page("Controls")
+        _,systems = self._group("Systems",layout)
         self.list = QtWidgets.QListWidget()
         self.list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        self.list.setMinimumHeight(110)
+        self.list.setFixedHeight(82)
+        self.list.setTextElideMode(QtCore.Qt.ElideMiddle)
+        self.list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.list.setToolTip("Choose one or more systems. Double click to select their controls in Maya.")
         self.list.itemDoubleClicked.connect(self._select_controls)
-        layout.addWidget(self.list)
         self.list.itemSelectionChanged.connect(self._system_selected)
-        actions = QtWidgets.QGridLayout()
-        for index,(title,callback) in enumerate((("Toggle + Bake",lambda:self._toggle(False)),("Toggle + Revert",lambda:self._toggle(True)),
-                                                ("Clear + Bake",lambda:self._clear(False)),("Clear + Revert",lambda:self._clear(True)))):
-            button = QtWidgets.QPushButton(title)
-            button.clicked.connect(lambda *_,cb=callback:self._action(cb))
-            actions.addWidget(button,index//2,index%2)
-        layout.addLayout(actions)
-        form = QtWidgets.QFormLayout()
+        systems.addWidget(self.list)
+        row = QtWidgets.QHBoxLayout()
+        self._button("Select controls",self._select_system_controls,row)
+        self._button("Refresh",self.refresh,row)
+        systems.addLayout(row)
+        self.enabled = SettingsSwitch("Enabled")
+        self.enabled.setObjectName("tempControlEnabled")
+        self.enabled.setToolTip("Turning off commits the visible motion to the rig. Enable Revert below to restore the original animation instead.")
+        self.enabled.toggled.connect(lambda checked:self._action(lambda:self._set_enabled(checked)))
+        systems.addWidget(self.enabled)
+        self.revert_mode = SettingsSwitch("Revert when disabling")
+        self.revert_mode.setToolTip("Off: bake the current result. On: restore the original animation without applying temporary edits.")
+        systems.addWidget(self.revert_mode)
+        self.appearance_group,appearance = self._group("Appearance",layout)
+        self.appearance_hint = self._note("Select a control in Maya, or edit all controls in the chosen systems.")
+        appearance.addWidget(self.appearance_hint)
+        size_row = QtWidgets.QHBoxLayout()
+        size_row.addWidget(QtWidgets.QLabel("Size"))
+        self.size_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.size_slider.setRange(25,300)
+        self.size_slider.setValue(100)
+        self.size_slider.setTracking(False)
+        self.size_slider.setFixedHeight(28)
+        self.size_slider.setAccessibleName("Control display size")
+        self.size_value = QtWidgets.QSpinBox()
+        self.size_value.setRange(25,300)
+        self.size_value.setSuffix(" %")
+        self.size_value.setValue(100)
+        self.size_value.setFixedWidth(76)
+        self.size_value.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.size_value.setKeyboardTracking(False)
+        self.size_value.setAlignment(QtCore.Qt.AlignCenter)
+        size_row.addWidget(self.size_slider,1)
+        size_row.addWidget(self.size_value)
+        appearance.addLayout(size_row)
+        self.size_slider.setToolTip("Display size relative to when these controls were selected. Rig transforms and animation are unchanged.")
+        self.size_slider.valueChanged.connect(self._size_changed)
+        self.size_value.valueChanged.connect(self._size_changed)
+        form = self._form(appearance)
+        self.shape = self._combo(shapes.NAMES)
+        self.shape_orientation = self._combo(["X {}  /  Y {}  /  Z {}".format(*angles) for angles in shapes.ORIENTATIONS])
+        self.shape.activated.connect(lambda i:self._appearance_changed(shape=i))
+        self.shape_orientation.activated.connect(lambda i:self._appearance_changed(orientation=i))
+        form.addRow("Shape",self.shape)
+        form.addRow("Orientation",self.shape_orientation)
+        self._button("Choose color...",self._color,appearance)
+        self.finish_group = QtWidgets.QWidget()
+        finish = QtWidgets.QHBoxLayout(self.finish_group)
+        finish.setContentsMargins(0,6,0,0)
+        self._button("Bake && Remove",lambda:self._clear(False),finish,"primary").setToolTip("Keep the visible animation on the rig and remove the selected temporary systems.")
+        self._button("Revert && Remove",lambda:self._clear(True),finish).setToolTip("Remove the selected temporary systems and restore their original animation.")
+        layout.addStretch()
+
+    def _tools_tab(self):
+        layout = self._page("Tools")
+        self.tools_hint = self._note("Tools apply to the systems selected in Controls. Select individual controls or rig members in Maya when needed.")
+        layout.addWidget(self.tools_hint)
+        self.space_group,space = self._group("Change space",layout)
+        form = self._form(space)
         self.panel_position = self._combo(tc.SPACES)
         self.panel_orientation = self._combo(tc.SPACES)
         self.chain_orientation = self._combo(("World","Parent","Local"))
         form.addRow("Position",self.panel_position)
         form.addRow("Orientation",self.panel_orientation)
-        form.addRow("FK Orientation",self.chain_orientation)
+        form.addRow("FK orientation",self.chain_orientation)
+        self.chain_label = form.labelForField(self.chain_orientation)
         self.chain_orientation.currentIndexChanged.connect(self._chain_orientation)
-        layout.addLayout(form)
-        self._button("Apply Spaces (preserve keyed poses)",self._change_spaces,layout)
-        appearance = QtWidgets.QHBoxLayout()
-        for title,callback in (("Size −",lambda:tc.appearance(size_percent=-10)),("Size +",lambda:tc.appearance(size_percent=10)),
-                               ("Shape",lambda:tc.appearance(shape_step=1)),("Orient",lambda:tc.appearance(orientation_step=1)),("Color",self._color)):
-            self._button(title,callback,appearance)
-        layout.addLayout(appearance)
-        extras = QtWidgets.QHBoxLayout()
-        self._button("Add Parent",lambda:tc.add_extra(parent=True),extras)
-        self._button("Add Child",tc.add_extra,extras)
-        self._button("Remove Extra",tc.remove_extra,extras)
-        layout.addLayout(extras)
-        pivot = QtWidgets.QHBoxLayout()
-        self._button("Edit Pivot / Finish",tc.edit_pivot,pivot)
-        self._button("Reset Pivot",tc.reset_pivot,pivot)
-        layout.addLayout(pivot)
-        membership = QtWidgets.QHBoxLayout()
-        for label,action in (("Add Member","add"),("Remove Member","remove"),("↑","up"),("↓","down"),("Reverse","reverse")):
-            self._button(label,lambda a=action:tc.edit_members(a),membership)
-        layout.addLayout(membership)
-        grab = QtWidgets.QHBoxLayout()
-        self._button("Add Grab",lambda:self._grab("grab"),grab)
-        self._button("Release",lambda:self._grab("release"),grab)
-        self._button("Remove",lambda:self._grab("remove"),grab)
-        self._button("Normalize",lambda:self._grab("normalize"),grab)
-        layout.addLayout(grab)
-        self.transitions = QtWidgets.QLabel("Grab Release: no transitions")
-        self.transitions.setWordWrap(True)
-        layout.addWidget(self.transitions)
-        files = QtWidgets.QHBoxLayout()
-        self._button("Import Setup",lambda:import_setup(),files)
-        self._button("Export Setup",lambda:export_setup(self._systems()),files)
-        self._button("Refresh",self.refresh,files)
-        layout.addLayout(files)
+        self._button("Apply space",self._change_spaces,space)
+        self.extra_group,extras = self._group("Extra controls && pivots",layout)
+        row = QtWidgets.QHBoxLayout()
+        self._button("Add parent",lambda:self._control_action(lambda:tc.add_extra(parent=True)),row)
+        self._button("Add child",lambda:self._control_action(tc.add_extra),row)
+        self._button("Remove extra",lambda:self._control_action(tc.remove_extra),row)
+        extras.addLayout(row)
+        row = QtWidgets.QHBoxLayout()
+        self._button("Edit pivot / Finish",self._edit_pivot,row)
+        self._button("Reset pivot",lambda:self._control_action(tc.reset_pivot),row)
+        extras.addLayout(row)
+        self.members_group,membership = self._group("Group / FK members",layout)
+        row = QtWidgets.QHBoxLayout()
+        for label,action in (("Add","add"),("Remove","remove"),("Up","up"),("Down","down"),("Reverse","reverse")):
+            self._button(label,lambda a=action:self._edit_members(a),row)
+        membership.addLayout(row)
+        self.grab_group,grab = self._group("Grab && release",layout)
+        row = QtWidgets.QHBoxLayout()
+        self._button("Grab",lambda:self._grab("grab"),row)
+        self._button("Release",lambda:self._grab("release"),row)
+        self._button("Remove",lambda:self._grab("remove"),row)
+        grab.addLayout(row)
+        row = QtWidgets.QHBoxLayout()
+        self.y_up = SettingsSwitch("Keep Y up")
+        row.addWidget(self.y_up)
+        self._button("Normalize",lambda:self._grab("normalize"),row)
+        grab.addLayout(row)
+        self.transitions = self._note("No transitions")
+        grab.addWidget(self.transitions)
+        _,files = self._group("Setup files",layout)
+        row = QtWidgets.QHBoxLayout()
+        self._button("Import...",import_setup,row)
+        self.export_button = self._button("Export...",lambda:export_setup(self._systems()),row)
+        files.addLayout(row)
+        self.legacy_recovery = self._button("Recover legacy controls...",self._recover_legacy,files)
+        layout.addStretch()
 
     def _systems(self):
         return [item.data(QtCore.Qt.UserRole) for item in self.list.selectedItems()] or tc.selected_systems()
 
-    def _toggle(self,revert):
-        tc.toggle(self._systems(),revert=revert)
+    def _set_enabled(self,enabled):
+        for system in self._systems():
+            tc.set_enabled(system,enabled,revert=self.revert_mode.isChecked())
 
     def _clear(self,revert):
         tc.clear(self._systems(),revert=revert)
@@ -219,90 +342,215 @@ class TempControlsWindow(ContextPopupWindow):
     def _select_controls(self,item):
         cmds.select(tc.controls(item.data(QtCore.Qt.UserRole)),replace=True)
 
+    def _select_system_controls(self):
+        nodes = [n for system in self._systems() for n in tc.controls(system)]
+        if nodes:
+            cmds.select(nodes,replace=True)
+
+    def _appearance_nodes(self):
+        available = [n for system in self._systems() for n in tc.controls(system)]
+        selected = set(tc.selected_controls())
+        return [n for n in available if n in selected] or available
+
+    def _control_action(self,callback):
+        nodes = self._appearance_nodes()
+        if not nodes:
+            raise ValueError("Choose a system in Controls first.")
+        cmds.select(nodes,replace=True)
+        return callback()
+
+    def _edit_pivot(self):
+        if tc._pivot_edit:
+            return tc.edit_pivot()
+        return self._control_action(tc.edit_pivot)
+
+    def _edit_members(self,action):
+        systems = self._systems()
+        if len(systems) != 1:
+            raise ValueError("Choose one Group or FK system in Controls first.")
+        cmds.select(tf.transforms()+systems,replace=True)
+        return tc.edit_members(action)
+
+    def _appearance_changed(self,**properties):
+        if self.refreshing:
+            return
+        self._action(lambda:self._apply_appearance(**properties))
+
+    def _apply_appearance(self,**properties):
+        def apply(nodes):
+            for node in nodes:
+                shapes.apply(node,**properties)
+        self._edit_shapes(apply,"AnimKey Control Appearance")
+
+    def _edit_shapes(self,callback,label):
+        nodes = self._appearance_nodes()
+        previous = cmds.ls(selection=True,long=True) or []
+        self.refreshing = True
+        try:
+            with tf.undo_chunk(label):
+                try:
+                    callback(nodes)
+                finally:
+                    remaining = [n for n in previous if cmds.objExists(n)]
+                    cmds.select(remaining,replace=True) if remaining else cmds.select(clear=True)
+        finally:
+            self.refreshing = False
+
+    def _size_changed(self,value):
+        if self.refreshing:
+            return
+        for widget in (self.size_slider,self.size_value):
+            blocked = widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(blocked)
+        def apply(nodes):
+            for node in nodes:
+                identity = cmds.ls(node,uuid=True)[0]
+                base = self._appearance_base.get(identity,cmds.getAttr(node+'.shapeSize')[0])
+                shapes.apply(node,size=[v*value/100. for v in base])
+        self._action(lambda:self._edit_shapes(apply,"AnimKey Control Display Size"))
+
     def _color(self):
-        color = QtWidgets.QColorDialog.getColor(QtGui.QColor("#33d9bf"),self,"Temp Control Color")
+        nodes = self._appearance_nodes()
+        if not nodes:
+            return
+        rgb = [float(v) for v in tf.string(nodes[0],"shapeColor").split(",")]
+        color = QtWidgets.QColorDialog.getColor(QtGui.QColor.fromRgbF(*rgb),self,"Control color")
         if color.isValid():
-            tc.appearance(color=(color.redF(),color.greenF(),color.blueF()))
+            self._apply_appearance(color=(color.redF(),color.greenF(),color.blueF()))
 
     def _change_spaces(self):
         selected = tf.transforms()
-        systems = self._systems()
         mode = self.panel_position.currentIndex()
         orientation = self.panel_orientation.currentIndex()
         relative = selected[-1] if selected and (2 in (mode,orientation)) else None
-        tc.change_space(systems,mode,orientation,relative=relative)
+        tc.change_space(self._systems(),mode,orientation,relative=relative)
 
     def _chain_orientation(self,index):
         if self.refreshing:
             return
-        with tf.undo_chunk("AnimKey FK Orientation"):
-            for system in self._systems():
-                if cmds.getAttr(system+".systemID") == 3:
-                    nodes = tc.controls(system)
-                    samples = tf.capture(nodes,tf.times(nodes,frames=cmds.getAttr(system+".bakeFrames")))
-                    cmds.setAttr(system+".chainOrientation",index)
-                    tc._apply_control_samples(nodes,samples)
+        def apply():
+            with tf.undo_chunk("AnimKey FK Orientation"):
+                for system in self._systems():
+                    if cmds.getAttr(system+".systemID") == 3:
+                        nodes = tc.controls(system)
+                        samples = tf.capture(nodes,tf.times(nodes,frames=cmds.getAttr(system+".bakeFrames")))
+                        cmds.setAttr(system+".chainOrientation",index)
+                        tc._apply_control_samples(nodes,samples)
+        self._action(apply)
 
     def _grab(self,action):
         selected = tf.transforms()
-        systems = self._systems()
         driver = selected[-1] if selected and action == "grab" else None
         if action == "grab" and not driver:
-            raise ValueError("Select a system in the panel and an external driver in Maya.")
-        for system in systems:
-            tc.grab(system,driver=driver,remove=action == "remove",normalise=action == "normalize")
+            raise ValueError("Select a system in Controls and an external driver in Maya.")
+        for system in self._systems():
+            tc.grab(system,driver=driver,remove=action == "remove",normalise=action == "normalize",
+                    y_up=self.y_up.isChecked() and action == "normalize")
+
+    def _recover_legacy(self):
+        from AnimKey.buttons import tempControlsLegacy
+        return tempControlsLegacy.show(anchor_button=self.anchor_button)
+
+    def _tab_changed(self,*_):
+        self.finish_group.setVisible(self.tabs.currentIndex() == 1)
+        self._defer_refresh()
+
+    def _undo_refresh(self,*_):
+        self._appearance_signature = None
+        self._defer_refresh()
 
     def _selection_changed(self,*_):
-        if self.refreshing:
+        if self.refreshing or self._closed:
             return
         nodes = tf.transforms()
-        if nodes and not tc.selected_systems(nodes):
+        systems = tc.selected_systems(nodes)
+        if systems:
+            self._pending_system_selection = set(systems)
+        elif nodes:
             self.saved_selection = [tf.NodeRef(n) for n in nodes]
         self._defer_refresh()
 
     def _defer_refresh(self,*_):
-        QtCore.QTimer.singleShot(0,self.refresh)
+        if not self._closed:
+            self.refresh_timer.start(0)
 
     def _system_selected(self):
-        systems = self._systems()
-        if not systems or self.refreshing:
+        if self.refreshing or self._closed:
             return
-        system = systems[0]
+        self._pending_system_selection = None
+        systems = self._systems()
         self.refreshing = True
         try:
-            family = cmds.getAttr(system+".systemID")
-            excluded = (1,4) if family == 1 else (4,) if family == 3 else ()
-            for combo,attr in ((self.panel_position,"positionSpace"),(self.panel_orientation,"orientationSpace")):
-                for i in range(6):
-                    combo.model().item(i).setEnabled(i not in excluded)
-                combo.setCurrentIndex(cmds.getAttr(system+"."+attr))
-            self.chain_orientation.setEnabled(family == 3)
-            self.chain_orientation.setCurrentIndex(cmds.getAttr(system+".chainOrientation"))
-            self.transitions.setText("Grab Release: " + (" · ".join("{}: {}".format(cmds.getAttr(e+".frame"),tc._first(e,"driver") or "World")
-                                                         for e in tc._grab_events(system) if cmds.getAttr(e+".frame") > -1000000) or "no transitions"))
+            self.enabled.setEnabled(bool(systems))
+            self.revert_mode.setEnabled(bool(systems))
+            states = [bool(cmds.getAttr(s+".isEnabled")) for s in systems]
+            self.enabled.setText("Enabled (mixed selection)" if len(set(states)) > 1 else "Enabled")
+            self.enabled.setChecked(bool(states) and all(states))
+            for group in (self.appearance_group,self.finish_group,self.space_group,self.extra_group,self.grab_group):
+                group.setEnabled(bool(systems))
+            self.export_button.setEnabled(bool(systems))
+            families = [cmds.getAttr(s+".systemID") for s in systems]
+            self.members_group.setVisible(any(f in (1,3) for f in families))
+            self.members_group.setEnabled(len(systems) == 1 and families[0] in (1,3))
+            self.chain_orientation.setVisible(families == [3])
+            self.chain_label.setVisible(families == [3])
+            self.tools_hint.setText("Selected: "+", ".join(s.rsplit('|',1)[-1] for s in systems) if systems else "Choose a system in Controls. Import is available below.")
+            if systems:
+                system = systems[0]
+                excluded = set().union(*[(1,4) if f == 1 else (4,) if f == 3 else () for f in families])
+                for combo,attr in ((self.panel_position,"positionSpace"),(self.panel_orientation,"orientationSpace")):
+                    for i in range(6):
+                        combo.model().item(i).setEnabled(i not in excluded)
+                    combo.setCurrentIndex(cmds.getAttr(system+"."+attr))
+                self.chain_orientation.setEnabled(families == [3])
+                self.chain_orientation.setCurrentIndex(cmds.getAttr(system+".chainOrientation"))
+                self.transitions.setText(" / ".join("{}: {}".format(cmds.getAttr(e+".frame"),tc._first(e,"driver") or "World")
+                                                  for e in tc._grab_events(system) if cmds.getAttr(e+".frame") > -1000000) or "No transitions")
+            nodes = self._appearance_nodes()
+            signature = tuple(sorted(cmds.ls(nodes,uuid=True) or [])) if nodes else ()
+            if signature != self._appearance_signature:
+                self._appearance_signature = signature
+                self._appearance_base = {cmds.ls(n,uuid=True)[0]:cmds.getAttr(n+'.shapeSize')[0] for n in nodes}
+                self.size_slider.setValue(100)
+                self.size_value.setValue(100)
+            self.appearance_hint.setText("Editing {} control(s). Size affects display only.".format(len(nodes)))
+            if nodes:
+                self.shape.setCurrentIndex(cmds.getAttr(nodes[0]+'.shapeIndex'))
+                self.shape_orientation.setCurrentIndex(cmds.getAttr(nodes[0]+'.shapeOrientation'))
         finally:
             self.refreshing = False
 
     def refresh(self,*_):
-        if self.refreshing or not self.isVisible() and not self.list:
+        if self.refreshing or self._closed:
             return
         prior = set(self._systems())
+        if self._pending_system_selection is not None:
+            prior = self._pending_system_selection
+        self._pending_system_selection = None
         self.refreshing = True
         try:
+            self.legacy_recovery.setVisible(bool(cmds.ls("*.tempTag",objectsOnly=True)))
             self.list.clear()
             for system in tc.all_systems():
                 active = cmds.getAttr(system+".isEnabled")
-                title = "{}  {} · {}".format("●" if active else "○",system.rsplit("|",1)[-1],tc.SYSTEMS[cmds.getAttr(system+".systemID")])
+                title = "{}  -  {}  /  {}".format(system.rsplit("|",1)[-1],tc.SYSTEMS[cmds.getAttr(system+".systemID")],"On" if active else "Off")
                 item = QtWidgets.QListWidgetItem(title)
                 item.setData(QtCore.Qt.UserRole,system)
-                item.setForeground(QtGui.QColor("#5bc0be" if active else "#999999"))
+                item.setToolTip(system)
                 self.list.addItem(item)
                 item.setSelected(system in prior)
         finally:
             self.refreshing = False
         self._system_selected()
+        if self.tabs.currentIndex() == 0:
+            self.status.setText("{} rig object(s) selected. Select them in Maya in the desired order.".format(len([r for r in self.saved_selection if r.name()])))
+        else:
+            self.status.setText("{} system(s) selected. Appearance changes affect display only.".format(len(self._systems())))
 
     def closeEvent(self,event):
+        self._closed = True
+        self.refresh_timer.stop()
         for callback in self.callbacks:
             try:
                 om.MMessage.removeCallback(callback)
@@ -393,50 +641,5 @@ def _quick_path():
 
 
 def show_menu(button=None,pos=None):
-    menu = QtWidgets.QMenu(button)
-    def action(label,callback):
-        menu.addAction(label,lambda:_run(callback))
-    bake = menu.addMenu("Baking Mode")
-    for label,value in (("Bake Keys",0),("Bake Frames",1)):
-        item = bake.addAction(label)
-        item.setCheckable(True)
-        preference = cmds.optionVar(query="AnimKeyTempBakeFrames") if cmds.optionVar(exists="AnimKeyTempBakeFrames") else 0
-        item.setChecked(preference == value)
-        item.triggered.connect(lambda *_,v=value:cmds.optionVar(intValue=("AnimKeyTempBakeFrames",v)))
-    menu.addSeparator()
-    for index,name in enumerate(tc.SPACES):
-        action(name+" Space",lambda i=index:tc.create(space=i,bake_frames=bool(cmds.optionVar(query="AnimKeyTempBakeFrames")) if cmds.optionVar(exists="AnimKeyTempBakeFrames") else False))
-    menu.addSeparator()
-    action("Quick Import",lambda:import_setup(_quick_path()))
-    action("Quick Export",lambda:export_setup(path=_quick_path()))
-    action("Import Setup…",import_setup)
-    action("Export Setup…",export_setup)
-    menu.addSeparator()
-    action("Toggle and Revert",lambda:tc.toggle(revert=True))
-    action("Toggle and Bake",lambda:tc.toggle(revert=False))
-    action("Clear and Revert",lambda:tc.clear(revert=True))
-    action("Clear and Bake",lambda:tc.clear(revert=False))
-    menu.addSeparator()
-    anim = menu.addMenu("Anim Controls")
-    for label,callback in (("Increase Size",lambda:tc.appearance(size_percent=10)),("Decrease Size",lambda:tc.appearance(size_percent=-10)),
-                           ("Next Shape",lambda:tc.appearance(shape_step=1)),("Next Orientation",lambda:tc.appearance(orientation_step=1)),
-                           ("Add Child Control",tc.add_extra),("Add Parent Control",lambda:tc.add_extra(parent=True)),("Remove Control",tc.remove_extra)):
-        anim.addAction(label,lambda *_,cb=callback:_run(cb))
-    anim.addAction("Edit Pivot / Finish",lambda:_run(tc.edit_pivot))
-    anim.addAction("Reset Pivot",lambda:_run(tc.reset_pivot))
-    gr = menu.addMenu("Grab Release")
-    for label,kwargs in (("Add Grab",{}),("Add Release",{"driver":None}),("Remove Grab",{"remove":True}),
-                         ("Normalize Transitions",{"normalise":True}),("Normalize Y Up",{"normalise":True,"y_up":True})):
-        def apply_gr(options=kwargs,title=label):
-            systems = tc.selected_systems()
-            options = dict(options)
-            if title == "Add Grab":
-                selected = tf.transforms()
-                options["driver"] = selected[-1] if selected else None
-            for system in systems:
-                tc.grab(system,**options)
-        gr.addAction(label,lambda *_,cb=apply_gr:_run(cb))
-    action("Temp Controls Panel",lambda:tc.show(button=button,panel=True))
-    if cmds.ls("*.tempTag",objectsOnly=True):
-        action("Recover Legacy Temp Controls…",lambda:__import__("AnimKey.buttons.tempControlsLegacy",fromlist=["show"]).show(anchor_button=button))
-    execute_qt(menu,button.mapToGlobal(pos) if button is not None and pos is not None else QtGui.QCursor.pos())
+    """Compatibility hook: right click opens the complete settings window."""
+    return tc.show(button=button,panel=bool(tc.selected_systems()))

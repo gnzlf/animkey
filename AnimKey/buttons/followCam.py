@@ -164,7 +164,7 @@ def _is_model_panel(panel):
 
 
 def _active_3d_view_context():
-    """Return the last Maya 3D view's panel and camera, if available."""
+    """Resolve the active view by widget identity, even with shared cameras."""
     panel = None
     camera = None
     try:
@@ -172,20 +172,54 @@ def _active_3d_view_context():
         camera_path = view.getCamera()
         if camera_path and camera_path.isValid():
             camera = camera_path.fullPathName()
-
-        # The active M3dView survives focus moving from the viewport to the
-        # AnimKey toolbar.  Resolve its QWidget back to the owning modelPanel
-        # when Maya exposes the control path.
-        try:
-            widget_ptr = view.widget()
-            control = omui1.MQtUtil.fullName(int(widget_ptr)) if widget_ptr else None
-            if control:
-                panel = cmds.getPanel(containing=control)
-        except Exception:
-            panel = None
+        widget_ptr = view.widget()
+        if widget_ptr:
+            # A camera can be displayed in several viewports. Its DAG path
+            # cannot identify which one was used before clicking the toolbar.
+            for candidate in cmds.getPanel(type="modelPanel") or []:
+                try:
+                    candidate_view = omui2.M3dView.getM3dViewFromModelPanel(candidate)
+                    if int(candidate_view.widget()) == int(widget_ptr):
+                        panel = candidate
+                        break
+                except Exception:
+                    continue
+            if not panel:
+                # Maya can append an unnamed Qt child to this path. Strip the
+                # trailing separator before asking which panel owns it.
+                control = omui1.MQtUtil.fullName(int(widget_ptr))
+                if control:
+                    panel = cmds.getPanel(containing=control.rstrip("|"))
     except Exception:
         pass
     return (panel if _is_model_panel(panel) else None), _camera_transform(camera)
+
+
+def _visible_model_panels():
+    """Use live view visibility when Maya's pane-layout cache is stale."""
+    try:
+        reported = [p for p in (cmds.getPanel(visiblePanels=True) or []) if _is_model_panel(p)]
+    except Exception:
+        reported = []
+    try:
+        panels = list(cmds.getPanel(type="modelPanel") or [])
+    except Exception:
+        panels = list(reported)
+    visible = []
+    for panel in panels:
+        shown = None
+        if not cmds.about(batch=True):
+            try:
+                from AnimKey.mods.maya_compat import QtWidgets, wrap_instance
+                view = omui2.M3dView.getM3dViewFromModelPanel(panel)
+                pointer = view.widget()
+                if pointer and QtWidgets.QApplication.instance():
+                    shown = wrap_instance(int(pointer),QtWidgets.QWidget).isVisible()
+            except Exception:
+                pass
+        if shown is True or (shown is None and panel in reported):
+            visible.append(panel)
+    return visible
 
 
 def _is_perspective_panel(panel):
@@ -202,80 +236,42 @@ def _is_perspective_panel(panel):
 
 
 def _get_active_panel():
-    """Return the viewport used immediately before the toolbar was clicked."""
+    """Return the visible viewport used immediately before the toolbar."""
     global _last_model_panel
+    visible = _visible_model_panels()
+    if not visible:
+        return None
 
-    direct_candidates = []
-    for query in (
-        lambda: cmds.getPanel(withFocus=True),
-        lambda: cmds.getPanel(underPointer=True),
-    ):
+    for query in (lambda:cmds.getPanel(underPointer=True),
+                  lambda:cmds.getPanel(withFocus=True)):
         try:
             panel = query()
-            if panel and panel not in direct_candidates:
-                direct_candidates.append(panel)
+            if panel in visible:
+                _last_model_panel = panel
+                return panel
         except Exception:
             pass
 
-    for panel in direct_candidates:
-        if _is_model_panel(panel):
-            _last_model_panel = panel
-            return panel
+    active_panel, active_camera = _active_3d_view_context()
+    if active_panel in visible:
+        _last_model_panel = active_panel
+        return active_panel
 
-    # Clicking a toolbar usually removes both focus and pointer from the
-    # modelPanel.  M3dView still remembers the viewport the animator last used.
-    active_view_panel, active_view_camera = _active_3d_view_context()
-    if active_view_panel:
-        _last_model_panel = active_view_panel
-        return active_view_panel
+    matches = [p for p in visible if active_camera and _same_node(_panel_camera(p),active_camera)]
+    # Camera matching is safe only when it identifies exactly one viewport.
+    if len(matches) == 1:
+        _last_model_panel = matches[0]
+        return matches[0]
+    if _last_model_panel in visible:
+        return _last_model_panel
 
-    visible = []
-    try:
-        visible.extend([
-            panel for panel in (cmds.getPanel(visiblePanels=True) or [])
-            if _is_model_panel(panel) and panel not in visible
-        ])
-    except Exception:
-        pass
-
-    # Some Maya layouts do not let MQtUtil resolve the panel name.  Match the
-    # active M3dView camera instead; this correctly selects the perspective or
-    # shot-camera panel rather than modelPanel1 (usually Top view).
-    if active_view_camera:
-        for panel in visible:
-            if _same_node(_panel_camera(panel), active_view_camera):
-                _last_model_panel = panel
-                return panel
-
-    if _last_model_panel and _is_model_panel(_last_model_panel):
-        if not visible or _last_model_panel in visible:
-            return _last_model_panel
-
-    # A toolbar click in the standard four-view layout used to fall through to
-    # the first visible panel, which is commonly an orthographic view.  Prefer
-    # the visible perspective/shot-camera view for the natural FollowCam flow.
-    for panel in visible:
+    candidates = matches or visible
+    for panel in candidates:
         if _is_perspective_panel(panel):
             _last_model_panel = panel
             return panel
-
-    candidates = list(visible)
-    try:
-        candidates.extend([
-            panel for panel in (cmds.getPanel(type="modelPanel") or [])
-            if panel not in candidates
-        ])
-    except Exception:
-        pass
-
-    for panel in candidates:
-        try:
-            if _is_model_panel(panel):
-                _last_model_panel = panel
-                return panel
-        except Exception:
-            continue
-    return None
+    _last_model_panel = candidates[0]
+    return candidates[0]
 
 
 def _long_name(node):
@@ -447,6 +443,20 @@ def _panel_camera(panel):
         return None
 
 
+def _restore_panel_cameras(roots):
+    """Restore only panels actually looking through a camera being removed."""
+    panels = cmds.getPanel(type="modelPanel") or []
+    for root in roots:
+        original = _camera_transform(_message_source(root,ORIGINAL_CAMERA_ATTR))
+        original = original or _camera_transform(_original_camera) or _camera_transform("persp")
+        cameras = _follow_cameras(root)
+        if not original:
+            continue
+        for panel in panels:
+            if any(_same_node(_panel_camera(panel),camera) for camera in cameras):
+                cmds.lookThru(panel,original)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #                           MAIN FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -500,15 +510,17 @@ def create_follow_cam(translation=True, rotation=True, *args):
             cmds.warning("AnimKey: Select a rig control, not the existing Follow Cam.")
             return None
 
-    _original_camera = source_camera
-    _original_panel = panel
     created_root = None
     follow_cam = None
 
     cmds.undoInfo(openChunk=True, chunkName="AnimKey_FollowCam")
     try:
         if old_roots:
+            _restore_panel_cameras(old_roots)
             cmds.delete(old_roots)
+
+        _original_camera = source_camera
+        _original_panel = panel
 
         _create_animkey_container()
         temp_container = _create_temp_container()
@@ -637,6 +649,7 @@ def create_follow_cam(translation=True, rotation=True, *args):
     except Exception as exc:
         if created_root and cmds.objExists(created_root):
             try:
+                _restore_panel_cameras([created_root])
                 cmds.delete(created_root)
             except Exception:
                 pass
@@ -682,46 +695,9 @@ def remove_follow_cam(*args):
         cmds.warning("AnimKey: No Follow Cam in the scene.")
         return False
 
-    panels = cmds.getPanel(type="modelPanel") or []
-    for candidate in (
-        _original_panel,
-        _get_active_panel(),
-    ):
-        if candidate and candidate not in panels:
-            panels.append(candidate)
-    for root in roots:
-        candidate = _stored_panel(root)
-        if candidate and candidate not in panels:
-            panels.append(candidate)
-    restored_panels = set()
-    for root in roots:
-        original = _camera_transform(_message_source(root, ORIGINAL_CAMERA_ATTR))
-        original = original or _camera_transform(_original_camera) or _camera_transform("persp")
-        follow_cameras = _follow_cameras(root)
-        for panel in panels:
-            current = _panel_camera(panel)
-            if any(_same_node(current, camera) for camera in follow_cameras):
-                if original:
-                    try:
-                        cmds.lookThru(panel, original)
-                        restored_panels.add(panel)
-                    except Exception:
-                        pass
-
-        stored_panel = _stored_panel(root)
-        if (
-            not restored_panels
-            and stored_panel
-            and original
-        ):
-            try:
-                cmds.lookThru(stored_panel, original)
-                restored_panels.add(stored_panel)
-            except Exception:
-                pass
-
     cmds.undoInfo(openChunk=True, chunkName="AnimKey_RemoveFollowCam")
     try:
+        _restore_panel_cameras(roots)
         cmds.delete(roots)
     finally:
         cmds.undoInfo(closeChunk=True)

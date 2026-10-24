@@ -102,6 +102,22 @@ def get_maya_main_window():
         return None
 
 
+def get_maya_font():
+    """Copy Maya's native UI font without changing application preferences."""
+    window = get_maya_main_window()
+    if window is not None:
+        return QtGui.QFont(window.font())
+    app = QtWidgets.QApplication.instance()
+    return QtGui.QFont(app.font()) if isinstance(app,QtGui.QGuiApplication) else QtGui.QFont()
+
+
+def get_maya_font_family():
+    font = get_maya_font()
+    if isinstance(QtWidgets.QApplication.instance(),QtGui.QGuiApplication):
+        return QtGui.QFontInfo(font).family()
+    return font.family() or "sans-serif"
+
+
 def is_qt_object_valid(widget):
     """Safely test a wrapped QObject after Maya has closed or deleted it."""
     if widget is None:

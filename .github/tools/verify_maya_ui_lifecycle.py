@@ -28,6 +28,35 @@ assert Path(toolbar.__file__).resolve() == SOURCE/'AnimKey/core/toolbar.py'
 report = {'events': [], 'passed': False, 'source': str(toolbar.__file__), 'materials': []}
 state = {'cycle': 0, 'window': None, 'scene': None}
 
+
+class EntranceTrace(QtCore.QObject):
+    """Record actual paint offsets and capture timing in Maya's event loop."""
+    def __init__(self, window):
+        super().__init__(window)
+        self.window = window
+        self.offsets = []
+        self.capture_counts = []
+        self.done = False
+        window.installEventFilter(self)
+        window._window_reveal._animation.finished.connect(self.finish)
+
+    def record(self):
+        reveal = self.window._window_reveal
+        if reveal._target is not None:
+            self.offsets.append(self.window.y() - reveal._target.y())
+            self.capture_counts.append(self.window._material_surface._capture_count)
+
+    def finish(self):
+        self.record()
+        self.done = True
+
+    def eventFilter(self, watched, event):
+        if not self.done:
+            kind = event.type()
+            if kind == QtCore.QEvent.Paint or (kind == QtCore.QEvent.Move and watched._window_reveal.applying):
+                self.record()
+        return False
+
 def scene_stamp():
     return {'selection': cmds.ls(sl=True, long=True),
             'time': cmds.currentTime(q=True),
@@ -53,12 +82,13 @@ def finish(error=None):
         cmds.deleteUI(toolbar.WORKSPACE_NAME, control=True)
     report['runtime_cleanup_complete'] = True
     (OUTPUT/'result.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
-    QtCore.QTimer.singleShot(500, lambda: cmds.quit(force=True))
+    # Leave the Qt timeout callback before Maya destroys the application tree.
+    QtCore.QTimer.singleShot(500, lambda: maya.utils.executeDeferred(lambda: cmds.quit(force=True)))
 
 def step():
     try:
         cycle = state['cycle']
-        if cycle == 20:
+        if cycle == int(os.environ.get('ANIMKEY_LIFECYCLE_CYCLES', '20')):
             return finish()
         bar = toolbar.animkey_toolbar
         if getattr(bar, '_reload_pending', False):
@@ -70,6 +100,8 @@ def step():
                    animCleaner.AnimCleanerWindow, tempControlsUI.TempControlsWindow)[cycle % 5]
         window = factory()
         state['window'] = window
+        if os.environ.get('ANIMKEY_TEST_OPEN_MATERIAL') == '1':
+            state['entrance'] = EntranceTrace(window)
         if os.environ.get('ANIMKEY_TEST_PORTABLE_GLASS') == '1':
             window.setProperty('forcePortableMaterial', True)
         window.show()
@@ -89,6 +121,17 @@ def step():
 def start_motion():
     try:
         surface = state['window']._material_surface
+        if os.environ.get('ANIMKEY_TEST_OPEN_MATERIAL') == '1':
+            entrance = state['entrance']
+            if not entrance.done and state.get('entrance_waits', 0) < 30:
+                state['entrance_waits'] = state.get('entrance_waits', 0) + 1
+                QtCore.QTimer.singleShot(100, start_motion)
+                return
+            state['entrance_waits'] = 0
+            assert entrance.done and len(entrance.offsets) >= 2, 'Entrance did not finish'
+            assert entrance.offsets == sorted(entrance.offsets, reverse=True), str(entrance.offsets)
+            assert entrance.offsets[0] == surface.reveal.DISTANCE and entrance.offsets[-1] == 0
+            assert not any(entrance.capture_counts), 'GPU readback blocked the entrance'
         if surface._capture_count == 0 and state.get('warmup_attempts', 0) < 30:
             state['warmup_attempts'] = state.get('warmup_attempts', 0) + 1
             QtCore.QTimer.singleShot(100, start_motion)
@@ -157,6 +200,9 @@ def close_and_reload():
         if os.environ.get('ANIMKEY_TEST_LIVE_MATERIAL') == '1':
             report['materials'][-1]['motion'] = report['last_motion'].copy()
             assert window._material_surface._capture_count == state['motion_captures_before'] + 1
+        if os.environ.get('ANIMKEY_TEST_OPEN_MATERIAL') == '1':
+            report['materials'][-1]['entrance'] = state['entrance'].offsets
+            report['materials'][-1]['entrance_capture_counts'] = state['entrance'].capture_counts
         assert mode == 'portable', 'Application backdrop did not run: ' + str(mode)
         assert window.property('nativeBlurBackend') == 'qt'
         assert window._material_surface._backdrop_image is not None

@@ -7,9 +7,10 @@ fill the rectangular canvas behind it.
 
 import re
 
-from AnimKey.mods.maya_compat import QtCore, QtGui, QtWidgets
+from AnimKey.mods.maya_compat import QtCore, QtGui, QtWidgets, get_maya_font
 from AnimKey.core.settings_style import STYLESHEET, GlassPanel, apply_native_backdrop
 from AnimKey.core.material_backdrop import rounded_path, sync_native_region, capture_application_backdrop, paint_material
+from AnimKey.core.window_reveal import apply_window_reveal
 
 
 COMPACT_STYLESHEET = STYLESHEET + """
@@ -80,7 +81,7 @@ class MaterialSurface(QtCore.QObject):
     CAPTURE_SETTLE_MS = 180
 
     def __init__(self, window, polish=True, paint=True, panel=None, compact=True,
-                 defer_polish=False, auto_fade=True):
+                 defer_polish=False, auto_fade=True, animate_open=True):
         super().__init__(window)
         self.window = window
         self.polish = polish
@@ -110,14 +111,25 @@ class MaterialSurface(QtCore.QObject):
         self._opacity_animation = QtCore.QPropertyAnimation(window, b'windowOpacity', self)
         self._opacity_animation.setDuration(150)
         self._opacity_animation.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        self.reveal = apply_window_reveal(window, enabled=animate_open)
+        self.reveal.aboutToStart.connect(self._prepare_open_backdrop)
+        self.reveal.settled.connect(self._schedule_capture)
         window.setAttribute(QtCore.Qt.WA_TranslucentBackground)
         window.setWindowFlags(window.windowFlags() | QtCore.Qt.FramelessWindowHint
                               | QtCore.Qt.NoDropShadowWindowHint)
         window.setProperty("materialSurface", True)
         window.installEventFilter(self)
 
+    def _prepare_open_backdrop(self):
+        # GPU readback must not block the first frame or the upward entrance.
+        # The frosted snapshot is refreshed once the window has settled.
+        self._capture_timer.stop()
+
     def _schedule_capture(self, immediate=False):
         if self.active or self._capturing or not self.window.isVisible():
+            return
+        if self.reveal.pending or self.reveal.running:
+            self._capture_timer.stop()
             return
         # Restart after every move/resize: never read Maya's GPU while dragging.
         # The cached, already blurred owner supplies the moving glass instead.
@@ -184,6 +196,8 @@ class MaterialSurface(QtCore.QObject):
     def _capture_backdrop(self):
         if self.active or not self.window.isVisible() or self._capturing:
             return
+        if self.reveal.pending or self.reveal.running:
+            return
         # A held drag can pause longer than the debounce interval. Wait for
         # release as well, including native/custom title-bar mouse grabs.
         if QtWidgets.QApplication.mouseButtons() != QtCore.Qt.NoButton:
@@ -233,7 +247,8 @@ class MaterialSurface(QtCore.QObject):
             self._schedule_capture()
         elif kind == QtCore.QEvent.Move:
             self._reproject_backdrop()
-            self._schedule_capture()
+            if not self.reveal.applying:
+                self._schedule_capture()
         elif kind in (QtCore.QEvent.Enter, QtCore.QEvent.Leave):
             if self.auto_fade and not watched.isModal():
                 self._update_proximity()
@@ -269,6 +284,7 @@ def apply_window_style(window, **options):
     """Install before first show, after the window's controls have been built."""
     surface = getattr(window, "_material_surface", None)
     if surface is None:
+        window.setFont(get_maya_font())
         surface = MaterialSurface(window, **options)
         window._material_surface = surface
     return surface

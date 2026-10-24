@@ -21,6 +21,7 @@ _previous_anchor = None
 _saved_pivots = {}
 _buttons = []
 _gesture_filter = None
+_window = None
 
 
 @contextmanager
@@ -374,6 +375,10 @@ def _sync_buttons():
         button = ref()
         if button is not None:
             set_button_active(button, is_active())
+    if _window is not None:
+        from AnimKey.mods.maya_compat import is_qt_object_valid
+        if is_qt_object_valid(_window):
+            _window.refresh()
 
 
 def set_button_active(button, active):
@@ -414,23 +419,22 @@ def execute_temp_pivot(*args, **kwargs):
     return result
 
 
+def show(button=None):
+    global _window
+    from AnimKey.mods.maya_compat import is_qt_object_valid
+    from AnimKey.buttons.tempPivotUI import TempPivotWindow
+    if is_qt_object_valid(_window):
+        _window.close()
+    _window = TempPivotWindow(anchor_button=button)
+    _window.show()
+    _window.position_window()
+    _window.raise_()
+    return _window
+
+
 def show_menu(button=None, pos=None):
-    from AnimKey.mods.maya_compat import QtWidgets, QtGui, execute_qt
-    from AnimKey.core.executionGuard import animkey_execution
-    menu = QtWidgets.QMenu(button)
-    def invoke(fn):
-        with animkey_execution("Temp Pivot menu"):
-            fn()
-    action = menu.addAction("Temp Pivot")
-    action.setCheckable(True)
-    action.setChecked(is_active())
-    action.triggered.connect(lambda *_: invoke(deactivate_temp_pivot if is_active() else activate_temp_pivot))
-    for title, mode in (("To Last Object    Shift", "last"), ("Centered    Ctrl", "center"), ("World Space    Ctrl+Shift", "world")):
-        menu.addAction(title, lambda m=mode: invoke(lambda: activate_temp_pivot(pivot_mode=m)))
-    menu.addSeparator()
-    menu.addAction("Toggle Edit Pivot    Alt", toggle_edit_temp_pivot)
-    menu.addAction("Reset Pivot    Ctrl+Alt", reset_temp_pivot_offsets)
-    execute_qt(menu, button.mapToGlobal(pos) if button is not None and pos is not None else QtGui.QCursor.pos())
+    """Compatibility hook: settings live in the tool window, without menus."""
+    return show(button=button)
 
 
 def execute(*args, **kwargs):
@@ -440,7 +444,11 @@ def execute(*args, **kwargs):
 
 
 def cleanup_orphans():
-    global _gesture_filter
+    global _gesture_filter, _window
+    from AnimKey.mods.maya_compat import is_qt_object_valid
+    if is_qt_object_valid(_window):
+        _window.close()
+    _window = None
     deactivate_temp_pivot()
     if _gesture_filter is not None:
         from AnimKey.mods.maya_compat import QtWidgets
