@@ -169,8 +169,10 @@ class LinkRangeTests(unittest.TestCase):
                 actual = cmds.xform(node, query=True, matrix=True, worldSpace=True)
                 self.assertLess(max(abs(a - b) for a, b in zip(actual, expected)), 1e-5)
 
-    def test_worldspace_and_parent_copy_use_identical_scope_boundaries(self):
+    def test_worldspace_uses_sparse_keys_and_parent_copy_keeps_per_frame_sampling(self):
         path = os.path.join(self.folder.name, "worldspace.json")
+        for node in (self.main, self.follow):
+            cmds.setKeyframe(node, attribute="translateX", time=3, insert=True)
         with mock.patch.object(link.worldspace, "_get_animation_data_file", return_value=path), \
                 mock.patch.object(link.worldspace, "_get_selected_time_range", return_value=(1, 3)):
             for parent_copy, world_copy, expected in (
@@ -183,20 +185,24 @@ class LinkRangeTests(unittest.TestCase):
                     world = world_copy()
                     self.assertEqual(parent["times"], expected)
                     for source in world["sources"]:
-                        self.assertEqual(sorted(float(time) for time in source["samples"]), expected)
+                        world_times = [0, 3, 6] if parent_copy == link.copy_link_all_animation else [3]
+                        self.assertEqual(sorted(float(time) for time in source["samples"]), world_times)
                     self.assertEqual(cmds.currentTime(query=True), 3)
 
     def test_worldspace_playback_paste_leaves_external_keys_intact(self):
         path = os.path.join(self.folder.name, "worldspace.json")
         cmds.select(self.follow)
+        for time in (2.5, 3.5):
+            cmds.setKeyframe(self.follow, attribute="translateX", time=time, insert=True)
         with mock.patch.object(link.worldspace, "_get_animation_data_file", return_value=path):
-            link.worldspace.copy_worldspace_all_animation()
+            link.worldspace.copy_worldspace_playback_range()
             cmds.keyframe(self.follow, edit=True, relative=True, valueChange=20)
             before = {time: self._x(self.follow, time) for time in (0, 6)}
             result = link.worldspace.paste_worldspace_playback_range()
         self.assertEqual(result["failedSamples"], 0)
         self.assertEqual({time: self._x(self.follow, time) for time in (0, 6)}, before)
-        for time in (2, 3, 4):
+        self.assertEqual(sorted(set(cmds.keyframe(self.follow, query=True, timeChange=True))), [0, 2.5, 3.5, 6])
+        for time in (2.5, 3.5):
             self.assertAlmostEqual(self._x(self.follow, time), 1 + time * 3)
 
     def test_fractional_playback_and_autokey_state_are_preserved(self):

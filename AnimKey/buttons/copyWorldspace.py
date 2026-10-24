@@ -5,7 +5,8 @@ The original implementation stored world translation and Euler rotation as six
 independent numbers. That loses the real transform when a control has pivots,
 rotate axes, joint orientation, negative scale, an animated parent, constraints,
 or animation layers. This module records evaluated world matrices instead and
-bakes them back in hierarchy order.
+applies them back in hierarchy order. Animation and range captures retain real
+key times, including fractional keys and animation driving the world pose.
 
 Public function names remain compatible with existing AnimKey shelves, toolbar
 actions, and hotkeys in Maya 2022 and newer.
@@ -130,12 +131,12 @@ def _normalise_payload(raw, kind=None):
                         ]
                     except (TypeError, ValueError):
                         continue
-            if not samples:
+            if not samples and raw.get("sampling") != "keys":
                 continue
             clean = dict(source)
             clean["samples"] = samples
             sources.append(clean)
-        if not sources:
+        if not any(source["samples"] for source in sources):
             return None
         result = dict(raw)
         result["sources"] = sources
@@ -315,6 +316,13 @@ def _sample_times(start, end, nodes=None):
     return sorted(values)
 
 
+def _world_key_times(node):
+    """Return actual key times, including animation driving the world pose."""
+    dependencies = _world_dependency_nodes([node])
+    values = cmds.keyframe(dependencies, query=True, timeChange=True) or []
+    return sorted(set(round(float(value), 10) for value in values))
+
+
 def _dag_path(node):
     selection = om.MSelectionList()
     selection.add(node)
@@ -440,13 +448,18 @@ def _require_context(name):
 # Capture
 # ---------------------------------------------------------------------------
 
-def _capture_payload(nodes, times, kind="animation", range_mode="custom"):
+def _capture_payload(nodes, times, kind="animation", range_mode="custom",
+                     times_by_node=None):
     nodes = [_long_transform(node) for node in nodes]
     nodes = [node for node in nodes if node]
     if not nodes or not times:
         return None
 
     paths = {}
+    capture_times = {
+        node: {_time_key(value) for value in values}
+        for node, values in (times_by_node or {}).items()
+    }
     sources = []
     for index, node in enumerate(nodes):
         try:
@@ -475,6 +488,8 @@ def _capture_payload(nodes, times, kind="animation", range_mode="custom"):
             cmds.currentTime(float(time_value), edit=True, update=True)
             sample_key = _time_key(time_value)
             for source, node in zip(sources, nodes):
+                if times_by_node is not None and sample_key not in capture_times[node]:
+                    continue
                 try:
                     source["samples"][sample_key] = {
                         "matrix": _world_matrix(node, paths[node]),
@@ -502,15 +517,17 @@ def _capture_payload(nodes, times, kind="animation", range_mode="custom"):
         _warning("Capture cancelled; no partial data was saved.")
         return None
 
-    sources = [source for source in sources if source["samples"]]
-    if not sources:
+    if times_by_node is None:
+        sources = [source for source in sources if source["samples"]]
+    if not any(source["samples"] for source in sources):
         return None
     return {
         "version": DATA_VERSION,
         "kind": kind,
         "rangeMode": range_mode,
         "range": [float(times[0]), float(times[-1])],
-        "sampleStep": 1.0,
+        "sampleStep": None if times_by_node is not None else 1.0,
+        "sampling": "keys" if times_by_node is not None else "frames",
         "mayaVersion": str(cmds.about(version=True)),
         "linearUnit": str(cmds.currentUnit(query=True, linear=True)),
         "timeUnit": str(cmds.currentUnit(query=True, time=True)),
@@ -519,14 +536,27 @@ def _capture_payload(nodes, times, kind="animation", range_mode="custom"):
 
 
 def _copy_range(path, nodes, start, end, label, range_mode):
-    times = _sample_times(start, end, nodes=nodes)
-    payload = _capture_payload(nodes, times, kind="animation", range_mode=range_mode)
+    start, end = sorted((float(start), float(end)))
+    times_by_node = {
+        node: [value for value in _world_key_times(node)
+               if start - TIME_TOLERANCE <= value <= end + TIME_TOLERANCE]
+        for node in nodes
+    }
+    times = sorted({value for values in times_by_node.values() for value in values})
+    if not times:
+        _warning("No animation keys were found in the requested range. Copy a frame for a pose.")
+        return None
+    payload = _capture_payload(
+        nodes, times, kind="animation", range_mode=range_mode,
+        times_by_node=times_by_node,
+    )
     if not payload:
         return None
+    payload["range"] = [start, end]
     _write_payload(path, payload)
     _message(
         label,
-        "{0} object(s), {1} sampled frame(s), range {2} - {3}".format(
+        "{0} object(s), {1} keyed time(s), range {2} - {3}".format(
             len(payload["sources"]), len(times), _time_key(start), _time_key(end)
         ),
     )
@@ -540,11 +570,24 @@ def copy_worldspace_all_animation(*args):
     if not nodes:
         _warning("Select at least one source object.")
         return None
-    start, end = _playback_range(animation=True)
-    return _copy_range(
-        _get_animation_data_file(), nodes, start, end,
-        "Worldspace Animation Copied", "animation",
+    # Keep each source's key timing. Link's per-frame solver continues to use
+    # _sample_times independently of the World Space clipboard.
+    current_time = float(cmds.currentTime(query=True))
+    times_by_node = {
+        node: _world_key_times(node) or [current_time] for node in nodes
+    }
+    times = sorted({value for values in times_by_node.values() for value in values})
+    payload = _capture_payload(
+        nodes, times, kind="animation", range_mode="animation",
+        times_by_node=times_by_node,
     )
+    if payload:
+        _write_payload(_get_animation_data_file(), payload)
+        _message(
+            "Worldspace Animation Copied",
+            "{0} object(s), {1} keyed time(s)".format(len(nodes), len(times)),
+        )
+    return payload
 
 
 def copy_worldspace_selected_range(*args):
@@ -935,6 +978,29 @@ def _apply_payload(payload, selection=None, time_range=None,
         _warning("No copied samples exist in the requested range.")
         return None
 
+    keyed_animation = payload.get("sampling") == "keys" and destination_time is None
+    if keyed_animation:
+        # Empty slots retain source/selection correspondence when only some
+        # copied objects have keys in the range. Leave those targets untouched.
+        mapping = [(target, source) for target, source in mapping
+                   if any(_sample_for_time(source, value) is not None
+                          for value in source_times)]
+        if not mapping:
+            _warning("No copied keys exist for these objects in the requested range.")
+            return None
+        # Finish each parent's curves before solving its children. A child can
+        # have a key between two parent keys; inserting the parent's later key
+        # after that solve would change the child's evaluated world pose.
+        batches = [
+            (target_time, source_time, [(target, source)])
+            for target, source in mapping
+            for target_time, source_time in schedule
+            if _sample_for_time(source, source_time) is not None
+        ]
+    else:
+        batches = [(target_time, source_time, mapping)
+                   for target_time, source_time in schedule]
+
     targets = []
     for target, _source in mapping:
         if target not in targets:
@@ -942,7 +1008,7 @@ def _apply_payload(payload, selection=None, time_range=None,
 
     original_time = float(cmds.currentTime(query=True))
     refresh_state = _suspend_refresh()
-    progress = _begin_progress("Applying real world-space matrices...", len(schedule))
+    progress = _begin_progress("Applying real world-space matrices...", len(batches))
     previous_busy = _state.busy
     _state.busy = True
     failures = []
@@ -957,12 +1023,12 @@ def _apply_payload(payload, selection=None, time_range=None,
         if replace and destination_time is None:
             _cut_transform_keys(targets, schedule[0][0], schedule[-1][0])
 
-        for target_time, source_time in schedule:
+        for batch_index, (target_time, source_time, frame_mapping) in enumerate(batches):
             if _progress_cancelled(progress):
                 cancelled = True
                 break
             cmds.currentTime(target_time, edit=True, update=True)
-            for target, source in mapping:
+            for target, source in frame_mapping:
                 values = _sample_for_time(source, source_time)
                 if values is None:
                     continue
@@ -1010,15 +1076,21 @@ def _apply_payload(payload, selection=None, time_range=None,
                             _key_transform(target, target_time)
                         except Exception:
                             pass
+            if keyed_animation and (
+                batch_index + 1 == len(batches)
+                or batches[batch_index + 1][2][0][0] != frame_mapping[0][0]
+            ):
+                _filter_rotations([frame_mapping[0][0]])
             _progress_step(progress)
 
-        _filter_rotations(targets)
+        if not keyed_animation:
+            _filter_rotations(targets)
     finally:
-        if undo_open:
-            cmds.undoInfo(closeChunk=True)
         try:
             cmds.currentTime(original_time, edit=True, update=True)
         finally:
+            if undo_open:
+                cmds.undoInfo(closeChunk=True)
             _state.busy = previous_busy
             _end_progress(progress)
             _resume_refresh(refresh_state)

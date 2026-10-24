@@ -65,6 +65,17 @@ source checkout was loaded instead, Update locates the existing Maya installatio
 and reloads that installed copy after upgrading or downgrading. The source
 checkout is kept untouched.
 
+### AnimKey 1.2.8
+
+- World Space All Animation, Playback Range and Selected Range on Timeline now
+  copy and paste at actual key times instead of baking a key on every frame.
+  Preserve fractional keys, each object's own timing and keys driving world
+  motion through parents, constraints and animation layers.
+- Finish parent curves before solving child keys, keep objects without keys in
+  a copied range untouched, and restore a paste with a single Undo.
+- Copy animation again after updating: older World Space clipboards retain
+  their previously baked samples.
+
 ### AnimKey 1.2.7
 
 - Unify the toolbar and floating tools with neutral grey glass, compact Brush
