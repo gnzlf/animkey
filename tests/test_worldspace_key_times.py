@@ -250,6 +250,164 @@ class WorldspaceKeyTimeTests(unittest.TestCase):
         self.assertEqual(result["failedSamples"], 0)
         self.assertEqual(self.times(target), [2, 3, 4, 12])
 
+    def master_rig(self, constrained=False, lock_poles=False):
+        master = self.animated("master", [1, 8.5, 24])
+        for time, value in ((1, 15), (8.5, 40), (24, 80)):
+            cmds.setKeyframe(master, attribute="rotateY", time=time, value=value)
+        controls, groups = [], []
+        for name, position in (("zRoot", (0, 8, 0)), ("aFootL", (3, 0, 2)),
+                               ("bFootR", (-3, 0, 2)), ("cKneeL", (3, 4, 6)),
+                               ("dKneeR", (-3, 4, 6))):
+            group = cmds.createNode("transform", name=name+"Space", parent=master)
+            cmds.setAttr(group+".translate", *position)
+            node = self.animated(name, [1, 12, 24], parent=group, attribute="translateZ")
+            if constrained and controls:
+                cmds.parentConstraint(controls[0], group, maintainOffset=True)
+            if lock_poles and "Knee" in name:
+                for attr in ("rotateX", "rotateY", "rotateZ", "scaleX", "scaleY", "scaleZ",
+                             "shearXY", "shearXZ", "shearYZ"):
+                    cmds.setAttr(node+"."+attr, lock=True)
+            controls.append(node)
+            groups.append(cmds.ls(group, long=True)[0])
+        cmds.currentTime(6)
+        return master, controls, groups
+
+    def test_same_controls_reselected_in_a_different_order_keep_their_own_world_motion(self):
+        master, controls, _ = self.master_rig()
+        cmds.select(controls)
+        data = ws.copy_worldspace_all_animation()
+        cmds.cutKey(master, clear=True)
+        cmds.setAttr(master+".translateX", 0)
+        cmds.setAttr(master+".rotateY", 0)
+        cmds.select(list(reversed(controls)))
+        result = ws.paste_worldspace_animation()
+        self.assertEqual(result["failedSamples"], 0)
+        for node, source in zip(controls, data["sources"]):
+            self.assert_poses(node, source)
+
+    def test_root_constraint_spaces_are_solved_before_feet_after_master_keys_are_deleted(self):
+        master, controls, _ = self.master_rig(constrained=True)
+        cmds.select(controls)
+        data = ws.copy_worldspace_all_animation()
+        cmds.cutKey(master, clear=True)
+        cmds.setAttr(master+".translateX", 0)
+        cmds.setAttr(master+".rotateY", 0)
+        result = ws.paste_worldspace_animation()
+        self.assertEqual(result["failedSamples"], 0)
+        for node, source in zip(controls, data["sources"]):
+            self.assert_poses(node, source)
+
+    def test_reparented_controls_keep_identity_after_the_master_node_is_removed(self):
+        master, controls, groups = self.master_rig()
+        cmds.select(controls)
+        data = ws.copy_worldspace_all_animation()
+        for group in groups:
+            cmds.parent(group, world=True)
+        cmds.delete(master)
+        controls = [cmds.ls(source["uuid"], long=True)[0] for source in data["sources"]]
+        cmds.select(list(reversed(controls)))
+        self.assertEqual(ws.paste_worldspace_animation()["failedSamples"], 0)
+        for node, source in zip(controls, data["sources"]):
+            self.assert_poses(node, source)
+
+    def test_locked_pole_rotation_does_not_block_world_position_restore(self):
+        master, controls, _ = self.master_rig(lock_poles=True)
+        cmds.select(controls)
+        data = ws.copy_worldspace_all_animation()
+        cmds.cutKey(master, clear=True)
+        cmds.setAttr(master+".translateX", 0)
+        cmds.setAttr(master+".rotateY", 0)
+        result = ws.paste_worldspace_animation()
+        self.assertEqual(result["failedSamples"], 0)
+        for node, source in zip(controls, data["sources"]):
+            for time, sample in source["samples"].items():
+                cmds.currentTime(float(time))
+                actual = cmds.xform(node, query=True, worldSpace=True, matrix=True)
+                self.assertLess(max(abs(actual[i]-sample["matrix"][i]) for i in (12,13,14)), 1e-5)
+            if "Knee" in node:
+                self.assertTrue(cmds.getAttr(node+".rotateX", lock=True))
+                self.assertFalse(cmds.keyframe(node, attribute="rotateX", query=True, timeChange=True))
+
+    def test_pivot_rotate_axis_and_offset_parent_matrix_survive_master_key_removal(self):
+        master, controls, _ = self.master_rig(constrained=True)
+        offset = cmds.createNode("transform", name="offsetMatrixSource")
+        cmds.setAttr(offset+".translate", 2, -1, 3)
+        cmds.setAttr(offset+".rotate", 0, 18, 4)
+        matrix = cmds.xform(offset, query=True, matrix=True)
+        cmds.delete(offset)
+        for node in controls:
+            cmds.setAttr(node+".rotateOrder", 3)
+            cmds.setAttr(node+".rotateAxis", 7, 12, 3)
+            cmds.setAttr(node+".rotatePivot", 2, 1, -3)
+            cmds.setAttr(node+".offsetParentMatrix", *matrix, type="matrix")
+        cmds.select(controls)
+        data = ws.copy_worldspace_all_animation()
+        cmds.cutKey(master, clear=True)
+        cmds.setAttr(master+".translateX", 0)
+        cmds.setAttr(master+".rotateY", 0)
+        result = ws.paste_worldspace_animation()
+        self.assertEqual(result["failedSamples"], 0)
+        for node, source in zip(controls, data["sources"]):
+            self.assert_poses(node, source)
+        self.assertFalse(cmds.ls("AnimKey_WorldSolve*"))
+
+    def test_controls_with_existing_animation_layers_restore_after_master_keys_are_deleted(self):
+        master, controls, _ = self.master_rig()
+        layer = cmds.animLayer("IKCorrections")
+        for node in controls:
+            cmds.animLayer(layer, edit=True, attribute=node+".translateZ")
+            for time, value in ((1, 0), (8.5, 3), (24, 0)):
+                cmds.setKeyframe(node, attribute="translateZ", time=time,
+                                value=value, animLayer=layer, noResolve=True)
+        cmds.select(controls)
+        data = ws.copy_worldspace_all_animation()
+        cmds.cutKey(master, clear=True)
+        cmds.setAttr(master+".translateX", 0)
+        cmds.setAttr(master+".rotateY", 0)
+        result = ws.paste_worldspace_animation()
+        self.assertEqual(result["failedSamples"], 0)
+        for node, source in zip(controls, data["sources"]):
+            self.assert_poses(node, source)
+
+    def test_original_subset_maps_by_identity_instead_of_requiring_selection_order(self):
+        master, controls, _ = self.master_rig()
+        cmds.select(controls)
+        data = ws.copy_worldspace_all_animation()
+        cmds.cutKey(master, clear=True)
+        cmds.setAttr(master+".translateX", 0)
+        cmds.setAttr(master+".rotateY", 0)
+        cmds.select([controls[3], controls[1]])
+        self.assertEqual(ws.paste_worldspace_animation()["failedSamples"], 0)
+        self.assert_poses(controls[3], data["sources"][3])
+        self.assert_poses(controls[1], data["sources"][1])
+
+    def test_final_validation_detects_feet_invalidated_by_a_later_root_solve(self):
+        master, controls, _ = self.master_rig(constrained=True)
+        cmds.select(controls)
+        ws.copy_worldspace_all_animation()
+        cmds.cutKey(master, clear=True)
+        cmds.setAttr(master+".translateX", 0)
+        cmds.setAttr(master+".rotateY", 0)
+        with mock.patch.object(ws, "_hierarchy_order", side_effect=lambda mapping: sorted(mapping)):
+            result = ws.paste_worldspace_animation()
+        self.assertGreater(result["failedSamples"], 0)
+
+    def test_failed_solve_does_not_change_pivot_structure_or_leave_scratch_nodes(self):
+        source = self.animated("source", [1, 24])
+        cmds.select(source)
+        ws.copy_worldspace_all_animation()
+        target = cmds.createNode("transform", name="target")
+        cmds.setAttr(target+".rotatePivot", 3, 2, 1)
+        cmds.setAttr(target+".rotatePivotTranslate", 1, 2, 3)
+        cmds.select(target)
+        original = {a: cmds.getAttr(target+"."+a) for a in ("rotatePivot", "rotatePivotTranslate")}
+        with mock.patch.object(ws, "_apply_world_sample", return_value=(False, 10, False)):
+            result = ws.paste_worldspace_animation()
+        self.assertEqual(result["failedSamples"], 2)
+        for attr, value in original.items():
+            self.assertEqual(cmds.getAttr(target+"."+attr), value)
+        self.assertFalse(cmds.ls("AnimKey_WorldSolve*"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

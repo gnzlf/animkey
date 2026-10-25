@@ -65,6 +65,17 @@ source checkout was loaded instead, Update locates the existing Maya installatio
 and reloads that installed copy after upgrading or downgrading. The source
 checkout is kept untouched.
 
+### AnimKey 1.2.9
+
+- Restore copied World Space poses after deleting an animated master's keys:
+  match original controls by identity even when reselected in another order,
+  and solve root/space drivers before the feet they influence through constraints.
+- Preserve locked IK pole rotations while restoring their world positions.
+  Solve channel transforms with offsetParentMatrix, rotate axes and pivot offsets
+  without changing the rig's locked attributes or pivot setup.
+- Verify the final evaluated rig after all controls have been pasted, so a later
+  root change cannot silently invalidate an earlier foot pose.
+
 ### AnimKey 1.2.8
 
 - World Space All Animation, Playback Range and Selected Range on Timeline now

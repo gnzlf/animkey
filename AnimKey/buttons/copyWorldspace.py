@@ -650,10 +650,6 @@ def copy_worldspace_current_frame(*args):
 # ---------------------------------------------------------------------------
 
 def _resolve_original_source(source):
-    path = source.get("path") or ""
-    if path and cmds.objExists(path):
-        return _long_transform(path)
-
     uuid_value = source.get("uuid") or ""
     if uuid_value:
         try:
@@ -662,6 +658,10 @@ def _resolve_original_source(source):
             matches = []
         if len(matches) == 1:
             return _long_transform(matches[0])
+
+    path = source.get("path") or ""
+    if path and cmds.objExists(path):
+        return _long_transform(path)
 
     name = source.get("name") or (path.split("|")[-1] if path else "")
     if name:
@@ -681,8 +681,18 @@ def _target_mapping(payload, selection=None, warn=True):
     if targets:
         if len(sources) == 1:
             return [(target, sources[0]) for target in targets]
+        originals = {_resolve_original_source(source): index
+                     for index, source in enumerate(sources)}
+        matched = {target: originals[target] for target in targets if target in originals}
+        if len(matched) == len(targets):
+            return [(target, sources[matched[target]]) for target in targets]
         if len(targets) == len(sources):
-            return list(zip(targets, sources))
+            # Original controls retain their identity even after reparenting or
+            # reselection. Unrelated destination rigs still map by selection.
+            used = set(matched.values())
+            remaining = iter(source for index, source in enumerate(sources) if index not in used)
+            return [(target, sources[matched[target]] if target in matched else next(remaining))
+                    for target in targets]
         if warn:
             _warning(
                 "Selection has {0} object(s), but the copy contains {1}. "
@@ -703,7 +713,21 @@ def _target_mapping(payload, selection=None, warn=True):
 
 
 def _hierarchy_order(mapping):
-    return sorted(mapping, key=lambda item: (item[0].count("|"), item[0]))
+    pending = dict(mapping)
+    dependencies = {}
+    for target in pending:
+        history = _world_dependency_nodes([target])
+        names = set(cmds.ls(history, long=True) or [])
+        dependencies[target] = (names & set(pending)) - {target}
+    result = []
+    while pending:
+        ready = [target for target in pending if not (dependencies[target] & set(pending))]
+        if not ready:
+            _warning("Selected controls have cyclic world-space dependencies; check the paste result.")
+            ready = list(pending)
+        for target in sorted(ready, key=lambda node: (node.count("|"), node)):
+            result.append((target, pending.pop(target)))
+    return result
 
 
 def _available_times(payload):
@@ -794,68 +818,71 @@ def _rotation_difference_degrees(first, second):
 
 
 def _apply_world_sample(node, values):
-    """Apply a matrix exactly, falling back to world rotation then position."""
-    saved_world_rotation = None
-    if isinstance(values, dict):
-        saved_world_rotation = values.get("rotation")
-        values = values.get("matrix") or values.get("values") or []
-    if len(values) == 6:
-        # Rotation first: changing it can move a non-zero pivot.
-        cmds.xform(node, worldSpace=True, rotation=values[3:6])
-        cmds.xform(node, worldSpace=True, translation=values[0:3])
-        return True, 0.0, True
-
-    desired = [float(value) for value in values]
-    if len(desired) != 16:
+    """Solve on an independent sibling, preserving the rig's locked channels."""
+    sample = values
+    rotation = values.get("rotation") if isinstance(values, dict) else None
+    values = (values.get("matrix") or values.get("values") or []) if isinstance(values, dict) else values
+    if len(values) not in (6, 16):
         return False, float("inf"), False
-
+    channels = _settable_channels(node)
+    if not channels:
+        return False, float("inf"), False
+    scratch = None
+    original_selection = cmds.ls(selection=True, long=True) or []
     try:
-        cmds.xform(node, worldSpace=True, matrix=desired)
-        actual = _world_matrix(node)
-        matrix_error = _matrix_difference(desired, actual)
-        if matrix_error <= MATRIX_TOLERANCE:
-            return True, matrix_error, True
-    except Exception:
-        pass
+        scratch = cmds.duplicate(node, parentOnly=True, inputConnections=False,
+                                 name="AnimKey_WorldSolve#")[0]
+        fixed = {attr: cmds.getAttr(node + "." + attr)
+                 for attr in TRANSFORM_CHANNELS if attr not in channels}
+        for attr in TRANSFORM_CHANNELS:
+            cmds.setAttr(scratch + "." + attr, lock=False)
+        if len(values) == 6:
+            cmds.xform(scratch, worldSpace=True, rotation=values[3:6])
+            cmds.xform(scratch, worldSpace=True, translation=values[:3])
+        else:
+            # Maya's parentInverseMatrix includes offsetParentMatrix. Solve the
+            # channel matrix directly; xform's world setter/move can omit that
+            # offset when converting translation back into local channels.
+            local_matrix = list(om.MMatrix(values) * om.MMatrix(
+                cmds.getAttr(node + ".parentInverseMatrix[0]")
+            ))
+            cmds.xform(scratch, objectSpace=True, matrix=local_matrix)
+        for attr, value in fixed.items():
+            cmds.setAttr(scratch + "." + attr, value)
 
-    # Locked scale/shear can prevent a full matrix match even when the world
-    # position and orientation are achievable. Preserve those rig channels.
-    try:
-        cmds.xform(
-            node,
-            worldSpace=True,
-            rotation=(saved_world_rotation or _matrix_rotation_degrees(desired)),
-        )
-        cmds.xform(
-            node,
-            worldSpace=True,
-            translation=desired[12:15],
-        )
-        actual = _world_matrix(node)
-        translation_error, axis_error = _pose_difference(desired, actual)
-        full_match = _matrix_difference(desired, actual) <= MATRIX_TOLERANCE
-        if saved_world_rotation:
-            actual_world_rotation = cmds.xform(
-                node, query=True, worldSpace=True, rotation=True
-            )
-            rotation_error = _rotation_difference_degrees(
-                saved_world_rotation, actual_world_rotation
-            )
-            pose_error = max(translation_error, rotation_error)
-            return (
-                translation_error <= POSE_TOLERANCE
-                and rotation_error <= ROTATION_TOLERANCE_DEGREES,
-                pose_error,
-                full_match,
-            )
-        pose_error = max(translation_error, axis_error)
-        return (
-            translation_error <= POSE_TOLERANCE and axis_error <= POSE_TOLERANCE,
-            pose_error,
-            full_match,
-        )
+        def transfer():
+            # xform can hide pivot compensation in these attributes. They are
+            # rig structure, so solve translation with the target's originals.
+            for attr in ("rotatePivotTranslate", "scalePivotTranslate"):
+                cmds.setAttr(scratch + "." + attr, lock=False)
+                cmds.setAttr(scratch + "." + attr, *cmds.getAttr(node + "." + attr)[0])
+            if len(values) == 16:
+                # Correct pivot/rotateAxis offsets in the same local space.
+                actual = cmds.getAttr(scratch + ".matrix")
+                for attr, index in zip(("translateX", "translateY", "translateZ"), (12, 13, 14)):
+                    delta = local_matrix[index] - actual[index]
+                    cmds.setAttr(scratch + "." + attr, cmds.getAttr(scratch + "." + attr) + delta)
+            for attr in channels:
+                cmds.setAttr(node + "." + attr, cmds.getAttr(scratch + "." + attr))
+            return _verify_world_sample(node, sample)
+
+        result = transfer()
+        if not result[0] and rotation and all(attr in channels for attr in ROTATE_CHANNELS):
+            # Reflected/non-uniform spaces can require Maya's world Euler solve.
+            cmds.xform(scratch, worldSpace=True, rotation=rotation)
+            for attr, value in fixed.items():
+                cmds.setAttr(scratch + "." + attr, value)
+            result = transfer()
+        return result
     except Exception:
         return False, float("inf"), False
+    finally:
+        if scratch and cmds.objExists(scratch):
+            cmds.delete(scratch)
+        if original_selection:
+            cmds.select(original_selection, replace=True)
+        else:
+            cmds.select(clear=True)
 
 
 def _verify_world_sample(node, values):
@@ -872,9 +899,9 @@ def _verify_world_sample(node, values):
             (float(values[index]) - float(actual_translation[index])) ** 2
             for index in range(3)
         ))
-        rotation_error = _rotation_difference_degrees(
+        rotation_error = (_rotation_difference_degrees(
             values[3:6], cmds.xform(node, query=True, worldSpace=True, rotation=True)
-        )
+        ) if any(attr in _settable_channels(node) for attr in ROTATE_CHANNELS) else 0.0)
         return (
             translation_error <= POSE_TOLERANCE
             and rotation_error <= ROTATION_TOLERANCE_DEGREES,
@@ -890,6 +917,8 @@ def _verify_world_sample(node, values):
     if matrix_error <= MATRIX_TOLERANCE:
         return True, matrix_error, True
     translation_error, axis_error = _pose_difference(desired, actual)
+    if not any(attr in _settable_channels(node) for attr in ROTATE_CHANNELS):
+        return translation_error <= POSE_TOLERANCE, translation_error, False
     if saved_world_rotation:
         rotation_error = _rotation_difference_degrees(
             saved_world_rotation,
@@ -1036,7 +1065,8 @@ def _apply_payload(payload, selection=None, time_range=None,
                 sample_failure = None
                 full_match = False
                 try:
-                    before = _world_matrix(target)
+                    before = {attr: cmds.getAttr(target + "." + attr)
+                              for attr in _settable_channels(target)}
                     success, _error, _full_match = _apply_world_sample(target, values)
                     if not success:
                         sample_failure = _error
@@ -1072,7 +1102,8 @@ def _apply_payload(payload, selection=None, time_range=None,
                     # Do not leave a partially decomposed transform behind.
                     if before is not None:
                         try:
-                            cmds.xform(target, worldSpace=True, matrix=before)
+                            for attr, value in before.items():
+                                cmds.setAttr(target + "." + attr, value)
                             _key_transform(target, target_time)
                         except Exception:
                             pass
@@ -1085,6 +1116,24 @@ def _apply_payload(payload, selection=None, time_range=None,
 
         if not keyed_animation:
             _filter_rotations(targets)
+        if not cancelled:
+            # A later root/space solve or curve filter can invalidate an earlier
+            # foot result. Verify the final evaluated rig, after all keys exist.
+            failed_pairs = {(target, time) for target, time, _error in failures}
+            full_matrix_matches = 0
+            for target_time, source_time in schedule:
+                cmds.currentTime(target_time, edit=True, update=True)
+                for target, source in mapping:
+                    values = _sample_for_time(source, source_time)
+                    if values is None or (target, target_time) in failed_pairs:
+                        continue
+                    success, error, full_match = _verify_world_sample(target, values)
+                    maximum_error = max(maximum_error, error)
+                    if not success:
+                        failures.append((target, target_time, error))
+                        applied_samples -= 1
+                    elif full_match:
+                        full_matrix_matches += 1
     finally:
         try:
             cmds.currentTime(original_time, edit=True, update=True)
