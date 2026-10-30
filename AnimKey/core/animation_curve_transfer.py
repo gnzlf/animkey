@@ -1143,6 +1143,7 @@ def paste_curves_batch(
     time_offset=0.0,
     clear_existing=True,
     prevalidated_attr_paths=None,
+    clear_all=False,
 ):
     """Paste many serialized curves with one native clipboard operation.
 
@@ -1221,8 +1222,12 @@ def paste_curves_batch(
             return results
 
         if clear_existing:
+            if clear_all:
+                cmds.cutKey([item["target_curve"] for item in prepared], clear=True)
             range_groups = {}
             for item in prepared:
+                if clear_all:
+                    continue
                 clip_range = item["curve_data"].get("clip_range")
                 if not isinstance(clip_range, (list, tuple)) or len(clip_range) != 2:
                     continue
@@ -1313,6 +1318,7 @@ def paste_curves_batch(
                     layer_name=layer_name,
                     time_offset=offset,
                     clear_existing=clear_existing,
+                    clear_all=clear_all,
                 )
                 results[item["index"]] = bool(pasted)
             except Exception:

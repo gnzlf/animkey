@@ -6,6 +6,8 @@
 """
 
 import maya.cmds as cmds
+import maya.mel as mel
+import json
 
 from AnimKey.mods import configMod as config
 
@@ -30,6 +32,24 @@ def _append_unique(items, item):
         items.append(item)
 
 
+def _get_active_model_panel():
+    # Reuse the viewport resolver that matches the actual M3dView widget, even
+    # when a toolbar has focus or several panels display the same camera.
+    from AnimKey.buttons.followCam import _get_active_panel
+    return _get_active_panel()
+
+
+def _set_isolate_state(panel, enabled):
+    # Maya's native command also configures/locks the editor selection
+    # connection. Without it, restoring the animator's selection can replace
+    # the isolated hierarchy with only the selected control.
+    try:
+        mel.eval("enableIsolateSelect({}, {});".format(json.dumps(panel), int(enabled)))
+    except RuntimeError:
+        pass
+    cmds.isolateSelect(panel, state=int(enabled))
+
+
 def _load_isolate_objects(panel, objects):
     """Load objects into Maya's isolate set explicitly."""
     valid_objects = []
@@ -42,25 +62,24 @@ def _load_isolate_objects(panel, objects):
 
     try:
         cmds.select(valid_objects, replace=True)
-        cmds.isolateSelect(panel, state=1)
+        _set_isolate_state(panel, True)
         # ``addSelected`` retains members from Maya's prior isolate set.  A
         # fresh AnimKey isolate must replace that set so another rig cannot
         # remain visible from an earlier isolation.
         cmds.isolateSelect(panel, loadSelected=True)
     except Exception:
         try:
-            cmds.select(valid_objects, replace=True)
-            cmds.isolateSelect(panel, state=1)
-            cmds.isolateSelect(panel, loadSelected=True)
+            _set_isolate_state(panel, False)
         except Exception:
-            return False
+            pass
+        return False
 
     try:
         cmds.isolateSelect(panel, update=True)
     except Exception:
         pass
 
-    return True
+    return bool(cmds.isolateSelect(panel, query=True, state=True))
 
 
 def _node_type(node):
@@ -356,7 +375,7 @@ def get_root_node(node, down_one_level=False):
             # If down_one_level is enabled, we want the node previous to the root node
             # If we're at the root node and down_one_level is enabled, return previous_node
             # If down_one_level is not enabled, simply return the current node
-            return previous_node if down_one_level else node
+            return (previous_node or node) if down_one_level else node
 
         parent = parents[0]
 
@@ -371,132 +390,60 @@ def get_root_node(node, down_one_level=False):
 
 
 def execute(*args):
-    """
-    Main function to execute when button is clicked.
-    Isolates selected objects in the current viewport.
-    Based on AnimKey's isolate_master functionality.
-    """
+    """Toggle rig isolation in the active viewport, including toolbar clicks."""
     from AnimKey.core.executionGuard import require_animkey_context
     if not require_animkey_context("AnimKey.buttons.isolate.execute"):
         return None
-    global down_one_level_var
-    down_one_level = down_one_level_var
-    include_parented = include_parented_objects_enabled()
-    
-    # Save current selection
+    panel = _get_active_model_panel()
+    if not panel:
+        cmds.warning("AnimKey: No active viewport. Click on a viewport first.")
+        return False
+    if cmds.isolateSelect(panel, query=True, state=True):
+        _set_isolate_state(panel, False)
+        _update_maya_isolate_icon(panel, False)
+        return False
+
     current_selection = cmds.ls(selection=True, long=True) or []
-    
-    # Get currently selected objects
-    selected_objects = cmds.ls(selection=True, long=True) or []
-    currentPanel = cmds.getPanel(withFocus=True)
-    
-    # Check if current panel is a model panel
-    if cmds.getPanel(typeOf=currentPanel) != "modelPanel":
-        cmds.warning("AnimKey: Please focus on a model panel to use isolate")
-        return
-    
-    currentState = cmds.isolateSelect(currentPanel, query=True, state=True)
-    
-    # If no objects selected and isolation state is 0, exit the function
-    if not selected_objects and currentState == 0:
+    selected_objects = cmds.ls(selection=True, long=True, objectsOnly=True) or []
+    if not selected_objects:
         cmds.warning("AnimKey: No objects selected.")
-        return
-    
-    # If no objects selected but isolation is active, deactivate it
-    elif not selected_objects and currentState == 1:
-        cmds.isolateSelect(currentPanel, state=0)
-        _update_maya_isolate_icon(currentPanel, False)
-        return
-    else:
-        # For each selected object, find and select the root object.
+        return False
+    try:
         isolate_objects = []
         selected_roots = []
         for selected_object in selected_objects:
-            root_object = get_root_node(selected_object, down_one_level=down_one_level)
-            if root_object:
-                _append_unique(isolate_objects, root_object)
-                _append_unique(selected_roots, root_object)
-
-        if include_parented:
-            for root_object in selected_roots:
-                for obj in _find_parented_external_objects(root_object, root_object):
+            if not cmds.objectType(selected_object, isAType="dagNode"):
+                continue
+            root = get_root_node(selected_object, down_one_level=down_one_level_var)
+            _append_unique(isolate_objects, root)
+            _append_unique(selected_roots, root)
+        if include_parented_objects_enabled():
+            for root in selected_roots:
+                for obj in _find_parented_external_objects(root, root):
                     _append_unique(isolate_objects, obj)
-        
-        # Select all objects that should be included in isolate.
-        if isolate_objects:
-            cmds.select(isolate_objects, replace=True)
-        
-        # Get Maya version for icon fix
-        maya_version = cmds.about(version=True)
-        
-        if currentState == 0:
-            # Activate isolation
-            _load_isolate_objects(currentPanel, isolate_objects)
-            
-            # Fix to activate/deactivate Maya's isolate icon (for Maya 2024/2025)
-            _update_maya_isolate_icon(currentPanel, True)
+        if not _load_isolate_objects(panel, isolate_objects):
+            cmds.warning("AnimKey: Could not isolate the selected objects in this viewport.")
+            return False
+        _update_maya_isolate_icon(panel, True)
+        return True
+    finally:
+        if current_selection:
+            cmds.select(current_selection, replace=True)
         else:
-            # Deactivate isolation
-            cmds.isolateSelect(currentPanel, state=0)
-            cmds.isolateSelect(currentPanel, removeSelected=True)
-            
-            # Fix to activate/deactivate Maya's isolate icon
-            _update_maya_isolate_icon(currentPanel, False)
-    
-    # Restore original selection
-    if current_selection:
-        cmds.select(current_selection, replace=True)
+            cmds.select(clear=True)
 
 
 def _update_maya_isolate_icon(panel, value):
-    """
-    Update Maya's isolate icon in the viewport toolbar.
-    This is a fix for Maya 2024/2025 where the icon layout changed.
-    
-    Args:
-        panel: The model panel name
-        value: True to activate, False to deactivate
-    """
-    maya_version = cmds.about(version=True)
-    
-    # Icon paths for different Maya versions and panels
-    icon_paths = {
-        "modelPanel1": {
-            "2024": "MainPane|viewPanes|modelPanel1|modelPanel1|modelEditorIconBar|flowLayout3|formLayout24|IsolateSelectedBtn",
-            "2025": "MainPane|viewPanes|modelPanel1|modelPanel1|modelEditorIconBar|flowLayout3|formLayout24|IsolateSelectedBtn",
-            "default": "MainPane|viewPanes|modelPanel1|modelPanel1|modelEditorIconBar|flowLayout3|formLayout25|IsolateSelectedBtn"
-        },
-        "modelPanel2": {
-            "2024": "MainPane|viewPanes|modelPanel2|modelPanel2|modelEditorIconBar|flowLayout4|formLayout31|IsolateSelectedBtn",
-            "2025": "MainPane|viewPanes|modelPanel2|modelPanel2|modelEditorIconBar|flowLayout4|formLayout31|IsolateSelectedBtn",
-            "default": "MainPane|viewPanes|modelPanel2|modelPanel2|modelEditorIconBar|flowLayout4|formLayout32|IsolateSelectedBtn"
-        },
-        "modelPanel3": {
-            "2024": "MainPane|viewPanes|modelPanel3|modelPanel3|modelEditorIconBar|flowLayout5|formLayout38|IsolateSelectedBtn",
-            "2025": "MainPane|viewPanes|modelPanel3|modelPanel3|modelEditorIconBar|flowLayout5|formLayout38|IsolateSelectedBtn",
-            "default": "MainPane|viewPanes|modelPanel3|modelPanel3|modelEditorIconBar|flowLayout5|formLayout39|IsolateSelectedBtn"
-        },
-        "modelPanel4": {
-            "2024": "MainPane|viewPanes|modelPanel4|modelPanel4|modelEditorIconBar|flowLayout6|formLayout45|IsolateSelectedBtn",
-            "2025": "MainPane|viewPanes|modelPanel4|modelPanel4|modelEditorIconBar|flowLayout6|formLayout45|IsolateSelectedBtn",
-            "default": "MainPane|viewPanes|modelPanel4|modelPanel4|modelEditorIconBar|flowLayout6|formLayout46|IsolateSelectedBtn"
-        }
-    }
-    
-    if panel in icon_paths:
-        # Get the correct icon path for this Maya version
-        if maya_version in ["2024", "2025"]:
-            icon_path = icon_paths[panel].get(maya_version)
-        else:
-            icon_path = icon_paths[panel].get("default")
-        
-        # Try to update the icon if it exists
-        if icon_path and cmds.objExists(icon_path):
-            try:
-                cmds.iconTextCheckBox(icon_path, edit=True, value=value)
-            except:
-                # Icon path might not exist in all Maya setups, ignore error
-                pass
+    """Update the actual panel's button without hardcoded layout/version paths."""
+    try:
+        bar = cmds.modelPanel(panel, query=True, barLayout=True)
+        if not bar:
+            return
+        for control in cmds.lsUI(type="iconTextCheckBox", long=True) or []:
+            if control.startswith(bar + "|") and control.rsplit("|", 1)[-1] == "IsolateSelectedBtn":
+                cmds.iconTextCheckBox(control, edit=True, value=bool(value))
+    except RuntimeError:
+        pass
 
 
 def get_info():

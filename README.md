@@ -65,6 +65,24 @@ source checkout was loaded instead, Update locates the existing Maya installatio
 and reloads that installed copy after upgrading or downgrading. The source
 checkout is kept untouched.
 
+### AnimKey 1.2.10
+
+- Integrate Animo-based animation transfer and mirror kernels behind the existing
+  menus. Preserve key times, native tangents and range/Graph Editor behavior;
+  retain AnimKey's animation-layer workflows and clipboard storage. Twenty
+  independent comparisons against Animo on a production scene matched.
+- Retime Alembic geometry while preserving cache offsets and speed. Find caches
+  from objects, shapes, groups or reader nodes, restore original time connections
+  when preview stops, and bake the cache clock to keep the deformation.
+  Use BAKE for Alembic; animation-layer bake reports that cache time is unsupported.
+- Move every key in a selected timeline or Graph Editor block together. Check
+  destination collisions before moving, including the toolbar's five-frame step.
+- Fix Isolate panel selection and native state, including split viewport layouts.
+- Reflow Selection Sets buttons and headers when resizing or adding sets,
+  preserving the transparent background without clipped controls.
+- Keep Flash Buttons circular during opening and hover. Add the opening-animation
+  switch to Recovery and safely stop pending window animations when disabled.
+
 ### AnimKey 1.2.9
 
 - Restore copied World Space poses after deleting an animated master's keys:

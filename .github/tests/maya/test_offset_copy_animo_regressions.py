@@ -294,7 +294,7 @@ class OffsetAndCopyAnimoRegressionTests(unittest.TestCase):
         self.assertEqual(payload["values"], [50.0, 100.0])
         self.assertEqual(payload["clip_range"], [5.0, 10.0])
 
-    def test_graph_copy_replace_preserves_keys_outside_selected_span(self):
+    def test_graph_copy_replace_replaces_target_channel_at_original_times(self):
         source = cmds.createNode("transform", name="graph_replace_source")
         target = cmds.createNode("transform", name="graph_replace_target")
         for frame, value in ((1.0, 10.0), (5.0, 50.0), (10.0, 100.0)):
@@ -315,11 +315,11 @@ class OffsetAndCopyAnimoRegressionTests(unittest.TestCase):
 
         self.assertEqual(
             cmds.keyframe(target + ".translateX", query=True, timeChange=True),
-            [1.0, 5.0, 10.0, 15.0],
+            [5.0, 10.0],
         )
         self.assertEqual(
             cmds.keyframe(target + ".translateX", query=True, valueChange=True),
-            [-1.0, 50.0, 100.0, -15.0],
+            [50.0, 100.0],
         )
 
     def test_selected_graph_curve_identifies_nonpreferred_source_layer(self):

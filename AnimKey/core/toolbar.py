@@ -2197,7 +2197,7 @@ class AnimKeyToolbar:
         btn_left.setFixedSize(int(26 * float(self.config.get("toolbar_scale", 1.0))), int(26 * float(self.config.get("toolbar_scale", 1.0))))
         btn_left.setToolTip(ui.create_tooltip_text(
             "Move Keys Left",
-            "On a keyed frame, move that key left by the frame amount. Otherwise pull the nearest key on the right.",
+            "Move the highlighted timeline range or selected Graph Editor keys left. Otherwise move the current key or pull the nearest key on the right.",
             {"Shift+Click": "Move selected/current keys left by 5x the frame amount"}
         ))
         btn_left.clicked.connect(lambda: self._move_keyframes(-1))
@@ -2241,7 +2241,7 @@ class AnimKeyToolbar:
         btn_right.setFixedSize(int(26 * float(self.config.get("toolbar_scale", 1.0))), int(26 * float(self.config.get("toolbar_scale", 1.0))))
         btn_right.setToolTip(ui.create_tooltip_text(
             "Move Keys Right",
-            "On a keyed frame, move that key right by the frame amount. Otherwise pull the nearest key on the left.",
+            "Move the highlighted timeline range or selected Graph Editor keys right. Otherwise move the current key or pull the nearest key on the left.",
             {"Shift+Click": "Move selected/current keys right by 5x the frame amount"}
         ))
         btn_right.clicked.connect(lambda: self._move_keyframes(1))
@@ -3359,7 +3359,7 @@ class AnimKeyToolbar:
             moved = result.get("moved", 0)
             mode = result.get("mode")
             if moved:
-                if mode in ("current", "selected"):
+                if mode in ("current", "selected", "range"):
                     signed_amount = frame_amount * direction
                     cmds.inViewMessage(
                         amg=(
@@ -3379,6 +3379,8 @@ class AnimKeyToolbar:
                         pos='topCenter', fade=True, fadeStayTime=1000
                     )
             else:
+                if mode in ("range", "selected"):
+                    return
                 side = "right" if direction < 0 else "left"
                 cmds.warning(f"AnimKey: No keyframes found on the {side} side of the current frame")
         
@@ -3386,46 +3388,18 @@ class AnimKeyToolbar:
             cmds.warning(f"AnimKey: Error moving keyframes: {e}")
 
     def _nudge_keyframes_relative(self, direction):
-        """Move selected/current keys by the spinbox amount for legacy shift-click use."""
-        frame_amount = int(self.key_offset_spinbox.value()) * direction * 5
-
-        selection = cmds.ls(selection=True)
-        if not selection:
-            cmds.warning("AnimKey: No objects selected")
-            return
-
-        selected_curves = cmds.keyframe(query=True, name=True, selected=True)
-
-        if selected_curves:
-            cmds.keyframe(edit=True, relative=True, timeChange=frame_amount)
+        """Move the same range/key selection as normal arrows, at five times the step."""
+        from AnimKey.buttons.keyframe_move import move_key_with_arrow
+        amount = int(self.key_offset_spinbox.value()) * 5
+        result = move_key_with_arrow(direction, frame_amount=amount, allow_neighbor=False)
+        if result.get("moved"):
             cmds.inViewMessage(
-                amg=f"<span style='color:#88c0d0'>Keys moved by {frame_amount} frame(s)</span>",
-                pos='topCenter', fade=True, fadeStayTime=1000
+                amg=f"<span style='color:#88c0d0'>Keys moved by {amount * direction} frame(s)</span>",
+                pos='topCenter', fade=True, fadeStayTime=1000,
             )
-            return
-
-        current_time = cmds.currentTime(query=True)
-        keys_found = False
-        for obj in selection:
-            keyframes = cmds.keyframe(obj, query=True, time=(current_time, current_time))
-            if keyframes:
-                keys_found = True
-                cmds.keyframe(
-                    obj,
-                    edit=True,
-                    time=(current_time, current_time),
-                    relative=True,
-                    timeChange=frame_amount,
-                )
-
-        if keys_found:
-            cmds.inViewMessage(
-                amg=f"<span style='color:#88c0d0'>Keys at frame {int(current_time)} moved by {frame_amount}</span>",
-                pos='topCenter', fade=True, fadeStayTime=1000
-            )
-        else:
+        elif result.get("mode") not in ("range", "selected"):
             cmds.warning("AnimKey: No keyframes selected or at current time")
-    
+
     def _add_inbetween(self):
         """Increase keyframe/attribute values (like AnimKey increase)"""
         from AnimKey.buttons.increase_decrease import execute as increase_decrease_execute
@@ -4444,7 +4418,7 @@ class AnimKeyToolbar:
         
         # Mirror modes section
         action_all_mirror = self._add_menu_action(menu, "All Mirror (Swap Both Sides)", "All Mirror (Swap Both Sides)")
-        action_all_mirror.setToolTip("Swap values between left/right controls")
+        action_all_mirror.setToolTip("Swap left/right animation in the highlighted range, or all keys; otherwise swap the current pose")
 
         action_mirror_left = self._add_menu_action(menu, "Mirror to Left", "Mirror to Left")
         action_mirror_left.setToolTip("Copy selected right-side controls onto the left side")
@@ -4531,10 +4505,10 @@ class AnimKeyToolbar:
         menu.addSeparator()
 
         act_paste = self._add_menu_action(menu, "Paste Animation", "Paste Animation")
-        act_paste.setToolTip("Paste animation to selected controls (replaces existing)")
+        act_paste.setToolTip("Replace the copied channels at their original times, including existing keys outside the copied span")
         
         act_insert = self._add_menu_action(menu, "Paste Insert", "Paste Insert")
-        act_insert.setToolTip("Paste animation at current time")
+        act_insert.setToolTip("Paste from the current frame, replacing only the inserted clip span")
         
         act_opposite = self._add_menu_action(menu, "Paste Opposite", "Paste Opposite")
         act_opposite.setToolTip("Paste animation to opposite (mirror) controls")

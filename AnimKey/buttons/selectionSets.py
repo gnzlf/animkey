@@ -985,10 +985,13 @@ class SetButton(QtWidgets.QFrame):
             int(max(26, SET_BUTTON_MIN_HEIGHT) * scale)
         )
 
-    def _row_size(self):
-        fm = self.fontMetrics()
+    def _row_size(self, maximum_width=None):
+        self.label.ensurePolished()
+        fm = self.label.fontMetrics()
         width = max(SET_BUTTON_MIN_WIDTH, fm.horizontalAdvance(self.set_name) + 24)
-        return QtCore.QSize(int(width), max(26, SET_BUTTON_MIN_HEIGHT))
+        if maximum_width is not None:
+            width = min(width, max(1, int(maximum_width)))
+        return QtCore.QSize(int(width), max(26, SET_BUTTON_MIN_HEIGHT, fm.height() + 8))
 
     def _size_from_data(self, data):
         if not isinstance(data, dict):
@@ -1048,15 +1051,18 @@ class SetButton(QtWidgets.QFrame):
             max(1, int(round(self.board_size.height() * zoom)))
         )
 
-    def _apply_button_size(self):
+    def _apply_button_size(self, row_width=None):
         self.board_size.setWidth(max(SET_BUTTON_MIN_WIDTH, min(SET_BUTTON_MAX_WIDTH, self.board_size.width())))
         self.board_size.setHeight(max(SET_BUTTON_MIN_HEIGHT, min(SET_BUTTON_MAX_HEIGHT, self.board_size.height())))
         layout = self.layout()
         if layout is not None:
             margin = max(1, min(10, int(round(10 * self._board_zoom())))) if self.free_move_mode else 10
             layout.setContentsMargins(margin, 0, margin, 0)
-        self.setFixedSize(self._visual_board_size() if self.free_move_mode else self._row_size())
-        self.label.setText(self.set_name)
+        self.setFixedSize(self._visual_board_size() if self.free_move_mode else self._row_size(row_width))
+        text = self.set_name if self.free_move_mode else self.label.fontMetrics().elidedText(
+            self.set_name, QtCore.Qt.ElideRight, max(0, self.width() - 24)
+        )
+        self.label.setText(text)
         self.apply_style()
         self._position_resize_grip()
         self.update()
@@ -2172,6 +2178,10 @@ class FlowContainer(QtWidgets.QWidget):
 
     def __init__(self):
         super(FlowContainer, self).__init__()
+        self._reflowing = False
+        self._reflow_timer = QtCore.QTimer(self)
+        self._reflow_timer.setSingleShot(True)
+        self._reflow_timer.timeout.connect(self.reflow)
         self.setProperty("materialContainer",True)
         self.setAutoFillBackground(False)
         self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent,False)
@@ -2982,6 +2992,15 @@ class FlowContainer(QtWidgets.QWidget):
         self._auto_save()
         
     def reflow(self):
+        if self._reflowing:
+            return
+        self._reflowing = True
+        try:
+            self._reflow_layout()
+        finally:
+            self._reflowing = False
+
+    def _reflow_layout(self):
         for btn in self.buttons:
             btn.setVisible(not btn.filtered_out)
         visible_buttons = [btn for btn in self.buttons if not btn.filtered_out]
@@ -3015,14 +3034,15 @@ class FlowContainer(QtWidgets.QWidget):
         for btn in self.buttons:
             if btn.free_move_mode:
                 btn.set_free_move_mode(False)
-        self._set_ordered_bounds(50)
+        self.setMinimumWidth(0)
         x = margin
         y = margin
         row_height = 0
-        max_width = max(self.width(), 200)
+        max_width = max(1, self._viewport_size().width())
         
         for btn in visible_buttons:
             btn.set_free_move_mode(False)
+            btn._apply_button_size(row_width=max_width - margin * 2)
             bw = btn.width()
             bh = btn.height()
             
@@ -3045,7 +3065,11 @@ class FlowContainer(QtWidgets.QWidget):
         
     def resizeEvent(self, e):
         super(FlowContainer, self).resizeEvent(e)
-        self.reflow()
+        if self._reflowing:
+            if e.oldSize().width() != e.size().width():
+                self._reflow_timer.start(0)
+        else:
+            self.reflow()
 
     def _normalized_rect(self, start, end):
         return QtCore.QRect(start, end).normalized()
@@ -3269,12 +3293,17 @@ class TabPage(QtWidgets.QWidget):
         
     def setup_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
+        # Let resizeEvent wrap the header before its wide size hint can force
+        # the entire window wider than the requested size.
+        layout.setSizeConstraint(QtWidgets.QLayout.SetNoConstraint)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
         
         # Namespace row
         ns_row = QtWidgets.QHBoxLayout()
         ns_row.setSpacing(6)
+        self._controls_row = ns_row
+        self._controls_wrapped = None
         
         self.ns_combo = QtWidgets.QComboBox()
         self.ns_combo.setMinimumWidth(100)
@@ -3409,7 +3438,20 @@ class TabPage(QtWidgets.QWidget):
         self.color_filter_layout.setContentsMargins(2, 0, 2, 0)
         self.color_filter_layout.setSpacing(1)
         self.color_filter_dots = {}
-        ns_row.addWidget(self.color_filter_widget)
+        self.color_filter_scroll = QtWidgets.QScrollArea(self)
+        self.color_filter_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.color_filter_scroll.setWidgetResizable(False)
+        self.color_filter_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.color_filter_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.color_filter_scroll.setFixedHeight(28)
+        self.color_filter_scroll.setMinimumWidth(0)
+        self.color_filter_scroll.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.color_filter_scroll.setWidget(self.color_filter_widget)
+        for canvas in (self.color_filter_scroll, self.color_filter_scroll.viewport(), self.color_filter_widget):
+            canvas.setProperty("materialContainer", True)
+            canvas.setAutoFillBackground(False)
+            canvas.setStyleSheet("background: transparent; border: none;")
+        ns_row.addWidget(self.color_filter_scroll)
 
         ns_row.addStretch()
         
@@ -3433,6 +3475,13 @@ class TabPage(QtWidgets.QWidget):
         ns_row.addWidget(self.add_btn)
         
         layout.addLayout(ns_row)
+        self._controls_wrap_widget = QtWidgets.QWidget(self)
+        self._controls_wrap_widget.setProperty("materialContainer", True)
+        self._controls_wrap_layout = QtWidgets.QHBoxLayout(self._controls_wrap_widget)
+        self._controls_wrap_layout.setContentsMargins(0, 0, 0, 0)
+        self._controls_wrap_layout.setSpacing(6)
+        self._controls_wrap_widget.hide()
+        layout.addWidget(self._controls_wrap_widget)
         
         # Scroll + container
         self.scroll = QtWidgets.QScrollArea()
@@ -3466,7 +3515,37 @@ class TabPage(QtWidgets.QWidget):
         
         layout.addWidget(self.scroll)
 
+    def _reflow_controls(self):
+        if not hasattr(self, "_controls_wrap_widget"):
+            return
+        primary = [self.ns_combo, self.namespace_lock_btn, self.set_visibility_btn]
+        secondary = [self.row_mode_btn, self.board_mode_btn, self.snap_check, self.color_filter_scroll]
+        required = self.ns_combo.minimumWidth() + 40 + 6 * 7 + self.add_btn.width()
+        required += sum(widget.sizeHint().width() for widget in primary[1:] + secondary[:3]
+                        if not widget.isHidden())
+        available = max(0, self.width() - 16)
+        wrapped = available < required
+        if wrapped == self._controls_wrapped:
+            return
+        self._controls_wrapped = wrapped
+        for row in (self._controls_row, self._controls_wrap_layout):
+            while row.count():
+                row.takeAt(0)
+        for widget in primary:
+            self._controls_row.addWidget(widget, 1 if widget is self.ns_combo else 0)
+        destination = self._controls_wrap_layout if wrapped else self._controls_row
+        for widget in secondary:
+            destination.addWidget(widget, 1 if widget is self.color_filter_scroll else 0)
+        self._controls_row.addWidget(self.add_btn)
+        self._controls_wrap_widget.setVisible(wrapped)
+
+    def resizeEvent(self, event):
+        super(TabPage, self).resizeEvent(event)
+        self._reflow_controls()
+
     def eventFilter(self, obj, event):
+        if obj is self.scroll.viewport() and event.type() == QtCore.QEvent.Resize:
+            self.container._reflow_timer.start(0)
         if self.container.layout_mode == "board":
             if event.type() == QtCore.QEvent.MouseButtonPress:
                 if self.container._start_board_pan(event):
@@ -3565,6 +3644,8 @@ class TabPage(QtWidgets.QWidget):
             self.color_filter_layout.addWidget(dot)
             self.color_filter_dots[color] = dot
         self.color_filter_widget.setVisible(bool(self.color_filter_dots))
+        self.color_filter_widget.adjustSize()
+        self._reflow_controls()
 
     def _on_color_filter_clicked(self, color, modifiers=QtCore.Qt.NoModifier):
         color = _palette_color(color)
@@ -3690,6 +3771,7 @@ class TabPage(QtWidgets.QWidget):
                 QtCore.Qt.ScrollBarAsNeeded if mode == "board" else QtCore.Qt.ScrollBarAlwaysOff
             )
             self.scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self._reflow_controls()
 
     def set_layout_mode(self, mode, save=True):
         mode = "board" if mode == "board" else "ordered"

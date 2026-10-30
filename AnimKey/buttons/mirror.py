@@ -1690,104 +1690,52 @@ def _calibrate_axis_group(source, target, sym_plane, source_attrs, target_attrs,
     return best[1] if best else {}
 
 
+def _axis_channel_attr_map(source, target, sym_plane, source_matrix=None,
+                           target_matrix=None, snapshot_cache=None):
+    """Transfer local channels with the reference tool's axis reflection rules.
+
+    Compare each reflected source axis with the same destination axis in the
+    default pose. Translation follows that sign; rotation uses its opposite,
+    except in mirrored spaces where all three signs are positive. Custom
+    scalar channels and scale copy unchanged. No name-based rig guesses.
+    """
+    source_matrix = source_matrix or _quick_structural_world_matrix(source)
+    target_matrix = target_matrix or _quick_structural_world_matrix(target)
+    source_axes = (source_matrix.x_axis(), source_matrix.y_axis(), source_matrix.z_axis())
+    target_axes = (target_matrix.x_axis(), target_matrix.y_axis(), target_matrix.z_axis())
+    normal = sym_plane.normal
+    signs = [1.0, 1.0, 1.0]
+    if _long_name(source) == _long_name(target):
+        index = max(range(3), key=lambda i: abs(_dot3(source_axes[i], normal)))
+        signs[index] = -1.0
+    else:
+        for index, (axis, other) in enumerate(zip(source_axes, target_axes)):
+            reflected = [axis[i] - 2.0 * _dot3(axis, normal) * normal[i] for i in range(3)]
+            signs[index] = -1.0 if _dot3(reflected, other) < 0.0 else 1.0
+    mirrored_space = all(sign == 1.0 for sign in signs)
+    target_attrs = set(_cached_scalar_attrs(target, snapshot_cache))
+    result = {}
+    for attr in _cached_scalar_attrs(source, snapshot_cache):
+        if attr in ATTRIBUTES_TO_IGNORE or attr not in target_attrs:
+            continue
+        index = _axis_index_from_attr(attr)
+        mult = 1.0
+        if index is not None and attr.startswith('translate'):
+            mult = signs[index]
+        elif index is not None and attr.startswith('rotate'):
+            mult = 1.0 if mirrored_space else -signs[index]
+        result[attr] = {'target': attr, 'mult': mult, 'mode': 'copy_value'}
+    return result
+
+
 def _build_calibrated_attr_map(source, target, sym_plane, snapshot_cache=None,
                                allow_finger_calibration=False):
-    attr_map = _default_attr_map(source, target, sym_plane, snapshot_cache=snapshot_cache)
-    source_attrs = _cached_scalar_attrs(source, snapshot_cache)
-    target_attrs = _cached_scalar_attrs(target, snapshot_cache)
-    if not source_attrs or not target_attrs:
-        return attr_map
-
-    # A hand pose can be captured at any frame. Finger controls therefore use
-    # their paired local channel convention directly, rather than inferring
-    # it from a potentially curled pose during a snapshot.
-    if (source != target and _is_finger_control(source)
-            and not allow_finger_calibration):
-        return _legacy_finger_attr_map(source, attr_map)
-
-    source_rest = _cached_rest_attrs(source, snapshot_cache)
-    target_rest = _cached_rest_attrs(target, snapshot_cache)
-    source_rest_mat = _cached_world_mat(source, snapshot_cache)
-    target_rest_mat = _cached_world_mat(target, snapshot_cache)
-
-    for group in (
-        ("translateX", "translateY", "translateZ"),
-        ("rotateX", "rotateY", "rotateZ"),
-    ):
-        attr_map.update(_calibrate_axis_group(
-            source, target, sym_plane, source_attrs, target_attrs,
-            source_rest, target_rest, group,
-            source_rest_mat=source_rest_mat,
-            target_rest_mat=target_rest_mat,
-            snapshot_cache=snapshot_cache,
-        ))
-
-    desired_base = _calibration_reflected_matrix(source_rest_mat, sym_plane)
-
-    for source_attr in source_attrs:
-        if source_attr in SCALE_ATTRS or source_attr in TRANSFORM_ATTRS:
-            continue
-        candidates = _attr_candidates(source_attr, target_attrs)
-        if not candidates:
-            continue
-        if not _cached_is_modifiable(source, source_attr, snapshot_cache):
-            continue
-
-        delta = _calibration_delta(source_attr)
-        source_value = source_rest.get(source_attr, 0.0)
-        if not _set_scalar_attr_cached(source, source_attr, source_value + delta, snapshot_cache):
-            continue
-
-        desired = _calibration_reflected_matrix(_mat4_from_maya(source), sym_plane)
-        _restore_attr(source, source_attr, source_value, snapshot_cache)
-
-        # Most custom attributes are switches or scalar settings that do not
-        # move their own control.  Treating a zero matrix effect as a negative
-        # calibration was a major source of flipped IK/FK and space switches.
-        if _matrix_error(desired_base, desired) <= 0.000001:
-            target_attr = source_attr if source_attr in candidates else candidates[0]
-            target_value = target_rest.get(target_attr, 0.0)
-            mult = -1.0 if (
-                abs(source_value + target_value) < 0.001
-                and abs(source_value - target_value) >= 0.001
-            ) else 1.0
-            try:
-                attr_type = cmds.getAttr(f"{source}.{source_attr}", type=True)
-            except Exception:
-                attr_type = "double"
-            spec = {"target": target_attr, "mult": mult}
-            if attr_type in ("bool", "enum", "byte", "char", "short", "long"):
-                spec["mode"] = "copy_value"
-                spec["mult"] = 1.0
-            else:
-                driven_sign = _calibrate_driven_custom_attr(
-                    source, target, source_attr, sym_plane,
-                    source_rest, target_rest, snapshot_cache)
-                if driven_sign is not None:
-                    spec["mult"] = driven_sign
-            attr_map[source_attr] = spec
-            continue
-
-        best = None
-        for target_attr in candidates:
-            if not _cached_is_modifiable(target, target_attr, snapshot_cache):
-                continue
-            target_value = target_rest.get(target_attr, 0.0)
-            for mult in (1.0, -1.0):
-                _set_scalar_attr_cached(target, target_attr, target_value + (delta * mult), snapshot_cache)
-                err = _matrix_delta_error(desired_base, desired, target_rest_mat, _mat4_from_maya(target))
-                if best is None or err < best[0]:
-                    best = (err, target_attr, mult)
-                _restore_attr(target, target_attr, target_value, snapshot_cache)
-
-        if best:
-            attr_map[source_attr] = {"target": best[1], "mult": best[2]}
-
-    _restore_attrs(source, source_rest, snapshot_cache)
-    _restore_attrs(target, target_rest, snapshot_cache)
-    for spec in attr_map.values():
-        spec["mode"] = "copy_value"
-    return attr_map
+    return _axis_channel_attr_map(
+        source, target, sym_plane,
+        source_matrix=_cached_world_mat(source, snapshot_cache),
+        target_matrix=_cached_world_mat(target, snapshot_cache),
+        snapshot_cache=snapshot_cache,
+    )
 
 
 def _get_parent_world_matrix(control):
@@ -2704,6 +2652,7 @@ def _create_mirror_snapshot(selected_controls, rig_name=None, rig_label=None,
     snapshot_data = {
         "version"       : SNAPSHOT_SCHEMA_VERSION,
         "profile_kind"  : "precise",
+        "channel_mirror_version": 1,
         "calibration_version": CALIBRATION_VERSION if allow_finger_calibration else 0,
         "created_at"    : time.time(),
         "rig_name"      : rig_name,
@@ -2913,38 +2862,8 @@ def snapshot_mirror_settings(*args):
     from AnimKey.core.executionGuard import require_animkey_context
     if not require_animkey_context("AnimKey.buttons.mirror.snapshot_mirror_settings"):
         return None
-    selected_controls = _expand_to_candidate_controls(cmds.ls(selection=True) or [])
-    if not selected_controls:
-        cmds.warning("AnimKey: Select all rig controls in T-Pose / default pose.")
-        return
-
-    grouped = _group_controls_by_rig(selected_controls)
-    if not grouped:
-        cmds.warning("AnimKey: No valid rig controls found for snapshot.")
-        return
-
-    results = []
-    for rig_name, info in grouped.items():
-        result = _create_default_pose_mirror_snapshot(
-            info["controls"],
-            rig_name=rig_name,
-            rig_label=info["label"],
-            show_message=(len(grouped) == 1),
-            expand_controls=False,
-            calibration_file=_saved_animbot_calibration_file(),
-        )
-        if result:
-            results.append(result)
-
-    if len(results) > 1:
-        rig_count = len(results)
-        pair_count = sum(item["paired"] for item in results)
-        central_count = sum(item["central"] for item in results)
-        cmds.inViewMessage(
-            amg=(f"<span style='color:#a3be8c'>Mirror snapshots saved</span><br>"
-                 f"<span style='color:#ebcb8b'>{rig_count} rigs - {pair_count} pairs - {central_count} central</span>"),
-            pos='topCenter', fade=True, fadeStayTime=2500
-        )
+    from AnimKey.core import reference_transfer as transfer
+    return transfer.snapshot(cmds.ls(selection=True) or [])
 
 
 def _safe_getattr(node, attr, default=None):
@@ -3548,6 +3467,7 @@ def _build_basic_mirror_snapshot(seed_controls, rig_name=None, rig_label=None,
     snapshot_data = {
         "version": SNAPSHOT_SCHEMA_VERSION,
         "profile_kind": "quick",
+        "channel_mirror_version": 1,
         "calibrated_fingers": True,
         "rig_name": rig_name,
         "rig_label": rig_label,
@@ -3588,8 +3508,8 @@ def _build_basic_mirror_snapshot(seed_controls, rig_name=None, rig_label=None,
             "rest_attrs": _quick_default_attrs(ctrl, control_cache),
             "custom_mults": {},
             "structure_fingerprint": _control_structure_fingerprint(ctrl, control_cache),
-            "attr_map": _quick_semantic_attr_map(
-                ctrl, target, sym_plane, control_cache
+            "attr_map": _axis_channel_attr_map(
+                ctrl, target, sym_plane, snapshot_cache=control_cache
             ),
         }
         if opp_id:
@@ -3955,15 +3875,18 @@ def _legacy_finger_attr_map(control, base_map=None):
 
 
 def _effective_attr_map(source, target, snapshot, sym_plane, source_data=None):
-    """Resolve a snapshot map, correcting pre-finger-calibration snapshots."""
-    attr_map = (source_data.get("attr_map") if source_data else None)
-    if not attr_map:
-        attr_map = _default_attr_map(source, target, sym_plane)
-    # Do not use a momentary snapshot pose as a finger rest pose. This also
-    # upgrades pre-existing snapshots, including ones made with a curled hand.
-    if _is_finger_control(source) and not snapshot.get("calibrated_fingers"):
-        return _legacy_finger_attr_map(source, attr_map)
-    return attr_map
+    """Use axis channel transfer, including profiles saved by earlier versions."""
+    source_data = source_data or _snap_ctrl_data(source, snapshot) or {}
+    if snapshot and snapshot.get('channel_mirror_version') == 1 and source_data.get('attr_map'):
+        return source_data['attr_map']
+    target_data = _snap_ctrl_data(target, snapshot) or {}
+    def rest_matrix(data):
+        values = data.get('rest_world_mat')
+        return Mat4(values) if values else None
+    return _axis_channel_attr_map(
+        source, target, sym_plane,
+        source_matrix=rest_matrix(source_data), target_matrix=rest_matrix(target_data),
+    )
 
 
 def _is_modifiable(control, attr):
@@ -4142,7 +4065,7 @@ def _sanitize_mirror_values(ctrl, target, snapshot, values):
     """Reject values that are likely to explode a rig."""
     if not values:
         return {}
-    if snapshot.get("calibration_version", 0) >= CALIBRATION_VERSION:
+    if snapshot:
         return {attr: float(value) for attr, value in values.items()
                 if isinstance(value, (int, float)) and math.isfinite(value)}
     pair_width = _mirror_pair_width(ctrl, target, snapshot)
@@ -4352,128 +4275,18 @@ def _apply_mirror_to_control(ctrl, opposite, sym_plane, snapshot,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def mirror(*args):
-    """Mirror the selected pose, or the selected time-slider range when present."""
-    try:
-        mirror_started = time.perf_counter()
-        selected = cmds.ls(selection=True)
-        if not selected:
-            cmds.warning("AnimKey: Select at least one control.")
-            return
-
-        selected_channels = _get_selected_channels()
-        start, end, has_selected_range = _time_slider_or_playback_range()
-        if has_selected_range:
-            total = mirror_selected_animation(
-                selected,
-                attrs_filter=selected_channels,
-                time_range=(start, end),
-                manage_undo=True,
-            )
-            if total:
-                cmds.inViewMessage(
-                    amg=(
-                        "<span style='color:#88c0d0'>Mirrored selected animation "
-                        "(%s-%s): %s keys</span>" % (start, end, total)
-                    ),
-                    pos="topCenter", fade=True, fadeStayTime=1000,
-                )
-            else:
-                cmds.warning(
-                    "AnimKey Mirror: No animation keys found in selected range %s-%s."
-                    % (start, end)
-                )
-            return total
-
-        graph_total = _mirror_selected_graph_keys(
-            selected,
-            attrs_filter=selected_channels,
-            manage_undo=True,
-        )
-        if graph_total is not None:
-            if graph_total:
-                cmds.inViewMessage(
-                    amg=(
-                        "<span style='color:#88c0d0'>Mirrored selected graph keys: "
-                        "%s</span>" % graph_total
-                    ),
-                    pos="topCenter", fade=True, fadeStayTime=900,
-                )
-            else:
-                cmds.warning("AnimKey Mirror: No mirrored channels found for selected graph keys.")
-            return graph_total
-
-        prepared_groups = _prepared_snapshot_groups(selected)
-        total = 0
-
-        _open_animkey_undo_chunk("AnimKey Mirror")
-        try:
-            for prepared in prepared_groups:
-                info = prepared["info"]
-                count, _ = _mirror_selected_pose_two_phase(
-                    info["controls"],
-                    prepared["snapshot"],
-                    prepared["sym_plane"],
-                    selected_channels,
-                )
-                total += count
-        finally:
-            _close_animkey_undo_chunk()
-
-        if total:
-            elapsed_ms = (time.perf_counter() - mirror_started) * 1000.0
-            cmds.inViewMessage(
-                amg=(f"<span style='color:#88c0d0'>Mirror: "
-                     f"{total} values ({elapsed_ms:.1f} ms)</span>"),
-                pos='topCenter', fade=True, fadeStayTime=800
-            )
-    except Exception as e:
-        cmds.warning(f"AnimKey Mirror: {e}")
-        import traceback; traceback.print_exc()
+    from AnimKey.core import reference_transfer as transfer
+    selected = cmds.ls(selection=True) or []
+    start, end, has_range = _time_slider_or_playback_range()
+    return transfer.mirror_action(selected, time_range=(start, end) if has_range else None)
 
 
 def _mirror_to_side(target_side, controls=None, attrs_filter=None):
-    """Run Mirror Pose only from the selected source side to ``target_side``."""
-    controls = list(controls) if controls else (cmds.ls(selection=True) or [])
-    if not controls:
-        cmds.warning("AnimKey: Select source-side controls to mirror.")
-        return 0
-
-    prepared_groups = _prepared_snapshot_groups(controls)
-    _open_animkey_undo_chunk("AnimKey Mirror To %s" % target_side.title())
-    try:
-        total = 0
-        for prepared in prepared_groups:
-            info = prepared["info"]
-            snapshot = prepared["snapshot"]
-            sym_plane = prepared["sym_plane"]
-            runtime_plane = _runtime_symmetry_plane(
-                snapshot, sym_plane, info["controls"]
-            )
-            source_controls = []
-            for source in info["controls"]:
-                target = (
-                    (_snap_opposite(source, snapshot) if snapshot else None)
-                    or find_opposite_smart(source, sym_plane)
-                )
-                if (target and cmds.objExists(target)
-                        and _control_side(target, runtime_plane) == target_side):
-                    source_controls.append(source)
-            count, _ = _mirror_selected_pose_two_phase(
-                source_controls, snapshot, sym_plane, attrs_filter
-            )
-            total += count
-        if total:
-            cmds.inViewMessage(
-                amg="<span style='color:#88c0d0'>Mirrored to %s: %s values</span>" % (
-                    target_side, total
-                ),
-                pos="topCenter", fade=True, fadeStayTime=800,
-            )
-        else:
-            cmds.warning("AnimKey: No opposite controls found for Mirror to %s." % target_side.title())
-        return total
-    finally:
-        _close_animkey_undo_chunk()
+    from AnimKey.core import reference_transfer as transfer
+    selected = list(controls) if controls else (cmds.ls(selection=True) or [])
+    start, end, has_range = _time_slider_or_playback_range()
+    return transfer.mirror_action(selected, time_range=(start, end) if has_range else None,
+                                  target_side=target_side)
 
 
 def mirror_to_left(*args):
@@ -4487,44 +4300,7 @@ def mirror_to_right(*args):
 
 
 def quick_mirror(*args):
-    """Mirror the current pose using only the fast in-memory rig profile."""
-    from AnimKey.core.executionGuard import require_animkey_context
-    if not require_animkey_context("AnimKey.buttons.mirror.quick_mirror"):
-        return None
-
-    selected = cmds.ls(selection=True) or []
-    if not selected:
-        cmds.warning("AnimKey: Select controls to quick mirror.")
-        return 0
-
-    started = time.perf_counter()
-    selected_channels = _get_selected_channels()
-    prepared_groups = _prepared_snapshot_groups(selected, force_quick=True)
-    total = 0
-    _open_animkey_undo_chunk("AnimKey Quick Mirror")
-    try:
-        for prepared in prepared_groups:
-            info = prepared["info"]
-            count, _ = _mirror_selected_pose_two_phase(
-                info["controls"],
-                prepared["snapshot"],
-                prepared["sym_plane"],
-                selected_channels,
-            )
-            total += count
-    finally:
-        _close_animkey_undo_chunk()
-
-    if total:
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
-        cmds.inViewMessage(
-            amg=("<span style='color:#88c0d0'>Quick Mirror: {} values "
-                 "({:.1f} ms)</span>".format(total, elapsed_ms)),
-            pos="topCenter", fade=True, fadeStayTime=800,
-        )
-    else:
-        cmds.warning("AnimKey Quick Mirror: No opposite controls found.")
-    return total
+    return mirror(*args)
 
 
 def _mirror_pair_values_from_matrix(source_mat, source_ctrl, target_ctrl,
@@ -4544,9 +4320,17 @@ def _apply_values_to_control(target, values, attrs_filter=None,
             values, attrs_filter, include_scale=include_scale):
         if attr in excluded_attrs or attr not in values:
             continue
+        plug = f"{target}.{attr}"
+        layer = curve_transfer.active_animation_layer()
+        if curve_transfer.resolve_anim_curve(plug, layer_name=layer):
+            frame = cmds.currentTime(query=True)
+            if curve_transfer.set_key_on_layer(plug, frame, values[attr], layer_name=layer):
+                cmds.keyTangent(plug, time=(frame, frame), inTangentType='auto', outTangentType='auto')
+                count += 1
+            continue
         if prevalidated:
             try:
-                cmds.setAttr(f"{target}.{attr}", values[attr])
+                cmds.setAttr(plug, values[attr])
                 count += 1
                 continue
             except Exception:
@@ -4650,6 +4434,10 @@ def _apply_pending_mirror(pending, attrs_filter=None, include_scale=False):
     except BaseException:
         _restore_pending_mirror_state(scalar_values, world_matrices)
         raise
+    if total:
+        # Key edits can leave a layered destination displaying its old value
+        # until Maya evaluates time again. Refresh once for the whole packet.
+        cmds.currentTime(cmds.currentTime(query=True), edit=True, update=True)
     return total, touched
 
 
@@ -4678,7 +4466,7 @@ def _selected_mirror_directions(controls, snapshot, sym_plane):
             directions.append((ctrl, opposite, False))
             if _long_name(opposite) in selected_keys:
                 directions.append((opposite, ctrl, False))
-        elif (_snap_ctrl_data(ctrl, snapshot) or {}).get("type") == "central":
+        else:
             directions.append((ctrl, ctrl, True))
 
     return directions
@@ -5030,9 +4818,13 @@ def _transfer_animation_jobs(jobs, time_range=None, clear_empty_sources=False):
         cache_key = (job["source"], job["source_attr"])
         if cache_key not in capture_cache:
             curve = curves.get(f"{job['source']}.{job['source_attr']}")
+            frames = (cmds.keyframe(curve, query=True, time=effective_range,
+                                    timeChange=True) or []) if curve else []
             capture_cache[cache_key] = (curve_transfer.capture_curve(
-                curve, time_range=effective_range, layer_name=layer_name,
-            ) if curve else None)
+                curve, key_times=frames, layer_name=layer_name,
+            ) if frames else None)
+            if capture_cache[cache_key]:
+                capture_cache[cache_key].pop('clip_range', None)
         curve_data = capture_cache.get(cache_key)
         if not curve_data:
             if clear_empty_sources:
@@ -5042,9 +4834,6 @@ def _transfer_animation_jobs(jobs, time_range=None, clear_empty_sources=False):
                 destinations.add((job["target"], job["target_attr"]))
             continue
 
-        # One-way mirroring keeps an unkeyed source from erasing a sparse
-        # destination channel. Two-sided swaps opt into clearing above.
-        destinations.add((job["target"], job["target_attr"]))
 
         multiplier = float(job.get("mult", 1.0))
         value_offset = 0.0
@@ -5082,7 +4871,7 @@ def _transfer_animation_jobs(jobs, time_range=None, clear_empty_sources=False):
         else:
             fallback.append((target, attr, curve_data, multiplier, value_offset))
     pasted = curve_transfer.paste_curves_batch(
-        batch, layer_name=layer_name, clear_existing=False)
+        batch, layer_name=layer_name, clear_existing=True)
     total += sum(len(payload.get("keyframes", []))
                  for (_, payload), success in zip(batch, pasted) if success)
     for target, attr, curve_data, multiplier, value_offset in fallback:
@@ -5090,7 +4879,7 @@ def _transfer_animation_jobs(jobs, time_range=None, clear_empty_sources=False):
             f"{target}.{attr}",
             curve_data,
             layer_name=layer_name,
-            clear_existing=False,
+            clear_existing=True,
             value_scale=multiplier,
             value_offset=value_offset,
         )
@@ -5265,14 +5054,15 @@ def _mirror_selected_graph_keys_for_rig(controls, snapshot, sym_plane,
             source_curve = entry.get("curve") or f"{job['source']}.{job['source_attr']}"
             cache_key = (source_curve, tuple(frames))
             if cache_key not in capture_cache:
-                capture_cache[cache_key] = curve_transfer.capture_curve(
-                    source_curve,
-                    time_range=(min(frames), max(frames)),
-                    layer_name=layer_name,
-                )
-            curve_data = _trim_curve_data_to_selected_frames(
-                capture_cache.get(cache_key), frames
-            )
+                interval = (min(frames), max(frames))
+                copied_frames = cmds.keyframe(source_curve, query=True, time=interval,
+                                              timeChange=True) or []
+                capture_cache[cache_key] = (curve_transfer.capture_curve(
+                    source_curve, key_times=copied_frames, layer_name=layer_name,
+                ) if copied_frames else None)
+                if capture_cache[cache_key]:
+                    capture_cache[cache_key].pop('clip_range', None)
+            curve_data = capture_cache.get(cache_key)
             if not curve_data:
                 continue
 
@@ -5287,21 +5077,13 @@ def _mirror_selected_graph_keys_for_rig(controls, snapshot, sym_plane,
             captures.append((dest_plug, curve_data, multiplier, value_offset))
             break
 
-    for dest_plug, frames in destinations.items():
-        for frame in frames:
-            curve_transfer.clear_attr_range(
-                dest_plug,
-                (float(frame), float(frame)),
-                layer_name=layer_name,
-            )
-
     total = 0
     for dest_plug, curve_data, multiplier, value_offset in captures:
         pasted, key_count = curve_transfer.paste_curve(
             dest_plug,
             curve_data,
             layer_name=layer_name,
-            clear_existing=False,
+            clear_existing=True,
             value_scale=multiplier,
             value_offset=value_offset,
         )
@@ -5319,6 +5101,8 @@ def _mirror_selected_graph_keys(controls=None, attrs_filter=None, manage_undo=Tr
     if not graph_entries:
         return None
 
+    selected_objects = cmds.ls(selection=True, long=True) or []
+    selected_keys = curve_transfer.selected_curve_key_times()
     prepared_groups = _prepared_snapshot_groups(controls)
     if manage_undo:
         _open_animkey_undo_chunk("AnimKey Mirror Selected Graph Keys")
@@ -5341,6 +5125,14 @@ def _mirror_selected_graph_keys(controls=None, attrs_filter=None, manage_undo=Tr
             ) or 0
         return total
     finally:
+        # Native pasteKey clears active keys. Restore the exact source key
+        # selection after the transfer, including sparse/multi-curve picks.
+        if selected_objects:
+            cmds.select(selected_objects, replace=True)
+        cmds.selectKey(clear=True)
+        for curve, frames in selected_keys.items():
+            if cmds.objExists(curve):
+                cmds.selectKey(curve, time=[(frame, frame) for frame in frames], add=True)
         if refresh_suspended:
             try:
                 cmds.refresh(suspend=False)
@@ -5520,174 +5312,156 @@ def _legacy_all_mirror(*args):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def all_mirror(*args):
-    """Mirror/swap animation over the selected time range, or playback range."""
     from AnimKey.core.executionGuard import require_animkey_context
     if not require_animkey_context("AnimKey.buttons.mirror.all_mirror"):
         return None
-    try:
-        selected = cmds.ls(selection=True) or []
-        if not selected:
-            cmds.warning("AnimKey: Select at least one control.")
-            return
+    from AnimKey.core import reference_transfer as transfer
+    start, end, has_range = _time_slider_or_playback_range()
+    return transfer.mirror_action(cmds.ls(selection=True) or [],
+        time_range=(start, end) if has_range else None, all_keys=True)
 
-        selected_channels = _get_selected_channels()
-        prepared_groups = _prepared_snapshot_groups(selected)
-        start, end, has_selected_range = _time_slider_or_playback_range()
-        time_range = (start, end)
 
-        _open_animkey_undo_chunk("AnimKey All Mirror")
-        refresh_suspended = False
-        try:
+class _AutoMirrorResources:
+    """Own callbacks so disabled/reloaded sessions cannot run queued work."""
+    def __init__(self):
+        self.active = True
+        self.jobs = []
+
+    def guard(self, callback):
+        def guarded(*args):
+            if self.active:
+                return callback(*args)
+        return guarded
+
+    def close(self):
+        self.active = False
+        for job in self.jobs:
             try:
-                cmds.refresh(suspend=True)
-                refresh_suspended = True
+                if cmds.scriptJob(exists=job):
+                    cmds.scriptJob(kill=job, force=True)
             except Exception:
                 pass
-            total = 0
-            animation_mode = False
-            missing_range_keys = False
-
-            for prepared in prepared_groups:
-                info = prepared["info"]
-                snapshot = prepared["snapshot"]
-                sym_plane = prepared["sym_plane"]
-                controls_for_keys = _expand_controls_with_opposites(
-                    info["controls"], snapshot, sym_plane
-                )
-                jobs = _animation_mirror_channel_jobs(
-                    controls_for_keys,
-                    snapshot,
-                    sym_plane,
-                    selected_channels,
-                )
-                if _animation_jobs_have_keys(jobs, time_range):
-                    animation_mode = True
-                    total += _transfer_animation_jobs(
-                        jobs,
-                        time_range=time_range,
-                        clear_empty_sources=True,
-                    )
-                elif not has_selected_range:
-                    count, _ = _mirror_selected_pose_two_phase(
-                        info["controls"], snapshot, sym_plane, selected_channels
-                    )
-                    total += count
-                else:
-                    missing_range_keys = True
-        finally:
-            if refresh_suspended:
-                try:
-                    cmds.refresh(suspend=False)
-                except Exception:
-                    pass
-            _close_animkey_undo_chunk()
-
-        if total:
-            if animation_mode:
-                label = f"{start:g}-{end:g}" if has_selected_range else "playback range"
-                cmds.inViewMessage(
-                    amg=f"<span style='color:#88c0d0'>Mirrored animation ({label}): {total} values</span>",
-                    pos='topCenter', fade=True, fadeStayTime=1200
-                )
-            else:
-                cmds.inViewMessage(
-                    amg=f"<span style='color:#88c0d0'>Swapped pose: {total} values</span>",
-                    pos='topCenter', fade=True, fadeStayTime=1200
-                )
-            return
-
-        if has_selected_range and missing_range_keys:
-            cmds.warning(f"AnimKey All Mirror: No keys found in selected range {start:g}-{end:g}.")
-            return
-        cmds.warning("AnimKey All Mirror: No mirrorable values found.")
-    except Exception as e:
-        cmds.warning(f"AnimKey All Mirror: {e}")
-        import traceback; traceback.print_exc()
+        self.jobs = []
 
 
 class AutoMirrorState:
-    enabled       = False
+    enabled = False
     script_job_id = None
-    last_run      = 0.0
+    last_run = 0.0
     last_signature = None
+    in_callback = False
+    generation = 0
+    resources = None
+    baseline_pending = False
+
 
 _auto_mirror_state = AutoMirrorState()
 
 
+def _auto_mirror_signature(selected):
+    values = []
+    for control in selected:
+        channels = []
+        for attr in _scalar_keyable_attrs(control):
+            value = _safe_getattr(control, attr)
+            if isinstance(value, (int, float)):
+                channels.append((attr, round(float(value), 6)))
+        values.append(tuple(channels))
+    return (tuple(selected), round(float(cmds.currentTime(query=True)), 4), tuple(values))
+
+
 def _auto_mirror_callback():
-    if not _auto_mirror_state.enabled:
+    state = _auto_mirror_state
+    if not state.enabled or state.in_callback:
         return
     try:
         now = time.perf_counter()
-        if now - _auto_mirror_state.last_run < (1.0 / 30.0):
+        if now - state.last_run < (1.0 / 30.0):
             return
-        _auto_mirror_state.last_run = now
-        selected = cmds.ls(selection=True)
-        if not selected:
+        state.last_run = now
+        selected = cmds.ls(selection=True) or []
+        signature = _auto_mirror_signature(selected)
+        previous = state.last_signature
+        # Scrubbing, playback and undo/redo establish a new baseline. They
+        # must never create animation or immediately reapply an undone mirror.
+        rebasing = bool(cmds.play(query=True, state=True))
+        rebasing = rebasing or not cmds.undoInfo(query=True, redoQueueEmpty=True)
+        if previous is not None and signature[:2] != previous[:2]:
+            rebasing = True
+        if state.baseline_pending or rebasing or not selected or signature == previous:
+            state.baseline_pending = False
+            state.last_signature = signature
             return
+        changed = selected
+        if previous is not None:
+            changed = [control for index, control in enumerate(selected)
+                       if signature[2][index] != previous[2][index]]
+        state.in_callback = True
+        from AnimKey.core import reference_transfer as transfer
+        transfer.prepare_profiles(changed)
+        _open_animkey_undo_chunk('AnimKey Auto Mirror')
+        try:
+            transfer.mirror_action(changed, pose_only=True)
+            # Remember the result, so our own destination writes are never
+            # mistaken for a fresh edit on the next idle event.
+            state.last_signature = _auto_mirror_signature(selected)
+        finally:
+            _close_animkey_undo_chunk()
+            state.in_callback = False
+    except Exception:
+        state.in_callback = False
 
-        signature_values = []
-        for ctrl in selected:
-            try:
-                matrix = cmds.getAttr(f"{ctrl}.worldMatrix[0]")
-                if matrix and isinstance(matrix[0], (list, tuple)):
-                    matrix = matrix[0]
-                signature_values.extend(round(float(value), 6) for value in matrix)
-            except Exception:
-                pass
-            for attr in (cmds.listAttr(ctrl, userDefined=True, keyable=True) or []):
-                value = _safe_getattr(ctrl, attr)
-                if isinstance(value, (int, float)):
-                    signature_values.append(round(float(value), 6))
-        signature = (
-            tuple(selected),
-            round(float(cmds.currentTime(query=True)), 4),
-            tuple(signature_values),
-        )
-        if signature == _auto_mirror_state.last_signature:
-            return
-        _auto_mirror_state.last_signature = signature
 
-        for rig_name, info in _group_controls_by_rig(selected).items():
-            snapshot, _ = _load_or_build_basic_snapshot(
-                info["controls"], rig_name=rig_name, rig_label=info["label"]
-            )
-            if not snapshot:
-                continue
-            _mirror_selected_pose_two_phase(
-                info["controls"],
-                snapshot,
-                _snap_sym_plane(snapshot),
-            )
-    except:
-        pass
+def _ensure_auto_mirror_job():
+    state = _auto_mirror_state
+    if not state.enabled:
+        return
+    if state.resources is None or not state.resources.active:
+        state.resources = _AutoMirrorResources()
+        def rebase(*args):
+            state.baseline_pending = True
+        for event in ('Undo', 'Redo'):
+            job = cmds.scriptJob(event=[event, state.resources.guard(rebase)], killWithScene=True)
+            state.resources.jobs.append(job)
+    if state.script_job_id and cmds.scriptJob(exists=state.script_job_id):
+        return
+    generation = state.generation
+    def callback():
+        if state.enabled and state.generation == generation:
+            _auto_mirror_callback()
+    state.script_job_id = cmds.scriptJob(
+        event=['idle', state.resources.guard(callback)], killWithScene=True)
+    state.resources.jobs.append(state.script_job_id)
 
 
 def enable_auto_mirror(*args):
-    global _auto_mirror_state
-    if _auto_mirror_state.enabled:
-        return
-    _auto_mirror_state.script_job_id = cmds.scriptJob(
-        event=["idle", _auto_mirror_callback], killWithScene=True
-    )
-    _auto_mirror_state.enabled = True
-    _auto_mirror_state.last_run = 0.0
-    _auto_mirror_state.last_signature = None
+    state = _auto_mirror_state
+    if not state.enabled:
+        state.generation += 1
+        state.enabled = True
+        state.last_run = 0.0
+        state.last_signature = _auto_mirror_signature(cmds.ls(selection=True) or [])
+        state.baseline_pending = False
+    _ensure_auto_mirror_job()
     cmds.inViewMessage(amg="<span style='color:#a3be8c'>Auto Mirror: ON</span>",
                        pos='topCenter', fade=True, fadeStayTime=1000)
 
 
 def disable_auto_mirror(*args):
-    global _auto_mirror_state
-    _auto_mirror_state.enabled = False
-    _auto_mirror_state.last_signature = None
-    if _auto_mirror_state.script_job_id:
+    state = _auto_mirror_state
+    state.enabled = False
+    state.generation += 1
+    state.last_signature = None
+    state.baseline_pending = False
+    if state.resources:
+        state.resources.close()
+    if state.script_job_id:
         try:
-            if cmds.scriptJob(exists=_auto_mirror_state.script_job_id):
-                cmds.scriptJob(kill=_auto_mirror_state.script_job_id, force=True)
-        except:
+            if cmds.scriptJob(exists=state.script_job_id):
+                cmds.scriptJob(kill=state.script_job_id, force=True)
+        except Exception:
             pass
-        _auto_mirror_state.script_job_id = None
+        state.script_job_id = None
     cmds.inViewMessage(amg="<span style='color:#bf616a'>Auto Mirror: OFF</span>",
                        pos='topCenter', fade=True, fadeStayTime=1000)
 
@@ -5700,6 +5474,7 @@ def toggle_auto_mirror(*args):
 
 
 def is_auto_mirror_enabled():
+    _ensure_auto_mirror_job()
     return _auto_mirror_state.enabled
 
 
@@ -5710,7 +5485,12 @@ def is_auto_mirror_enabled():
 def _get_selected_channels():
     try:
         cb = mel.eval('global string $gChannelBoxName; $temp=$gChannelBoxName;')
-        return cmds.channelBox(cb, q=True, selectedMainAttributes=True) or []
+        attrs = cmds.channelBox(cb, q=True, selectedMainAttributes=True) or []
+        selected = cmds.ls(selection=True) or []
+        if selected:
+            attrs = [cmds.attributeQuery(attr, node=selected[0], longName=True) or attr
+                     for attr in attrs]
+        return attrs
     except:
         return []
 
@@ -5723,6 +5503,8 @@ def delete_mirror_snapshot(*args):
     if not selected:
         cmds.warning("AnimKey: Select a control to identify the rig.")
         return
+    from AnimKey.core import reference_transfer as transfer
+    transfer.remove_snapshot(selected)
     rig_name = get_rig_identifier(selected)
     removed = False
     for path in _mirror_snapshot_candidates(rig_name):

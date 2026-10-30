@@ -109,7 +109,7 @@ class MirrorCalibrationTests(unittest.TestCase):
         mirror._mirror_selected_pose_two_phase([controls[0]], snapshot, plane)
         self.assertAlmostEqual(cmds.getAttr(controls[1] + ".curl"), 4.0)
 
-    def test_indirect_custom_rotation_is_measured_on_driven_nodes(self):
+    def test_custom_scalar_channels_copy_unchanged_like_reference(self):
         controls, plane = self.pair()
         for node, name, x in zip(controls, ("driven_L", "driven_R"), (3.0, -3.0)):
             cmds.addAttr(node, longName="poleTwist", attributeType="double", keyable=True)
@@ -121,10 +121,10 @@ class MirrorCalibrationTests(unittest.TestCase):
             cmds.connectAttr(mult + ".output", driven + ".rotateZ")
         snapshot = self.snapshot(controls)
         mapping = mirror._snap_ctrl_data(controls[0], snapshot)["attr_map"]
-        self.assertEqual(mapping["poleTwist"]["mult"], -1.0)
+        self.assertEqual(mapping["poleTwist"]["mult"], 1.0)
         cmds.setAttr(controls[0] + ".poleTwist", 28.0)
         mirror._mirror_selected_pose_two_phase([controls[0]], snapshot, plane)
-        self.assertAlmostEqual(cmds.getAttr(controls[1] + ".poleTwist"), -28.0)
+        self.assertAlmostEqual(cmds.getAttr(controls[1] + ".poleTwist"), 28.0)
 
     def test_old_calibration_is_not_reused(self):
         controls, _ = self.pair()

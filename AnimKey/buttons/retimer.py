@@ -501,6 +501,9 @@ class Retimer(object):
         if not sel:
             cmds.warning("Select objects to add")
             return []
+        was_previewing = self.is_preview_on()
+        if was_previewing:
+            self.preview_off()
         current = self.objects
         added = []
         for obj in sel:
@@ -508,14 +511,91 @@ class Retimer(object):
                 current.append(obj)
                 added.append(obj)
         self.objects = current
+        if was_previewing:
+            self.preview_on()
         return added
 
     def remove_objects(self, objs):
         """Remove specific objects from this retimer."""
+        was_previewing = self.is_preview_on()
+        if was_previewing:
+            self.preview_off()
         current = self.objects
         self.objects = [o for o in current if o not in objs]
+        if was_previewing and self.objects:
+            self.preview_on()
 
     # ── Preview ───────────────────────────────────────────────────────────
+
+    def _alembic_nodes(self):
+        """Find cache readers on selected nodes, shapes and group descendants."""
+        caches = set()
+        for obj in self.objects:
+            nodes = [obj]
+            if cmds.objectType(obj, isAType="dagNode"):
+                nodes.extend(cmds.listRelatives(obj, allDescendents=True, fullPath=True) or [])
+            for node in nodes:
+                if cmds.nodeType(node) == "AlembicNode":
+                    caches.add(node)
+                for upstream in cmds.listHistory(node, pruneDagObjects=False) or []:
+                    if cmds.nodeType(upstream) == "AlembicNode":
+                        caches.add(upstream)
+        return sorted(caches)
+
+    def _connect_alembic_preview(self, cache, warped_time):
+        """Add W(t)-t to the original clock, preserving offsets and connections.
+
+        Native time blend nodes keep frame/second conversions correct at every
+        scene FPS. Alembic's own offset, speed and cycle settings remain active.
+        """
+        plug = cache + ".time"
+        if cmds.getAttr(plug, lock=True):
+            raise RuntimeError("The Alembic time input is locked")
+        sources = cmds.listConnections(plug, source=True, destination=False, plugs=True) or []
+        item = {"input": plug, "sources": sources, "value": cmds.getAttr(plug),
+                "kind": "alembic", "nodes": []}
+        try:
+            delta = cmds.createNode("animBlendNodeTime", name=self.curve + "_cacheDelta#")
+            item["nodes"].append(delta)
+            cmds.setAttr(delta + ".weightA", 1.0)
+            cmds.setAttr(delta + ".weightB", -1.0)
+            cmds.connectAttr(warped_time, delta + ".inputA")
+            cmds.connectAttr("time1.outTime", delta + ".inputB")
+            clock = cmds.createNode("animBlendNodeTime", name=self.curve + "_cacheClock#")
+            item["nodes"].append(clock)
+            cmds.setAttr(clock + ".weightA", 1.0)
+            cmds.setAttr(clock + ".weightB", 1.0)
+            if sources:
+                cmds.connectAttr(sources[0], clock + ".inputA")
+            else:
+                cmds.setAttr(clock + ".inputA", item["value"])
+            cmds.connectAttr(delta + ".output", clock + ".inputB")
+            cmds.connectAttr(clock + ".output", plug, force=True)
+            return item
+        except Exception:
+            # Restore even if creating a branch failed halfway through.
+            self._restore_preview_item(item)
+            raise
+
+    @staticmethod
+    def _restore_preview_item(item):
+        plug = item.get("input") or (item.get("curve", "") + ".input")
+        if cmds.objExists(plug):
+            for source in cmds.listConnections(plug, source=True, destination=False, plugs=True) or []:
+                cmds.disconnectAttr(source, plug)
+            sources = item.get("sources") or []
+            for source in sources:
+                if cmds.objExists(source):
+                    cmds.connectAttr(source, plug, force=True)
+                    break
+            else:
+                if "value" in item:
+                    cmds.setAttr(plug, item["value"])
+                elif not sources:
+                    cmds.connectAttr("time1.outTime", plug, force=True)
+        for node in reversed(item.get("nodes", [])):
+            if cmds.objExists(node):
+                cmds.delete(node)
 
     def is_preview_on(self):
         """Check if preview has live retime connections."""
@@ -543,6 +623,8 @@ class Retimer(object):
         def node_is_controlled(node):
             if not node:
                 return False
+            if cmds.nodeType(node) == "AlembicNode":
+                return False  # Cache time uses its own offset-preserving branch.
             if _short_name(node) in obj_short_names:
                 return True
             return bool(set(cmds.ls(node, long=True) or []) & obj_long_names)
@@ -681,7 +763,7 @@ class Retimer(object):
                     if not cmds.objExists(obj):
                         continue
                     obj_samples = samples.setdefault(obj, {})
-                    attrs = attrs_by_obj.get(obj) if attrs_by_obj else self._keyable_scalar_attrs(obj)
+                    attrs = attrs_by_obj.get(obj) if attrs_by_obj is not None else self._keyable_scalar_attrs(obj)
                     for attr in attrs or []:
                         plug = obj + "." + attr
                         try:
@@ -740,6 +822,9 @@ class Retimer(object):
 
     def bake_to_anim_layer(self):
         """Bake the retimer result as additive deltas on a new animLayer."""
+        if self._alembic_nodes():
+            cmds.warning("Alembic cache time cannot use animation layers. Use BAKE to keep the retimed cache.")
+            return None
         objs = self.objects
         if not objs:
             cmds.warning("No objects to bake")
@@ -887,8 +972,15 @@ class Retimer(object):
             except Exception as e:
                 cmds.warning(f"Preview connection skipped for {anim_curve}: {e}")
 
+        for cache in self._alembic_nodes():
+            try:
+                preview_data.append(self._connect_alembic_preview(cache, attr))
+                connected += 1
+            except Exception as e:
+                cmds.warning(f"Alembic preview connection skipped for {cache}: {e}")
+
         if not connected:
-            cmds.warning("No animated curves found on retimer objects")
+            cmds.warning("No animation or Alembic time inputs could be connected for preview")
             return
 
         try:
@@ -907,32 +999,7 @@ class Retimer(object):
                 data = []
 
         for item in data:
-            anim_curve = item.get("curve")
-            input_attr = item.get("input") or (anim_curve + ".input" if anim_curve else "")
-            if not input_attr or not cmds.objExists(input_attr):
-                continue
-
-            current_sources = cmds.listConnections(
-                input_attr,
-                source=True,
-                destination=False,
-                plugs=True
-            ) or []
-            for source in current_sources:
-                try:
-                    cmds.disconnectAttr(source, input_attr)
-                except Exception:
-                    pass
-
-            sources = item.get("sources") or ["time1.outTime"]
-            for source in sources:
-                if not cmds.objExists(source):
-                    continue
-                try:
-                    cmds.connectAttr(source, input_attr, force=True)
-                    break
-                except Exception:
-                    pass
+            self._restore_preview_item(item)
 
         if cmds.objExists(self.curve) and cmds.attributeQuery("retimerPreviewData", node=self.curve, exists=True):
             try:
@@ -1050,12 +1117,15 @@ class Retimer(object):
         try:
             self._force_preview_off()
             anim_curves = self._animated_curves()
-            if not anim_curves:
-                cmds.warning("No animated curves found on retimer objects")
+            caches = self._alembic_nodes()
+            if not anim_curves and not caches:
+                cmds.warning("No animated curves or Alembic caches found on retimer objects")
                 return None
 
             attr_map = self._animated_scalar_attr_map(objs)
-            if not attr_map:
+            for cache in caches:
+                attr_map.pop(cache, None)
+            if not attr_map and not caches:
                 cmds.warning("No animated scalar attributes found on retimer objects")
                 return None
 
@@ -1064,20 +1134,29 @@ class Retimer(object):
                     total_keys_before += len(cmds.keyframe(curve, query=True, timeChange=True) or [])
 
             final_samples = {}
+            cache_samples = {}
             try:
                 self.preview_on()
                 if not self.is_preview_on():
                     cmds.warning("Retimer preview could not be enabled for bake")
+                    return None
+                preview_data = json.loads(cmds.getAttr(self._preview_data_attr) or "[]")
+                cache_inputs = {item["input"] for item in preview_data if item.get("kind") == "alembic"}
+                if any(cache + ".time" not in cache_inputs for cache in caches):
+                    cmds.warning("Alembic bake cancelled: not all cache time inputs could be connected")
                     return None
                 final_samples = self._sample_object_attrs_for_bake(
                     objs,
                     frame_map,
                     attrs_by_obj=attr_map
                 )
+                cache_samples = self._sample_object_attrs_for_bake(
+                    caches, frame_map, attrs_by_obj={cache: ["time"] for cache in caches}
+                )
             finally:
                 self._force_preview_off()
 
-            if not final_samples:
+            if not final_samples and not cache_samples:
                 cmds.warning("No retimed samples were created")
                 return None
 
@@ -1109,6 +1188,23 @@ class Retimer(object):
                         cmds.keyTangent(plug, edit=True, time=(start, end), inTangentType="auto", outTangentType="auto")
                     except Exception:
                         pass
+
+            # Keep the geometry cache and its native offset/speed intact. Bake
+            # only the cache clock; transform keys cannot reproduce deformation.
+            for cache, attrs in cache_samples.items():
+                values = attrs.get("time", [])
+                if not values:
+                    continue
+                curve = cmds.createNode("animCurveTT", name=_short_name(cache) + "_retimedTime#")
+                for frame, value in values:
+                    cmds.setKeyframe(curve, time=frame, value=value)
+                cmds.keyTangent(curve, inTangentType="linear", outTangentType="linear")
+                cmds.setAttr(curve + ".preInfinity", 1)
+                cmds.setAttr(curve + ".postInfinity", 1)
+                cmds.connectAttr("time1.outTime", curve + ".input", force=True)
+                cmds.connectAttr(curve + ".output", cache + ".time", force=True)
+                keyed += len(values)
+                total_keys_after += len(values)
 
             for anim_curve in self._animated_curves():
                 try:

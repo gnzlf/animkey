@@ -181,13 +181,13 @@ class CopyPasteSceneRegressionTests(unittest.TestCase):
         self.assertTrue(cmds.getAttr(layer + ".lock"))
         self.assertEqual(curve_values(target, "translateX", layer), before)
 
-    def test_insert_respects_selected_range_start_with_leading_empty_frames(self):
+    def test_insert_starts_at_first_copied_key_without_sampling_range_boundaries(self):
         source, target = control("source"), control("target")
         keys(source, "translateX", [(5, 2), (10, 8)])
         with mock.patch.object(tool, "get_selected_time_range", return_value=(1, 12)):
             self.invoke(tool.copy_animation, source)
         self.invoke(tool.paste_insert_animation, target, 40)
-        self.assertEqual(curve_values(target, "translateX"), ([40, 44, 49, 51], [2, 2, 8, 8]))
+        self.assertEqual(curve_values(target, "translateX"), ([40, 45], [2, 8]))
 
     def test_insert_replaces_old_keys_inside_clip_without_changing_other_times(self):
         source, target = control("source"), control("target")
@@ -196,8 +196,10 @@ class CopyPasteSceneRegressionTests(unittest.TestCase):
         self.invoke(tool.copy_animation, source)
         self.invoke(tool.paste_insert_animation, target, 40)
         self.assertEqual(curve_values(target, "translateX"), ([1, 40, 50, 70], [-5, 2, 8, 33]))
+        # Captured from the original Animo v10.7.5 engine: auto tangents
+        # are recalculated against the destination's outside neighbours.
         self.assertAlmostEqual(cmds.keyframe(target+".translateX", q=True, eval=True,
-                                            time=(45, 45))[0], 5.)
+                                            time=(45, 45))[0], 4.039965986394542)
 
     def test_missing_base_curve_does_not_resolve_to_another_layer(self):
         source = control("source")

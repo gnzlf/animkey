@@ -77,6 +77,7 @@ DEFAULT_CONFIG = {
     "crash_recovery_scene_snapshot_minutes": 10,
     
     # Window Settings
+    "ui_opening_animations_enabled": True,
     "window_opacity": 1.0,
     "always_on_top": False,
     

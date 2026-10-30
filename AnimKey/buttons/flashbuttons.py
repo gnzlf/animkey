@@ -17,7 +17,7 @@ from AnimKey.mods.storage import atomic_write_json, read_json
 from AnimKey.mods.maya_compat import (
     QtCore, QtGui, QtWidgets, execute_qt, is_qt_object_valid, wrap_instance as wrapInstance,
 )
-from AnimKey.core.window_reveal import apply_window_reveal
+from AnimKey.core.window_reveal import apply_window_reveal, opening_animations_enabled
 
 Qt = QtCore.Qt
 QApplication = QtWidgets.QApplication
@@ -319,6 +319,11 @@ class FlashButton(QPushButton):
         self.label_text = label
         self.button_id = button_id
         self.hover = False
+        self._hover_amount = 0.0
+        self._hover_animation = QtCore.QVariantAnimation(self)
+        self._hover_animation.setDuration(120)
+        self._hover_animation.setEasingCurve(QEasingCurve.OutCubic)
+        self._hover_animation.valueChanged.connect(self._set_hover_amount)
         self.pressed_state = False
         self.is_locked = True
         self.dragging = False
@@ -537,6 +542,10 @@ class FlashButton(QPushButton):
         """Draw a circular grey Flash Button with a subtle colored tint."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        scale = 0.90 + 0.10 * self._hover_amount
+        painter.translate(self.width() / 2, self.height() / 2)
+        painter.scale(scale, scale)
+        painter.translate(-self.width() / 2, -self.height() / 2)
 
         accent = self.hover_color if self.hover or self.pressed_state else self.HOVER_COLORS[
             self.base_color_index % len(self.HOVER_COLORS)
@@ -607,64 +616,34 @@ class FlashButton(QPushButton):
             painter.setFont(font)
             painter.drawText(circle_rect, Qt.AlignCenter, self._fallback_label())
 
+    def _set_hover_amount(self, value):
+        self._hover_amount = float(value)
+        self.update()
+
+    def _animate_hover(self, active):
+        self._hover_animation.stop()
+        self._hover_animation.setStartValue(self._hover_amount)
+        self._hover_animation.setEndValue(1.0 if active and self.is_locked else 0.0)
+        self._hover_animation.start()
+
     def enterEvent(self, event):
-        """Efecto hover - nuevo color aleatorio"""
         self.hover = True
         self.hover_color = random.choice(self.HOVER_COLORS)
-        self.update()
-        
-        if self.is_locked:
-            if not hasattr(self, 'base_pos'):
-                self.base_pos = self.pos()
-            
-            if hasattr(self, 'animation') and self.animation.state() == QPropertyAnimation.Running:
-                self.animation.stop()
-            
-            # Animación de escala
-            new_size = int(self.original_size * 1.15)
-            offset = (new_size - self.original_size) // 2
-            
-            self.animation = QPropertyAnimation(self, b"geometry")
-            new_geo = QRect(
-                self.base_pos.x() - offset,
-                self.base_pos.y() - offset,
-                new_size,
-                new_size
-            )
-            
-            self.animation.setDuration(150)
-            self.animation.setStartValue(self.geometry())
-            self.animation.setEndValue(new_geo)
-            self.animation.setEasingCurve(QEasingCurve.OutBack)
-            self.animation.start()
-    
+        self._animate_hover(True)
+        super(FlashButton, self).enterEvent(event)
+
     def leaveEvent(self, event):
-        """Fin del hover"""
         self.hover = False
-        self.update()
-        
-        if self.is_locked and hasattr(self, 'base_pos'):
-            if hasattr(self, 'animation') and self.animation.state() == QPropertyAnimation.Running:
-                self.animation.stop()
-            
-            self.animation = QPropertyAnimation(self, b"geometry")
-            restore_geo = QRect(
-                self.base_pos.x(),
-                self.base_pos.y(),
-                self.original_size,
-                self.original_size
-            )
-            
-            self.animation.setDuration(150)
-            self.animation.setStartValue(self.geometry())
-            self.animation.setEndValue(restore_geo)
-            self.animation.setEasingCurve(QEasingCurve.InBack)
-            self.animation.finished.connect(lambda: self.move(self.base_pos))
-            self.animation.start()
-    
+        self._animate_hover(False)
+        super(FlashButton, self).leaveEvent(event)
+
     def mousePressEvent(self, event):
         """Estado presionado y inicio de arrastre"""
         if event.button() == Qt.LeftButton:
+            for name in ('_panel_animation', '_panel_animation_timer'):
+                motion = getattr(self, name, None)
+                if is_qt_object_valid(motion):
+                    motion.stop()
             # Check if clicking on delete button area (when unlocked)
             if not self.is_locked:
                 delete_rect = QRectF(self.width() - 18, 2, 16, 16)
@@ -1222,7 +1201,7 @@ class FlashButtonsPanel(QWidget):
         self.hide_timer.stop()
         self.fade_animation.stop()
         for button in self.buttons:
-            for name in ('_panel_animation', '_panel_animation_timer', '_edit_timer'):
+            for name in ('_panel_animation', '_panel_animation_timer', '_edit_timer', '_hover_animation'):
                 animation = getattr(button, name, None)
                 if is_qt_object_valid(animation):
                     animation.stop()
@@ -1230,7 +1209,7 @@ class FlashButtonsPanel(QWidget):
     def _animate_button(self, button, start, end, delay=0):
         animation = getattr(button, '_panel_animation', None)
         if not is_qt_object_valid(animation):
-            animation = QPropertyAnimation(button, b"geometry", button)
+            animation = QPropertyAnimation(button, b"pos", button)
             button._panel_animation = animation
             timer = QTimer(button)
             timer.setSingleShot(True)
@@ -1238,11 +1217,29 @@ class FlashButtonsPanel(QWidget):
             button._panel_animation_timer = timer
         animation.stop()
         button._panel_animation_timer.stop()
-        animation.setDuration(300)
-        animation.setStartValue(start)
-        animation.setEndValue(end)
+        button.setGeometry(end)
+        if not opening_animations_enabled():
+            return
+        button.move(start.topLeft())
+        animation.setDuration(180)
+        animation.setStartValue(start.topLeft())
+        animation.setEndValue(end.topLeft())
         animation.setEasingCurve(QEasingCurve.OutCubic)
         button._panel_animation_timer.start(delay)
+
+    def _on_opening_animations_changed(self, enabled):
+        if enabled:
+            return
+        self.fade_animation.stop()
+        for button in self.buttons:
+            for name in ('_panel_animation', '_panel_animation_timer'):
+                animation = getattr(button, name, None)
+                if is_qt_object_valid(animation):
+                    animation.stop()
+            position = self.button_positions.get(button.button_id, button.pos())
+            button.setGeometry(QRect(position, QSize(self.button_size, self.button_size)))
+        if self.isVisible():
+            self.setWindowOpacity(1.0)
 
     def hideEvent(self, event):
         self._stop_panel_animations()
@@ -1455,9 +1452,8 @@ class FlashButtonsPanel(QWidget):
         
         # Mostrar el botón con animación
         button.show()
-        center = self.button_container.rect().center()
-        start_geo = QRect(center.x(), center.y(), 0, 0)
         end_geo = QRect(int(container_center_x + x), int(container_center_y + y), self.button_size, self.button_size)
+        start_geo = end_geo.translated(0, 10)
         
         self._animate_button(button, start_geo, end_geo)
         
@@ -1465,7 +1461,7 @@ class FlashButtonsPanel(QWidget):
         button._edit_timer = QTimer(button)
         button._edit_timer.setSingleShot(True)
         button._edit_timer.timeout.connect(lambda: self.edit_button(button.button_id))
-        button._edit_timer.start(350)
+        button._edit_timer.start(220 if opening_animations_enabled() else 0)
         
         self.save_config()
     
@@ -1525,12 +1521,8 @@ class FlashButtonsPanel(QWidget):
             self.button_positions[button.button_id] = new_pos
             
             # Animar a la nueva posición
-            animation = QPropertyAnimation(button, b"pos")
-            animation.setDuration(200)
-            animation.setStartValue(button.pos())
-            animation.setEndValue(new_pos)
-            animation.setEasingCurve(QEasingCurve.OutCubic)
-            animation.start()
+            self._animate_button(button, QRect(button.pos(), button.size()),
+                                 QRect(new_pos, QSize(self.button_size, self.button_size)))
         
         self.save_config()
     
@@ -1628,18 +1620,18 @@ class FlashButtonsPanel(QWidget):
         
         self.hide_timer.start()
         
-        # Animación de opacidad
-        self.fade_animation.setStartValue(0.0)
-        self.fade_animation.setEndValue(1.0)
-        self.fade_animation.start()
-        
-        # Animar botones desde el centro
-        center = self.button_container.rect().center()
+        if opening_animations_enabled():
+            self.fade_animation.setStartValue(0.0)
+            self.fade_animation.setEndValue(1.0)
+            self.fade_animation.start()
+        else:
+            self.setWindowOpacity(1.0)
         
         for i, button in enumerate(self.buttons):
             button.show()
-            
-            start_geo = QRect(center.x(), center.y(), 0, 0)
+            button.hover = False
+            button.pressed_state = False
+            button._set_hover_amount(0.0)
             
             if button.button_id in self.button_positions:
                 pos = self.button_positions[button.button_id]
@@ -1648,7 +1640,7 @@ class FlashButtonsPanel(QWidget):
                 end_geo = button.geometry()
                 end_geo.setSize(QSize(self.button_size, self.button_size))
             
-            self._animate_button(button, start_geo, end_geo, delay=i * 35)
+            self._animate_button(button, end_geo.translated(0, 10), end_geo, delay=i * 20)
     
     def hide_panel(self):
         """Oculta el panel inmediatamente"""

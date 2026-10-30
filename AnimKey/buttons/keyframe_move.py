@@ -6,6 +6,7 @@ from AnimKey.core.animation_curve_transfer import (
     ANIM_CURVE_TYPES,
     active_animation_layer,
     is_base_layer,
+    selected_time_range,
 )
 from AnimKey.core.animation_offset_session import resolve_target_curve_for_layer
 from AnimKey.sliders.slider_utils import get_selected_channels, should_process_attribute
@@ -129,8 +130,8 @@ def _move_curve_key_to_time(curve, source_frame, destination_frame):
         return False
 
 
-def _curves_for_context(objects=None, attrs=None):
-    selected_curves = _selected_anim_curves()
+def _curves_for_context(objects=None, attrs=None, use_selected_keys=True):
+    selected_curves = _selected_anim_curves() if use_selected_keys else []
     if selected_curves:
         return selected_curves
 
@@ -157,25 +158,32 @@ def _move_current_keys_to_offset(curves, current_time, frame_offset):
     return moved
 
 
+def _move_key_block(curves, frame_offset, time_range=None):
+    """Move a complete range/Graph selection without implicit active-key scope."""
+    edits = []
+    scope = {"time": tuple(time_range)} if time_range is not None else {"selected": True}
+    for curve in curves:
+        frames = _as_unique_sorted_frames(cmds.keyframe(curve, query=True, timeChange=True, **scope) or [])
+        if not frames:
+            continue
+        all_frames = _as_unique_sorted_frames(cmds.keyframe(curve, query=True, timeChange=True) or [])
+        stationary = [t for t in all_frames if not any(abs(t-f) <= FRAME_EPSILON for f in frames)]
+        if any(abs(frame+frame_offset-other) <= FRAME_EPSILON for frame in frames for other in stationary):
+            cmds.warning("AnimKey: A destination key is occupied; the selected key block was left unchanged.")
+            return 0
+        edits.append((curve, frames))
+    for curve, _frames in edits:
+        cmds.keyframe(curve, edit=True, relative=True, timeChange=float(frame_offset), option="over",
+                      time=[(frame, frame) for frame in _frames])
+    return sum(len(frames) for _curve, frames in edits)
+
+
 def _move_selected_keys_by_offset(frame_offset):
-    selected_curves = _selected_anim_curves()
-    if not selected_curves:
-        return 0
-
-    selected_key_count = 0
-    for curve in selected_curves:
-        try:
-            selected_key_count += len(cmds.keyframe(curve, query=True, selected=True, timeChange=True) or [])
-        except Exception:
-            pass
-    if not selected_key_count:
-        return 0
-
-    cmds.keyframe(edit=True, relative=True, timeChange=float(frame_offset))
-    return selected_key_count
+    return _move_key_block(_selected_anim_curves(), frame_offset)
 
 
-def move_key_with_arrow(direction, frame_amount=1, objects=None, attrs=None, current_time=None):
+def move_key_with_arrow(direction, frame_amount=1, objects=None, attrs=None, current_time=None,
+                        allow_neighbor=True):
     """
     Apply the toolbar arrow behavior.
 
@@ -191,20 +199,24 @@ def move_key_with_arrow(direction, frame_amount=1, objects=None, attrs=None, cur
         current_time = float(current_time)
 
     frame_offset = abs(float(frame_amount)) * (1 if direction > 0 else -1)
-    curves = _curves_for_context(objects=objects, attrs=attrs)
+    time_range = selected_time_range()
+    curves = _curves_for_context(objects=objects, attrs=attrs, use_selected_keys=time_range is None)
 
     moved = 0
     mode = "none"
     cmds.undoInfo(openChunk=True)
     try:
-        moved = _move_selected_keys_by_offset(frame_offset)
-        if moved:
-            mode = "selected"
+        if time_range is not None:
+            moved = _move_key_block(curves, frame_offset, time_range=time_range)
+            return {"mode": "range", "moved": moved}
+        if _selected_anim_curves():
+            moved = _move_selected_keys_by_offset(frame_offset)
+            return {"mode": "selected", "moved": moved}
         else:
             moved = _move_current_keys_to_offset(curves, current_time, frame_offset)
             if moved:
                 mode = "current"
-            else:
+            elif allow_neighbor:
                 for curve in curves:
                     frames = _as_unique_sorted_frames(cmds.keyframe(curve, query=True, timeChange=True) or [])
                     source_frame = _nearest_source_frame(frames, current_time, direction)

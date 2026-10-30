@@ -3,6 +3,29 @@
 from AnimKey.mods.maya_compat import QtCore, is_qt_object_valid
 
 
+def opening_animations_enabled():
+    try:
+        from AnimKey.mods import configMod
+        return bool(configMod.get_setting("ui_opening_animations_enabled", True))
+    except (ImportError, RuntimeError):
+        return True
+
+
+def set_opening_animations_enabled(enabled):
+    from AnimKey.mods import configMod
+    from AnimKey.mods.maya_compat import QtWidgets
+    configMod.set_setting("ui_opening_animations_enabled", bool(enabled))
+    app = QtWidgets.QApplication.instance()
+    if app is not None:
+        for widget in app.allWidgets():
+            reveal = getattr(widget, "_window_reveal", None)
+            if not enabled and is_qt_object_valid(reveal):
+                reveal.cancel(restore=True)
+            changed = getattr(widget, "_on_opening_animations_changed", None)
+            if changed is not None:
+                changed(bool(enabled))
+
+
 class WindowReveal(QtCore.QObject):
     aboutToStart = QtCore.Signal()
     settled = QtCore.Signal()
@@ -51,7 +74,8 @@ class WindowReveal(QtCore.QObject):
 
     def _prime(self):
         window = self.window
-        if (not self.enabled or not is_qt_object_valid(window) or not window.isVisible()
+        if (not self.enabled or not opening_animations_enabled()
+                or not is_qt_object_valid(window) or not window.isVisible()
                 or window.isMaximized() or window.isFullScreen()):
             return
         self._target = window.pos()
@@ -64,8 +88,12 @@ class WindowReveal(QtCore.QObject):
 
     def _start(self):
         self.pending = False
-        if is_qt_object_valid(self.window) and self.window.isVisible():
+        if (self.enabled and opening_animations_enabled()
+                and is_qt_object_valid(self.window) and self.window.isVisible()):
             self._animation.start()
+        else:
+            self._step(0.0)
+            self.settled.emit()
 
     def cancel(self, restore=False):
         active = self.running or self.pending

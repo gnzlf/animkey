@@ -25,6 +25,8 @@ from AnimKey.mods.maya_compat import (
 )
 from AnimKey.mods.storage import atomic_write_json
 from AnimKey.core.animation_curve_transfer import capture_curve, paste_curve
+from AnimKey.core.settings_style import SettingsSwitch
+from AnimKey.core.window_reveal import opening_animations_enabled, set_opening_animations_enabled
 
 
 QT_NO_BUTTON = getattr(QtCore.Qt, "NoButton", None)
@@ -1702,6 +1704,20 @@ class RecoveryWindow(ContextPopupWindow):
         header_layout.addWidget(self.power_btn)
         
         container_layout.addWidget(header)
+
+        motion_row = QtWidgets.QHBoxLayout()
+        motion_row.setContentsMargins(14, 8, 14, 0)
+        self.opening_animations_switch = SettingsSwitch("Opening animations")
+        self.opening_animations_switch.setObjectName("openingAnimationsSwitch")
+        self.opening_animations_switch.setToolTip(
+            "Animate opening windows, slider menus and Flash Buttons. "
+            "Turn off to show them immediately."
+        )
+        self.opening_animations_switch.setChecked(opening_animations_enabled())
+        self.opening_animations_switch.toggled.connect(set_opening_animations_enabled)
+        motion_row.addWidget(self.opening_animations_switch)
+        motion_row.addStretch()
+        container_layout.addLayout(motion_row)
         
         # Content
         content = QtWidgets.QWidget()
