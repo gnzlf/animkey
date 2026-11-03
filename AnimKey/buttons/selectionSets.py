@@ -578,53 +578,42 @@ class PopupInput(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         
+        # The window material paints the rounded body; the container only
+        # provides breathing room so nothing touches the rounded corners.
         container = QtWidgets.QFrame()
-        container.setStyleSheet("""
-            QFrame {
-                background-color: #333333;
-                border: 1px solid #333333;
-                border-radius: 8px;
-            }
-        """)
-        
+
         c_layout = QtWidgets.QVBoxLayout(container)
-        c_layout.setContentsMargins(12, 12, 12, 12)
-        c_layout.setSpacing(8)
+        c_layout.setContentsMargins(14, 14, 14, 14)
+        c_layout.setSpacing(10)
 
         input_row = QtWidgets.QHBoxLayout()
         input_row.setSpacing(8)
-        
+
+        # Styled by the shared material stylesheet, like every AnimKey field.
         self.input = QtWidgets.QLineEdit()
         self.input.setPlaceholderText(self._placeholder)
         self.input.setText(self._initial_text)
-        self.input.setMinimumWidth(180)
-        self.input.setStyleSheet("""
-            QLineEdit {
-                background-color: #383838;
-                border: 1px solid #444444;
-                border-radius: 6px;
-                padding: 10px 12px;
-                color: #F5F5F7;
-                font-size: 12px;
-            }
-            QLineEdit:focus { border-color: #3498DB; }
-        """)
+        self.input.setMinimumWidth(220)
         self.input.returnPressed.connect(self.submit)
-        input_row.addWidget(self.input)
-        
-        ok_btn = QtWidgets.QPushButton("✓")
-        ok_btn.setFixedSize(36, 36)
+        input_row.addWidget(self.input, 1)
+
+        self.ok_btn = ok_btn = QtWidgets.QPushButton("✓")
+        ok_btn.setProperty("preserveMaterialStyle", True)
         ok_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        ok_btn.setToolTip("Confirm (Enter)")
         ok_btn.setStyleSheet("""
             QPushButton {
                 background-color: #3498DB;
                 color: white;
-                font-size: 16px;
+                font-size: 15px;
                 font-weight: bold;
                 border: 1px solid #3498DB;
-                border-radius: 6px;
+                border-radius: 7px;
+                padding: 0px;
+                min-height: 0px;
             }
             QPushButton:hover { background-color: #4AA3DF; border-color: #4AA3DF; }
+            QPushButton:pressed { background-color: #2C83BE; border-color: #2C83BE; }
         """)
         ok_btn.clicked.connect(self.submit)
         input_row.addWidget(ok_btn)
@@ -673,10 +662,40 @@ class PopupInput(QtWidgets.QWidget):
         self.submitted.emit(self.input.text().strip())
         self.close()
         
+    def _fit_to_content(self):
+        """Size from the final (material) style, then stay fully on screen.
+
+        The shared stylesheet is applied on Show, after the first size was
+        computed; without this the field, ✓ and last swatch row get clipped.
+        """
+        self.input.ensurePolished()
+        height = max(28, self.input.sizeHint().height())
+        self.ok_btn.setFixedSize(height, height)
+        layout = self.layout()
+        if layout is not None:
+            layout.invalidate()
+            layout.activate()
+        self.resize(self.sizeHint().expandedTo(self.minimumSizeHint()))
+        screen = QtWidgets.QApplication.screenAt(self.geometry().center())
+        if screen is None:
+            screen = QtWidgets.QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            x = max(area.left() + 4, min(self.x(), area.right() - self.width() - 4))
+            y = max(area.top() + 4, min(self.y(), area.bottom() - self.height() - 4))
+            if (x, y) != (self.x(), self.y()):
+                self.move(x, y)
+
+    def show_below(self, widget, offset=6):
+        """Open under ``widget``, aligned to its left edge."""
+        self.move(widget.mapToGlobal(QtCore.QPoint(0, widget.height() + offset)))
+        self.show()
+
     def showEvent(self, e):
+        super(PopupInput, self).showEvent(e)
+        self._fit_to_content()
         self.input.setFocus()
         self.input.selectAll()
-        super(PopupInput, self).showEvent(e)
         
     def keyPressEvent(self, e):
         if e.key() == QtCore.Qt.Key_Escape:
@@ -979,7 +998,9 @@ class SetButton(QtWidgets.QFrame):
     def _default_size_for_scale(self, scale=None):
         scale = self.size_scale if scale is None else float(scale or 1.0)
         fm = self.fontMetrics()
-        w = fm.horizontalAdvance(self.set_name) + 24
+        # Board buttons show a corner resize grip: leave room on both sides so
+        # the centred name never runs under it.
+        w = fm.horizontalAdvance(self.set_name) + 44
         return QtCore.QSize(
             int(max(SET_BUTTON_MIN_WIDTH, w) * scale),
             int(max(26, SET_BUTTON_MIN_HEIGHT) * scale)
@@ -1059,13 +1080,32 @@ class SetButton(QtWidgets.QFrame):
             margin = max(1, min(10, int(round(10 * self._board_zoom())))) if self.free_move_mode else 10
             layout.setContentsMargins(margin, 0, margin, 0)
         self.setFixedSize(self._visual_board_size() if self.free_move_mode else self._row_size(row_width))
-        text = self.set_name if self.free_move_mode else self.label.fontMetrics().elidedText(
-            self.set_name, QtCore.Qt.ElideRight, max(0, self.width() - 24)
-        )
-        self.label.setText(text)
         self.apply_style()
+        self.label.setText(self._fitted_label_text())
         self._position_resize_grip()
         self.update()
+
+    def _label_font_size(self):
+        zoom = self._board_zoom() if self.free_move_mode else 1.0
+        return max(4, min(28, int(round(11 * zoom))))
+
+    def _fitted_label_text(self):
+        """Name elided to the space the button really has, in both modes.
+
+        Board buttons keep their user size, so a long or renamed set must
+        elide instead of spilling past the rounded edges or under the grip.
+        """
+        font = QtGui.QFont(self.label.font())
+        font.setPixelSize(self._label_font_size())
+        metrics = QtGui.QFontMetrics(font)
+        if self.free_move_mode:
+            # Default board sizes already leave room for the corner grip; on
+            # small/zoomed-out buttons readable text matters more than the grip.
+            margin = max(1, min(10, int(round(10 * self._board_zoom()))))
+            available = self.width() - 2 * margin
+        else:
+            available = self.width() - 24
+        return metrics.elidedText(self.set_name, QtCore.Qt.ElideRight, max(0, available))
 
     def _position_resize_grip(self):
         if not hasattr(self, "resize_grip"):
@@ -1145,7 +1185,7 @@ class SetButton(QtWidgets.QFrame):
         hover = QtGui.QColor(background).lighter(115).name()
         border = "#78BFFF" if self.ui_selected else "transparent"
         zoom = self._board_zoom() if self.free_move_mode else 1.0
-        font_size = max(4, min(28, int(round(11 * zoom))))
+        font_size = self._label_font_size()
         radius = max(1, min(18, int(round(6 * zoom))))
         if self.free_move_mode:
             self.setStyleSheet(f"""
@@ -2091,14 +2131,25 @@ class SetButton(QtWidgets.QFrame):
             cmds.inViewMessage(msg=f"Removed {removed}", pos='midCenter', fade=True)
             
     def do_rename(self):
-        n, ok = QtWidgets.QInputDialog.getText(self, "Rename", "Name:", text=self.set_name)
-        if ok and n:
-            self.set_name = n
-            self.update_size()
-            self.update_tooltip()
-            if self.parent():
-                self.parent().reflow()
-            self._auto_save()
+        # Same AnimKey popup as set creation; a QInputDialog parented to the
+        # button inherits the button's QSS and renders unreadable/clipped.
+        popup = PopupInput(self.window(), "Set name...", self.set_name)
+        popup.submitted.connect(self.rename)
+        popup.show_below(self)
+        self._rename_popup = popup
+        return popup
+
+    def rename(self, name):
+        name = (name or "").strip()
+        if not name or name == self.set_name:
+            return
+        self.set_name = name
+        self.update_size()
+        self.update_tooltip()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "reflow"):
+            parent.reflow()
+        self._auto_save()
             
     def do_color(self):
         menu = QtWidgets.QMenu(self)
@@ -3306,7 +3357,11 @@ class TabPage(QtWidgets.QWidget):
         self._controls_wrapped = None
         
         self.ns_combo = QtWidgets.QComboBox()
-        self.ns_combo.setMinimumWidth(100)
+        # Wide enough for "(no namespace)" plus padding and the drop-down
+        # arrow under the shared material style; longer names elide.
+        self.ns_combo.setMinimumWidth(
+            max(120, self.ns_combo.fontMetrics().horizontalAdvance("(no namespace)") + 52)
+        )
         self.ns_combo.setStyleSheet("""
             QComboBox {
                 background-color: #383838;
@@ -3532,7 +3587,9 @@ class TabPage(QtWidgets.QWidget):
             while row.count():
                 row.takeAt(0)
         for widget in primary:
-            self._controls_row.addWidget(widget, 1 if widget is self.ns_combo else 0)
+            # The namespace field gets most of the spare width; the colour
+            # filter strip only needs what its dots use.
+            self._controls_row.addWidget(widget, 3 if widget is self.ns_combo else 0)
         destination = self._controls_wrap_layout if wrapped else self._controls_row
         for widget in secondary:
             destination.addWidget(widget, 1 if widget is self.color_filter_scroll else 0)

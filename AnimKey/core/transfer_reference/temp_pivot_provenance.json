@@ -1,0 +1,40 @@
+{
+  "reference_version": "Animo v10.7.5",
+  "source_sha256": "f51654f4161fdec06a025b90c11cbf6c6bb8f19e9d4e93a1a6bf602fea3b9f14",
+  "runtime_reference_dependency": false,
+  "helpers": [
+    "get_current_time",
+    "get_key_count",
+    "get_matrix",
+    "get_mobject",
+    "has_keyframes",
+    "hierarchy_depth",
+    "is_attr_locked",
+    "obj_exists",
+    "run_euler_filter",
+    "set_pivot_matrix",
+    "set_selection"
+  ],
+  "methods": [
+    "__init__",
+    "apply_pivot_from_ref",
+    "apply_stored_offset",
+    "build_locators",
+    "cache_locked_attrs",
+    "follow",
+    "matrices_equal",
+    "matrix_moved_significantly",
+    "on_time_changed",
+    "on_timer_tick",
+    "refresh_locators",
+    "reset_state",
+    "save_relationship_to_disk",
+    "store_pivot_offset"
+  ],
+  "interface_changes": [
+    "Internal locator names use AnimKey.",
+    "No launcher autorun, application event filter, timer or scriptJob installation in the kernel.",
+    "AnimKey supplies the proxy name, atomic preference storage and identity-aware session.",
+    "The native time-change method does not rearm a scriptJob: AnimKey owns one removable callback."
+  ]
+}

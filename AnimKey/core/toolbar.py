@@ -21,12 +21,27 @@ from AnimKey.mods.maya_compat import (
     QtGui,
     QtWidgets,
     is_qt_object_valid,
-    execute_qt,
+    execute_qt as _execute_qt,
     shiboken,
     wrap_instance,
 )
+from AnimKey.core import help_popup
 
 wrapInstance = wrap_instance
+
+
+def execute_qt(target, *args, **kwargs):
+    """Run a Qt exec; toolbar menus also get their large help cards."""
+    if isinstance(target, QtWidgets.QMenu):
+        try:
+            help_popup.install_menu(target)
+        except Exception as error:
+            print("AnimKey: help popup unavailable for menu: {}".format(error))
+    try:
+        return _execute_qt(target, *args, **kwargs)
+    finally:
+        if isinstance(target, QtWidgets.QMenu):
+            help_popup.hide()
 
 # AnimKey modules
 from AnimKey.mods.themes import ThemeManager
@@ -2028,6 +2043,10 @@ class AnimKeyToolbar:
         self._drag_manager.reorderFinished.connect(self._refresh_toolbar_scroll_area)
         self.toolbar_scroll_area._install_pan_filter(self.content_widget)
         self.toolbar_scroll_area._update_content_width()
+        try:
+            help_popup.install_toolbar(self.toolbar_scroll_area)
+        except Exception as error:
+            print("AnimKey: could not install toolbar help popups: {}".format(error))
         QtCore.QTimer.singleShot(0, self._refresh_toolbar_scroll_area)
         QtCore.QTimer.singleShot(250, self._refresh_toolbar_scroll_area)
         QtCore.QTimer.singleShot(750, self._refresh_toolbar_scroll_area)
@@ -3091,7 +3110,6 @@ class AnimKeyToolbar:
 
         target_layout.addWidget(sets_btn)
         self._button_widgets["SETS"] = sets_btn
-        self._install_toolbar_gif_preview(sets_btn, "Gifs_SelSets.gif")
         if not workspace["buttons"].get("SETS", True):
             sets_btn.setVisible(False)
             sets_btn.setMaximumWidth(0)

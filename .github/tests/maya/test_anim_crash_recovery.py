@@ -4,6 +4,8 @@ import shutil
 import tempfile
 import time
 import unittest
+import threading
+from unittest import mock
 
 import maya.standalone
 
@@ -23,6 +25,103 @@ from AnimKey.buttons import animCrash
 
 
 class AnimCrashRecoveryTests(unittest.TestCase):
+    def test_unkeyed_attributes_and_graph_changes_mark_full_snapshot_dirty(self):
+        node = cmds.createNode("transform", name="unkeyedRecovery")
+        animCrash.RecoverySystem.start()
+        animCrash.RecoverySystem._refresh_attribute_watchers()
+        animCrash.RecoverySystem._scene_snapshot_dirty = False
+        cmds.setAttr(node + ".tx", 12.)
+        self.assertTrue(animCrash.RecoverySystem._scene_snapshot_dirty)
+        parent = cmds.createNode("transform")
+        animCrash.RecoverySystem._scene_snapshot_dirty = False
+        cmds.parent(node, parent)
+        self.assertTrue(animCrash.RecoverySystem._scene_snapshot_dirty)
+        utility = cmds.createNode("addDoubleLinear")
+        animCrash.RecoverySystem._scene_snapshot_dirty = False
+        cmds.connectAttr(utility + ".output", node + ".ty")
+        self.assertTrue(animCrash.RecoverySystem._scene_snapshot_dirty)
+        animCrash.RecoverySystem._scene_snapshot_dirty = False
+        cmds.delete(utility)
+        self.assertTrue(animCrash.RecoverySystem._scene_snapshot_dirty)
+
+    def test_untitled_scenes_have_independent_identity_with_monitor_off(self):
+        first = animCrash.get_scene_id()
+        self.assertEqual(animCrash.get_scene_id(), first)
+        cmds.file(new=True, force=True)
+        self.assertNotEqual(animCrash.get_scene_id(), first)
+
+    def _start_held_writer(self, auto=False):
+        node = cmds.createNode("transform", name="HeldWriterProbe")
+        cmds.setKeyframe(node, attribute="translateX", time=1, value=4.0)
+        animCrash.request_checkpoint(auto=auto)
+        capture = animCrash._async_checkpoint_capture
+        with mock.patch.object(animCrash, "_write_checkpoint_payload_async") as writer:
+            while animCrash._async_checkpoint_capture is capture:
+                capture._process_chunk()
+            completion = writer.call_args.kwargs["on_done"]
+        return capture, completion
+
+    def test_manual_capture_is_cancelled_on_new_scene_when_monitor_is_off(self):
+        node = cmds.createNode("transform", name="ManualSceneProbe")
+        cmds.setKeyframe(node, attribute="translateX", time=1, value=3.0)
+        self.assertFalse(animCrash.RecoverySystem.is_active())
+        animCrash.request_checkpoint(auto=False)
+        capture = animCrash._async_checkpoint_capture
+        cmds.file(new=True, force=True)
+        self.assertIsNone(animCrash._async_checkpoint_capture)
+        self.assertFalse(capture.is_current())
+        self.assertFalse(capture.timer.isActive())
+        self.assertEqual(os.listdir(self.folder), [])
+
+    def test_old_writer_cannot_mark_a_new_scene_as_saved(self):
+        _capture, finish = self._start_held_writer()
+        cmds.file(new=True, force=True)
+        animCrash.RecoverySystem._dirty = True
+        with mock.patch.object(animCrash, "_defer_to_main_thread",
+                               side_effect=lambda callback, *args: callback(*args)), \
+                mock.patch.object(animCrash.RecoverySystem, "_checkpoint_completed") as completed:
+            finish("old_scene.json")
+        completed.assert_not_called()
+        self.assertTrue(animCrash.RecoverySystem._dirty)
+        self.assertFalse(animCrash._async_checkpoint_write_in_progress)
+
+    def test_pending_new_scene_request_survives_old_writer_completion(self):
+        _capture, finish = self._start_held_writer()
+        cmds.file(new=True, force=True)
+        node = cmds.createNode("transform", name="NewShotProbe")
+        cmds.setKeyframe(node, attribute="translateY", time=1, value=7.0)
+        animCrash.request_checkpoint(auto=False, desc="new shot")
+        self.assertIsNotNone(animCrash._async_checkpoint_pending)
+        with mock.patch.object(animCrash, "_defer_to_main_thread",
+                               side_effect=lambda callback, *args: callback(*args)):
+            finish("old_scene.json")
+        capture = animCrash._async_checkpoint_capture
+        self.assertIsNotNone(capture)
+        self.assertEqual(capture.desc, "new shot")
+        self.assertEqual(capture.objects, [node])
+        self.assertIsNone(animCrash._async_checkpoint_pending)
+
+    def test_completion_queued_before_stop_is_invalid_after_restart(self):
+        _capture, finish = self._start_held_writer()
+        queued = []
+        with mock.patch.object(animCrash, "_defer_to_main_thread", side_effect=queued.append):
+            finish("old_session.json")
+        animCrash.RecoverySystem.stop()
+        animCrash.RecoverySystem.start()
+        with mock.patch.object(animCrash.RecoverySystem, "_checkpoint_completed") as completed:
+            queued[0]()
+        completed.assert_not_called()
+
+    def test_dispatch_failure_never_executes_maya_callback_on_worker(self):
+        callback = mock.Mock()
+        with mock.patch.object(animCrash, "_main_thread_callback_dispatcher", None), \
+                mock.patch.object(maya_utils, "executeDeferred", side_effect=RuntimeError("shutdown")):
+            worker = threading.Thread(target=animCrash._defer_to_main_thread, args=(callback,))
+            worker.start()
+            worker.join(timeout=2.0)
+            self.assertFalse(worker.is_alive())
+        callback.assert_not_called()
+
     def setUp(self):
         cmds.file(new=True, force=True)
         self.folder = tempfile.mkdtemp(prefix="animkey_recovery_test_")
@@ -126,6 +225,18 @@ class AnimCrashRecoveryTests(unittest.TestCase):
             maya_utils.processIdleEvents()
         self.assertEqual(initial_files, sorted(os.listdir(self.folder)))
 
+    def test_manual_checkpoints_never_overwrite_within_one_second(self):
+        node = cmds.createNode("transform", name="UniqueCheckpointProbe")
+        cmds.setKeyframe(node, attribute="translateX", time=1, value=1.0)
+
+        first = animCrash.save_checkpoint(auto=False, desc="first")
+        cmds.setKeyframe(node, attribute="translateX", time=2, value=2.0)
+        second = animCrash.save_checkpoint(auto=False, desc="second")
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(os.path.exists(first))
+        self.assertTrue(os.path.exists(second))
+
     def test_scene_snapshot_saves_complete_scene_without_renaming_it(self):
         scene_path = os.path.join(self.folder, "source_scene.ma")
         node = cmds.createNode("transform", name="FullSceneSnapshotProbe")
@@ -147,6 +258,10 @@ class AnimCrashRecoveryTests(unittest.TestCase):
         self.assertTrue(snapshot_path.endswith("_manual_scene.mb"))
         self.assertTrue(os.path.exists(snapshot_path))
         self.assertTrue(os.path.exists(snapshot_path + ".meta"))
+        self.assertFalse(any(
+            name.endswith(".partial.mb")
+            for name in os.listdir(self.folder)
+        ))
         self.assertEqual(cmds.file(query=True, sn=True), active_scene)
         self.assertEqual(cmds.file(query=True, modified=True), active_modified)
         self.assertEqual(
@@ -236,31 +351,19 @@ class AnimCrashRecoveryTests(unittest.TestCase):
             for object_data in data["animation"].values()
             for attribute in object_data
         }
-        self.assertIn("inputA", captured_attributes)
-        self.assertIn("inputB", captured_attributes)
+        self.assertEqual(captured_attributes, {"translateX"})
+        self.assertEqual({entry["layer"] for entry in data["animation"][node]["translateX"]["curves"]},
+                         {"BaseAnimation", layer})
 
-        expected = {}
-        for object_name, object_data in data["animation"].items():
-            for attribute, payload in object_data.items():
-                plug = object_name + "." + attribute
-                curve_data = payload["curves"][0]["curve"]
-                expected[plug] = list(zip(
-                    map(float, curve_data["keyframes"]),
-                    map(float, curve_data["values"]),
-                ))
-                cmds.cutKey(plug, clear=True)
+        expected = [cmds.getAttr(node + ".tx", time=t) for t in (1, 5, 10)]
+        cmds.delete(layer)
+        cmds.cutKey(node, clear=True)
 
         success, failed, skipped = animCrash.apply_animation(data)
         self.assertEqual(success, len(data["animation"]))
         self.assertEqual(failed, 0)
         self.assertEqual(skipped, 0)
-        for plug, expected_keys in expected.items():
-            times = cmds.keyframe(plug, query=True, timeChange=True) or []
-            values = cmds.keyframe(plug, query=True, valueChange=True) or []
-            self.assertEqual(
-                list(zip(map(float, times), map(float, values))),
-                expected_keys,
-            )
+        self.assertEqual([cmds.getAttr(node + ".tx", time=t) for t in (1, 5, 10)], expected)
 
     def test_recovery_can_apply_only_one_rig_namespace(self):
         cmds.namespace(add="RigA")

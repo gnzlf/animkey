@@ -1,0 +1,1 @@
+evalDeferred -lowestPriority "python(\"exec(compile(open(r'C:/Users/ANIM-gonzalo/iCloudDrive/Animacion/personal/ANIMKEY/ANIMKEY/.github/tools/validate_draw_ui.py').read(), 'validate_draw_ui.py', 'exec'), {'__file__': r'C:/Users/ANIM-gonzalo/iCloudDrive/Animacion/personal/ANIMKEY/ANIMKEY/.github/tools/validate_draw_ui.py', '__name__': '__main__'})\")";

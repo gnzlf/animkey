@@ -789,6 +789,24 @@ class SettingsWindow(QtWidgets.QWidget):
         
         layout.addWidget(scale_group)
 
+        # Interface motion (global UI preference, previously in Anim Crash)
+        from AnimKey.core.window_reveal import (
+            opening_animations_enabled, set_opening_animations_enabled
+        )
+        interface_group = QtWidgets.QGroupBox("Interface")
+        interface_layout = QtWidgets.QVBoxLayout(interface_group)
+        interface_layout.setContentsMargins(12, 16, 12, 12)
+        self.opening_animations_switch = SettingsSwitch("Opening animations")
+        self.opening_animations_switch.setObjectName("openingAnimationsSwitch")
+        self.opening_animations_switch.setToolTip(
+            "Animate opening windows, slider menus and Flash Buttons. "
+            "Turn off to show them immediately."
+        )
+        self.opening_animations_switch.setChecked(opening_animations_enabled())
+        self.opening_animations_switch.toggled.connect(set_opening_animations_enabled)
+        interface_layout.addWidget(self.opening_animations_switch)
+        layout.addWidget(interface_group)
+
         # Channel Box helpers
         channel_box_group = QtWidgets.QGroupBox("Channel Box")
         channel_box_layout = QtWidgets.QVBoxLayout(channel_box_group)

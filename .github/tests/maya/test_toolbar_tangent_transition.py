@@ -12,6 +12,16 @@ from AnimKey.core.toolbar import AnimKeyToolbar
 
 
 class ToolbarTransitionTests(unittest.TestCase):
+    def test_deferred_layout_callback_is_invalid_after_widget_scope_closes(self):
+        from AnimKey.core.runtime_lifecycle import replace_scope, close_scope
+        bar = AnimKeyToolbar.__new__(AnimKeyToolbar)
+        bar._ui_resources = replace_scope("toolbar.widgets")
+        bar._refresh_toolbar_scroll_area = mock.Mock()
+        bar._defer_toolbar_refresh()
+        close_scope("toolbar.widgets")
+        app.processEvents()
+        bar._refresh_toolbar_scroll_area.assert_not_called()
+
     def test_transition_finishes_without_full_refresh_per_button_per_tick(self):
         bar = AnimKeyToolbar.__new__(AnimKeyToolbar)
         bar._tangent_toggle_btn = QtWidgets.QPushButton()

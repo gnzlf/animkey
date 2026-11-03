@@ -72,12 +72,14 @@ def verify(name, factory):
     if isinstance(window, gimbalFixer.GimbalFixerWindow):
         window.refresh_data()
     if isinstance(window, flashbuttons.FlashButtonsPanel):
-        # Flash has floating circular buttons with no shared rectangular body.
+        # The shared Flash background is a fading circle with transparent corners.
         image = window.grab().toImage()
         window.grab().save(str(output / (name + ".png")))
         check(not hasattr(window, "_material_surface"), name + ": no rectangular glass base")
-        check(image.pixelColor(10, window.height() // 2).alpha() == 0,
-              name + ": transparent space around buttons")
+        check(image.pixelColor(1, 1).alpha() == 0,
+              name + ": no square background outside the circle")
+        check(image.pixelColor(int(image.width() * .65), image.height() // 2).alpha() > 100,
+              name + ": radial background between buttons")
         for button in window.buttons:
             button_image = button.grab().toImage()
             check(button.width() == button.height(), name + ": circular proportions")

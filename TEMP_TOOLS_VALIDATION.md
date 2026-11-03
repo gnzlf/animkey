@@ -1,7 +1,9 @@
 # Temp Pivot y Temp Controls — ANIMKEY 1.2.1
 
-Implementación independiente a partir de las dos especificaciones técnicas
-suministradas el 22 de octubre de 2026. No requiere instalar animBot.
+Temp Pivot incorpora el núcleo de datos del Temp Pivot de Animo v10.7.5,
+adaptado a los botones, modos y ciclo de vida de AnimKey. Temp Controls conserva
+su implementación a partir de las especificaciones suministradas el 22 de octubre.
+No se necesita instalar Animo ni animBot para utilizar estas herramientas.
 
 ## Uso
 
@@ -16,7 +18,18 @@ transformarlo. Ctrl: centro por extremos de posiciones de transforms.
 Ctrl+Shift: pivote fijo en World al recorrer frames. Alt: editar el marco.
 Ctrl+Alt: reset. Las variantes Last/Center/World sólo activan una sesión nueva.
 La ventana de PIV permite aplicar otro modo a la selección durante una sesión.
-La memoria de posición y orientación del pivote vive en la sesión Python.
+El motor de locators, los offsets respecto a la referencia, el seguimiento entre
+frames y la transferencia de keys proceden del código de Animo. Poner una key
+en el helper la transfiere a los controles y retira la key temporal del helper.
+El filtro Euler de Maya evita introducir vueltas de 360 grados al terminar una
+edición animada. Activar o recorrer frames sin editar conserva las curvas.
+Se mantienen los bloqueos por eje, Undo/Redo y los modos Last, Center y World.
+Los timers y callbacks pertenecen a la sesión y se retiran al cerrarla o cambiar
+de escena. El timer inactivo no reescribe preferencias ni posiciones.
+La memoria de la selección completa se guarda en `tools/temp_pivot_offsets.json`
+dentro de los datos de usuario de AnimKey. Sus identidades UUID permiten recuperar
+el pivote tras renombrar objetos y evitan aplicarlo a otro objeto con el nombre viejo.
+La ventana y sus cuatro modos mantienen las mismas opciones.
 
 **TMC** abre Create Temp Control. Ofrece Simple, Group, Aim con IK/Pole Vector/
 Twist y FK Chain con orientación World/Parent/Local. Position y Orientation

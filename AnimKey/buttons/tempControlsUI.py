@@ -440,10 +440,14 @@ class TempControlsWindow(ContextPopupWindow):
         self._action(apply)
 
     def _grab(self,action):
-        selected = tf.transforms()
-        driver = selected[-1] if selected and action == "grab" else None
-        if action == "grab" and not driver:
-            raise ValueError("Select a system in Controls and an external driver in Maya.")
+        driver = None
+        if action == "grab":
+            # The driver is the last selected object outside every Temp
+            # Controls system; temp controls/internal nodes may also be selected.
+            external = [n for n in tf.transforms() if not tc.selected_systems([n])]
+            driver = external[-1] if external else None
+            if not driver:
+                raise ValueError("Select a system in Controls and an external driver in Maya.")
         for system in self._systems():
             tc.grab(system,driver=driver,remove=action == "remove",normalise=action == "normalize",
                     y_up=self.y_up.isChecked() and action == "normalize")

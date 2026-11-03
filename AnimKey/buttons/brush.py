@@ -382,6 +382,9 @@ class WindowsPenInputBridge(_NATIVE_EVENT_FILTER_BASE):
             window_pos = QPoint(round(point.x / ratio), round(point.y / ratio))
             position = QPointF(canvas.mapFrom(window, window_pos))
             if kind == "press":
+                input_at = getattr(window, "_drawing_input_at", None)
+                if callable(input_at) and not input_at(canvas.mapToGlobal(position.toPoint())):
+                    return False, 0
                 hovered = QtWidgets.QApplication.widgetAt(canvas.mapToGlobal(position.toPoint()))
                 if hovered is not None and hovered.window().objectName() == "AnimKey_DrawControls":
                     return False, 0
@@ -3909,6 +3912,37 @@ class SketchboardWindow(QWidget):
         except (AttributeError, RuntimeError):
             return False
 
+    def _is_viewport_widget(self, widget):
+        """Only the native view may supply off-target tablet samples, not UI."""
+        interactive = (QtWidgets.QAbstractButton, QtWidgets.QAbstractSlider,
+                       QtWidgets.QLineEdit, QtWidgets.QAbstractSpinBox,
+                       QtWidgets.QComboBox, QtWidgets.QAbstractItemView,
+                       QtWidgets.QMenu, QtWidgets.QTabBar)
+        try:
+            while isinstance(widget, QWidget):
+                if isinstance(widget, interactive):
+                    return False
+                if widget is self.viewport_parent:
+                    return True
+                widget = widget.parentWidget()
+        except (AttributeError, RuntimeError):
+            pass
+        return False
+
+    def _drawing_input_at(self, global_pos):
+        """Exclude floating controls even when a driver targets the view below."""
+        point = QPoint(round(global_pos.x()), round(global_pos.y()))
+        if not self.canvas.rect().contains(self.canvas.mapFromGlobal(point)):
+            return False
+        if self.hud_wrapper.isVisible() and self.hud_wrapper.frameGeometry().contains(point):
+            return False
+        app = QtWidgets.QApplication.instance()
+        if app.activePopupWidget() is not None or app.activeModalWidget() is not None:
+            return False
+        hovered = app.widgetAt(point)
+        return (hovered is None or self._is_canvas_widget(hovered)
+                or self._is_viewport_widget(hovered))
+
     def eventFilter(self, watched, event):
         """Route off-target tablet events into the visible drawing canvas.
 
@@ -3937,9 +3971,10 @@ class SketchboardWindow(QWidget):
             and not self.canvas.testAttribute(Qt.WA_TransparentForMouseEvents)
             and not self._is_canvas_widget(watched)
             and not self._is_controls_widget(watched)
+            and self._is_viewport_widget(watched)
         ):
             global_pos = get_event_global_pos(event)
-            if global_pos is not None:
+            if global_pos is not None and self._drawing_input_at(global_pos):
                 window_pos = self.mapFromGlobal(QPoint(
                     int(round(global_pos.x())), int(round(global_pos.y()))
                 ))
@@ -4058,7 +4093,8 @@ class SketchboardWindow(QWidget):
 
     def toggle_passthrough(self, checked):
         self.canvas.pass_through_mode = checked
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, checked)
+        # Keep the owning Qt window interactive: its independent tool window
+        # contains the controls. Only the canvas/native overlay passes input.
         # A transparent QWidget alone still receives Windows hit tests as a
         # top-level overlay. Navigation must pass input to Maya's native view.
         input_flag = getattr(Qt, "WindowTransparentForInput", None)
@@ -4148,7 +4184,9 @@ class SketchboardWindow(QWidget):
         main_layout.addWidget(self.canvas, 1)
         self.timeline = MayaTimelineSync(self.canvas.data)
 
-        self.hud_wrapper = DrawControlsWindow(self, get_maya_main_window())
+        # An owned tool window stays above its canvas when drawing activates
+        # the overlay. Sibling windows owned by Maya can cover one another.
+        self.hud_wrapper = DrawControlsWindow(self, self)
         self.sidebar_widget = QFrame()
         self.sidebar_widget.setObjectName("drawTools")
         tools = QHBoxLayout(self.sidebar_widget)

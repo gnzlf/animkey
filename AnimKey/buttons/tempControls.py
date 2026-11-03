@@ -7,6 +7,7 @@ layer, so Revert never destroys the animator's original layers or curves.
 """
 import json
 import os
+from contextlib import contextmanager
 
 import maya.cmds as cmds
 import maya.api.OpenMaya as om
@@ -20,6 +21,29 @@ TAG = "ANIMKEY_TEMP_CONTROLS_1"
 ROOT = "AnimKey_Temp_Controls"
 _window = None
 _pivot_edit = None
+
+
+def _create_node(*args, **kwargs):
+    """Internal nodes never steal the animator's selection.
+
+    A selected GrabOffset/Space node would become the next Grab driver and
+    would narrow the systems chosen in the Temp Controls window.
+    """
+    kwargs.setdefault("skipSelect", True)
+    return cmds.createNode(*args, **kwargs)
+
+
+@contextmanager
+def _keep_selection():
+    previous = cmds.ls(selection=True, long=True) or []
+    try:
+        yield
+    finally:
+        remaining = [n for n in previous if cmds.objExists(n)]
+        if remaining:
+            cmds.select(remaining, replace=True)
+        else:
+            cmds.select(clear=True)
 
 
 def _first(node, attr):
@@ -74,7 +98,7 @@ def _create_root():
         parents = cmds.listRelatives(system, parent=True, fullPath=True) or []
         if parents:
             return parents[0]
-    root = cmds.createNode("transform", name=ROOT + "#" if cmds.objExists(ROOT) else ROOT)
+    root = _create_node("transform", name=ROOT + "#" if cmds.objExists(ROOT) else ROOT)
     tf.string(root, "animKeyTempRole", "root")
     return root
 
@@ -153,7 +177,7 @@ def _color(system):
 
 
 def _make_member(system, source):
-    record = cmds.createNode("transform", name="Member#", parent=system)
+    record = _create_node("transform", name="Member#", parent=system)
     tf.message(system, "members", record, multi=True)
     tf.message(record, "source", source)
     tf.string(record, "animKeyTempRole", "member")
@@ -165,7 +189,7 @@ def _make_member(system, source):
     tf.string(record, "channels", json.dumps(attrs))
     # The reference evaluates the original local animation independently from
     # the now-driven rig source, including parent matrices and joint metadata.
-    ghost = cmds.duplicate(source, parentOnly=True, inputConnections=False, name="OriginalMotion#")[0]
+    ghost = tf.unlocked_duplicate(source, "OriginalMotion#")
     ghost = cmds.parent(ghost, record, relative=True)[0]
     _pack(system, ghost)
     tf.message(record, "reference", ghost)
@@ -234,7 +258,7 @@ def _follow(system, target, driven, position=True, orientation=True, maintain=Fa
 
 
 def _space(system, record, parent=None):
-    node = cmds.createNode("transform", name="Space#", parent=parent or system)
+    node = _create_node("transform", name="Space#", parent=parent or system)
     _pack(system,node)
     tf.message(record, "space", node)
     position = cmds.getAttr(system + ".positionSpace")
@@ -243,7 +267,7 @@ def _space(system, record, parent=None):
         _grab_space(system, node)
     else:
         if position == 5 or orientation == 5:
-            gr = cmds.createNode("transform", name="GrabReleaseSpace#", parent=system)
+            gr = _create_node("transform", name="GrabReleaseSpace#", parent=system)
             _grab_space(system, gr)
         else:
             gr = None
@@ -278,10 +302,10 @@ def _grab_space(system, node):
 
 
 def _create_event(system, frame, driver=None):
-    event = cmds.createNode("transform", name="GrabEvent#", parent=system)
+    event = _create_node("transform", name="GrabEvent#", parent=system)
     _add(event, "frame", "long", int(frame))
     tf.message(system, "grabEvents", event, multi=True)
-    target = cmds.createNode("transform", name="GrabOffset#", parent=event)
+    target = _create_node("transform", name="GrabOffset#", parent=event)
     tf.message(event, "target", target)
     if driver:
         tf.message(event, "driver", driver)
@@ -317,7 +341,7 @@ def _build(system):
     previous = None
     if family == 1:
         space = _space(system, members[0])
-        motion = _pack(system, cmds.createNode("transform", name="GroupMotion#", parent=space))
+        motion = _pack(system, _create_node("transform", name="GroupMotion#", parent=space))
         tf.message(system, "groupMotion", motion)
         positions = [list(tf.world(n))[12:15] for n in _sources(system)]
         center = [sum(p[i] for p in positions) / len(positions) for i in range(3)]
@@ -338,7 +362,7 @@ def _build(system):
                     cmds.delete(constraint)
             cmds.xform(space, worldSpace=True, matrix=list(tf.rigid(tf.world(source))))
         if family == 3:
-            orient = cmds.createNode("transform", name="Sub_Orient#", parent=space)
+            orient = _create_node("transform", name="Sub_Orient#", parent=space)
             _pack(system,orient)
             _fk_orientation(system, orient, _first(record,"reference"))
             space = orient
@@ -355,8 +379,8 @@ def _build(system):
             for node, point in ((aim,om.MPoint(0,distance,0)),(pole,om.MPoint(distance,0,0))):
                 p = point * matrix
                 cmds.xform(node,worldSpace=True,translation=(p.x,p.y,p.z))
-            joint_a = cmds.createNode("joint",name="joint_a#",parent=control)
-            joint_b = cmds.createNode("joint",name="joint_b#",parent=joint_a)
+            joint_a = _create_node("joint",name="joint_a#",parent=control)
+            joint_b = _create_node("joint",name="joint_b#",parent=joint_a)
             _pack(system,joint_a)
             _pack(system,joint_b)
             cmds.setAttr(joint_b+".translateY",distance)
@@ -377,10 +401,10 @@ def _build(system):
 
 
 def _fk_orientation(system, orient, reference):
-    choice = _pack(system,cmds.createNode("choice",name="FKOrientationChoice#"))
-    multiply = _pack(system,cmds.createNode("multMatrix",name="FKLocalMatrix#"))
-    identity = _pack(system,cmds.createNode("composeMatrix",name="FKParentMatrix#"))
-    decompose = _pack(system,cmds.createNode("decomposeMatrix",name="FKOrientDecompose#"))
+    choice = _pack(system,_create_node("choice",name="FKOrientationChoice#"))
+    multiply = _pack(system,_create_node("multMatrix",name="FKLocalMatrix#"))
+    identity = _pack(system,_create_node("composeMatrix",name="FKParentMatrix#"))
+    decompose = _pack(system,_create_node("decomposeMatrix",name="FKOrientDecompose#"))
     cmds.connectAttr(orient+".parentInverseMatrix[0]",choice+".input[0]")
     cmds.connectAttr(identity+".outputMatrix",choice+".input[2]")
     cmds.connectAttr(reference+".worldMatrix[0]",multiply+".matrixIn[0]")
@@ -540,14 +564,12 @@ def _bake_rig(system, samples, parent_samples):
     try:
         for record, attrs in zip(members,attrs_by_record):
             source = _first(record,"source")
-            solver = cmds.duplicate(source,parentOnly=True,inputConnections=False,name="AnimKey_BakeSolve#")[0]
+            solver = tf.unlocked_duplicate(source,"AnimKey_BakeSolve#")
             solvers.append(solver)
-            for attr in tf.TR:
-                cmds.setAttr(solver+"."+attr,lock=False)
             # Solve against captured parent matrices. Maya can leave a freshly
             # keyed layer one evaluation behind when its child is solved in
             # the same frame; an independent parent avoids that dependency.
-            parent = cmds.createNode("transform",name="AnimKey_BakeParentSolve#")
+            parent = _create_node("transform",name="AnimKey_BakeParentSolve#")
             solver_parents.append(parent)
             solver = cmds.parent(solver,parent,relative=True)[0]
             solvers[-1] = solver
@@ -613,7 +635,7 @@ def create(node=None, name=None, system=0, space=0, positionSpace=None,
             root = _create_root()
             for group in chunks:
                 label = name or group[0].rsplit("|",1)[-1].replace(":","_")
-                mount = cmds.createNode("transform",name=label+"_Temp_Control#",parent=root)
+                mount = _create_node("transform",name=label+"_Temp_Control#",parent=root)
                 mount = cmds.ls(mount,long=True)[0]
                 created.append(mount)
                 tf.string(mount,"animKeyTempSystem",TAG)
@@ -654,7 +676,7 @@ def create(node=None, name=None, system=0, space=0, positionSpace=None,
 def set_enabled(system, enabled, revert=False):
     if bool(cmds.getAttr(system+".isEnabled")) == bool(enabled):
         return
-    with tf.undo_chunk("AnimKey Toggle Temp Controls"):
+    with tf.undo_chunk("AnimKey Toggle Temp Controls"), _keep_selection():
         if enabled:
             if not revert:
                 nodes = _sources(system)
@@ -825,7 +847,7 @@ def remove_extra():
 
 
 def change_space(systems,position,orientation,relative=None):
-    with tf.undo_chunk("AnimKey Change Temp Control Space"):
+    with tf.undo_chunk("AnimKey Change Temp Control Space"), _keep_selection():
         for system in systems:
             family = cmds.getAttr(system+".systemID")
             if (family == 1 and any(s in (1,4) for s in (position,orientation))) or (family == 3 and 4 in (position,orientation)):
@@ -864,7 +886,7 @@ def change_space(systems,position,orientation,relative=None):
                 else:
                     gr = None
                     if 5 in (position,orientation):
-                        gr = cmds.createNode("transform",name="GrabReleaseSpace#",parent=system)
+                        gr = _create_node("transform",name="GrabReleaseSpace#",parent=system)
                         _grab_space(system,gr)
                     _follow(system,gr if position == 5 else _spatial_target(system,record,position),space,orientation=False)
                     _follow(system,gr if orientation == 5 else _spatial_target(system,record,orientation),space,position=False)
@@ -893,7 +915,7 @@ def grab(system,driver=None,frame=None,remove=False,normalise=False,y_up=False):
     if driver:
         driver = tf.transforms([driver])[0]
         _validate_references(system,driver)
-    with tf.undo_chunk("AnimKey Grab Release"):
+    with tf.undo_chunk("AnimKey Grab Release"), _keep_selection():
         nodes = controls(system)
         samples = tf.capture(nodes,tf.times(nodes+_sources(system),frames=cmds.getAttr(system+".bakeFrames")))
         for event in _grab_events(system):
@@ -962,7 +984,7 @@ def _apply_pivot_offsets(nodes,offsets,reset=False):
         for record,old_driver in zip(members,drivers):
             receiver = _first(record,"pivotReceiver")
             if not receiver:
-                receiver = cmds.createNode("transform",name="Pivot_Compensation#",parent=old_driver)
+                receiver = _create_node("transform",name="Pivot_Compensation#",parent=old_driver)
                 tf.string(receiver,"animKeyTempRole","pivotReceiver")
                 _pack(system,receiver)
                 tf.message(record,"pivotReceiver",receiver)

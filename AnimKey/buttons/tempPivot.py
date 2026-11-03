@@ -1,9 +1,5 @@
-"""Temporary pivot proxy. The rig's own pivots and hierarchy stay intact.
-
-ANIMKEY implementation of the documented interaction and row-vector delta:
-target(t) = (target(0) * inverse(proxy(0))) * proxy(t).
-"""
-import math
+"""Animo-based Temp Pivot data engine behind AnimKey's existing controls."""
+import os
 import weakref
 from contextlib import contextmanager
 
@@ -14,6 +10,7 @@ import maya.api.OpenMayaAnim as oma
 import maya.utils
 
 from AnimKey.core import temp_transform as tf
+from AnimKey.core.transfer_reference import temp_pivot as kernel
 
 _session = None
 _previous_targets = []
@@ -22,6 +19,11 @@ _saved_pivots = {}
 _buttons = []
 _gesture_filter = None
 _window = None
+
+
+def _memory_path():
+    from AnimKey.mods import configMod
+    return os.path.join(configMod.get_user_folder_path(), "tools", "temp_pivot_offsets.json")
 
 
 @contextmanager
@@ -34,9 +36,10 @@ def _unrecorded():
         cmds.undoInfo(stateWithoutFlush=state)
 
 
-class PivotSession:
+class PivotSession(kernel.LiveTempPivot):
     def __init__(self, nodes, mode="standard"):
         global _previous_anchor
+        super(PivotSession, self).__init__()
         self.targets = [tf.NodeRef(n) for n in nodes]
         self.anchor = self.targets[-1]
         self.mode = mode
@@ -56,39 +59,67 @@ class PivotSession:
         self.timeline = None
         self.editors = []
         self.orientation = (0., 0., 0.)
-        self.cache = []
         self.parent = None
         self.proxy = None
+        self.locator_refs = []
+        self.dirty = False
+        self.edited = False
+        self.keyed_pending = False
+        self.frame = cmds.currentTime(query=True)
+
+    @property
+    def manip_chunk_open(self):
+        return self.chunk
+
+    @manip_chunk_open.setter
+    def manip_chunk_open(self, value):
+        self.chunk = value
 
     def start(self, edit=True):
         with _unrecorded():
             self.parent = tf.NodeRef(cmds.createNode("transform", name="AnimKey_Temp_Pivot#"))
             node = cmds.createNode("transform", name="AnimKey_Temp_Pivot_xForm#", parent=self.parent.name())
             self.proxy = tf.NodeRef(node)
-            for attr in tf.TR + ("scaleX", "scaleY", "scaleZ", "visibility"):
-                cmds.setAttr(node + "." + attr, keyable=False, channelBox=True)
-            self.reposition(initial=True)
-            memory = _saved_pivots.get(self.anchor.name())
-            if memory and self.mode == "standard":
-                pivot, self.orientation = memory
-                cmds.xform(node, objectSpace=True, pivots=pivot)
-                self.recache()
+            kernel.PIVOT_NULL = node
+            kernel._storage_path = _memory_path()
+            for attr in tf.TR:
+                cmds.setAttr(node + "." + attr, keyable=True, channelBox=True)
+            for attr in ("scaleX", "scaleY", "scaleZ", "visibility"):
+                cmds.setAttr(node + "." + attr, lock=True, keyable=False, channelBox=False)
+            self.sel = [r.name() for r in self.targets if r.name()]
+            self.ref_obj = self.anchor.name()
+            self.cache_locked_attrs()
+            self.objects_had_keys = any(kernel.has_keyframes(n, kernel.TR_ATTRS) for n in self.sel)
+            if self.mode in ("center", "world"):
+                cmds.xform(node, worldSpace=True, translation=tf.center(self.sel))
+            else:
+                cmds.matchTransform(node, self.ref_obj, pos=True, rot=True)
+            remembered = self.mode == "standard" and self.apply_stored_offset(self.sel)
+            self.build_locators()
+            self.locator_refs = [(tf.NodeRef(obj), tf.NodeRef(loc)) for obj, loc in self.locators]
+            self.store_pivot_offset()
+            self.last_pivot_matrix = kernel.get_matrix(node)
             self._connect_editors()
             cmds.select(node, replace=True)
             if not cmds.about(batch=True):
                 cmds.setToolTo("moveSuperContext")
                 cmds.manipPivot(orientation=self.orientation)
-                if edit and (self.mode == "world" or (self.mode == "standard" and not memory)):
+                if edit and (self.mode == "world" or (self.mode == "standard" and not remembered)):
                     cmds.ctxEditMode()
         self.busy = False
         self.callbacks.append(om.MNodeMessage.addAttributeChangedCallback(self.proxy.handle.object(), self._changed))
-        for event, callback in (("SelectionChanged", self._selection), ("timeChanged", self._defer_refresh),
+        for event, callback in (("SelectionChanged", self._selection), ("timeChanged", self._time_changed),
                                 ("Undo", self._undo), ("Redo", self._undo), ("DragRelease", self._release)):
             self.callbacks.append(om.MEventMessage.addEventCallback(event, callback))
         for event in (om.MSceneMessage.kBeforeNew, om.MSceneMessage.kBeforeOpen):
-            self.callbacks.append(om.MSceneMessage.addCallback(event, lambda *_: self.close()))
+            self.callbacks.append(om.MSceneMessage.addCallback(event, lambda *_: self.close(save=False, restore_selection=False)))
         self.callbacks.append(om.MNodeMessage.addNodePreRemovalCallback(self.proxy.handle.object(), self._removed))
-        self.callbacks.append(oma.MAnimMessage.addAnimCurveEditedCallback(self._defer_refresh))
+        self.callbacks.append(oma.MAnimMessage.addAnimCurveEditedCallback(self._curve_edited))
+        if not cmds.about(batch=True):
+            from AnimKey.mods.maya_compat import QtCore
+            self.timer = QtCore.QTimer()
+            self.timer.timeout.connect(self.tick)
+            self.timer.start(16)
         _install_gesture_filter()
         _sync_buttons()
 
@@ -116,28 +147,160 @@ class PivotSession:
     def reposition(self, initial=False):
         if self.closed or not self.proxy or not self.proxy.name() or not self.anchor.name():
             return
-        node = self.proxy.name()
         self.busy = True
         try:
             with _unrecorded():
-                if self.mode in ("standard", "last"):
-                    pivot = cmds.xform(node, query=True, objectSpace=True, rotatePivot=True)
-                    cmds.xform(node, zeroTransformPivots=True)
-                    cmds.xform(node, worldSpace=True, matrix=list(tf.rigid(tf.world(self.anchor.name()))))
-                    cmds.xform(node, objectSpace=True, pivots=pivot)
-                elif self.mode == "center" or (self.mode == "world" and initial):
-                    names = [r.name() for r in self.targets if r.name()]
-                    cmds.xform(node, zeroTransformPivots=True)
-                    cmds.xform(node, worldSpace=True, rotation=(0, 0, 0), translation=tf.center(names))
-            self.recache()
+                self._sync_refs()
+                if cmds.currentTime(query=True) == self.frame and not initial:
+                    self.recache()
+                else:
+                    kernel.LiveTempPivot.on_time_changed(self)
+                self.frame = cmds.currentTime(query=True)
         finally:
             self.busy = False
 
     def recache(self, *_):
         if self.closed or not self.proxy or not self.proxy.name():
             return
-        inverse = tf.world(self.proxy.name()).inverse()
-        self.cache = [(ref, tf.world(ref.name()) * inverse) for ref in self.targets if ref.name()]
+        with _unrecorded():
+            self._sync_refs()
+            self.refresh_locators()
+            self.store_pivot_offset()
+            self.last_pivot_matrix = kernel.get_matrix(self.proxy.name())
+
+    def _sync_refs(self):
+        kernel.PIVOT_NULL = self.proxy.name()
+        self.sel = [ref.name() for ref in self.targets if ref.name()]
+        self.ref_obj = self.anchor.name()
+        self.locators = [(obj.name(), loc.name()) for obj, loc in self.locator_refs if obj.name() and loc.name()]
+        self.cache_locked_attrs()
+
+    def apply_pivot_from_ref(self):
+        if self.mode == "world":
+            return
+        if self.mode == "center":
+            cmds.xform(self.proxy.name(), worldSpace=True, translation=tf.center(self.sel), rotation=(0, 0, 0))
+            return
+        return kernel.LiveTempPivot.apply_pivot_from_ref(self)
+
+    def follow(self):
+        # The normal route is the supplied native locator/matchTransform engine.
+        partial = any(0 < len(locked.get(key, [])) < 3 for locked in self.locked_attrs.values()
+                      for key in ("skip_t", "skip_r"))
+        if not partial:
+            kernel.LiveTempPivot.follow(self)
+        else:
+            # Preserve per-axis locks with AnimKey's existing Maya channel
+            # solver. Finish each parent before its children to avoid moving a
+            # child twice when only some channels of its parent are writable.
+            pairs = sorted(self.locators, key=lambda pair: pair[0].count("|"))
+            desired = {obj: tf.world(loc) for obj, loc in pairs}
+            for _ in range(len(pairs) + 1):
+                changed = False
+                for obj, _ in pairs:
+                    before = kernel.get_matrix(obj)
+                    tf.set_world(obj, desired[obj])
+                    changed |= not self.matrices_equal(before, kernel.get_matrix(obj), 1e-6)
+                if not changed:
+                    break
+        # matchTransform redo can reevaluate its live locator after Undo rebases
+        # the helper. Record the evaluated channel result explicitly so Redo
+        # restores the same pose even after the helper has been recached.
+        for obj in self.sel:
+            for attr in tf.writable(obj):
+                plug = obj + "." + attr
+                if cmds.getAttr(plug, settable=True):
+                    cmds.setAttr(plug, cmds.getAttr(plug))
+
+    def open_manip_chunk(self):
+        if not self.chunk:
+            cmds.undoInfo(openChunk=True, chunkName="AnimKey Temp Pivot gesture")
+            self.chunk = True
+
+    def close_manip_chunk(self):
+        if self.busy and not self.is_time_changing:
+            return  # Finish native key forwarding and Euler filtering together.
+        if self.chunk:
+            cmds.undoInfo(closeChunk=True)
+            self.chunk = False
+
+    def maybe_finalize(self):
+        # The owning session closes one complete native gesture after key
+        # forwarding and Auto Key, rather than opening another timer transaction.
+        pass
+
+    def tick(self, force=False):
+        if self.closed or self.busy or not self.proxy.name():
+            return
+        if cmds.currentTime(query=True) != self.frame:
+            self.reposition()
+            return
+        self._sync_refs()
+        if not self.sel or not self.ref_obj:
+            self.close(save=False)
+            return
+        before = {n: kernel.get_matrix(n) for n in self.sel}
+        had_proxy_keys = bool(kernel.get_key_count(self.proxy.name(), kernel.TR_ATTRS))
+        if force:
+            self.time_change_cooldown = 0
+            self.awaiting_real_manipulation = False
+        self.busy = True
+        try:
+            kernel.LiveTempPivot.on_timer_tick(self)
+            if had_proxy_keys and not kernel.get_key_count(self.proxy.name(), kernel.TR_ATTRS):
+                self.keyed_pending = True
+            if any(not self.matrices_equal(matrix, kernel.get_matrix(n), 1e-8) for n, matrix in before.items()):
+                self.dirty = self.edited = True
+        finally:
+            self.busy = False
+        if not self.gesture and (self.chunk or self.pending_reapply or had_proxy_keys):
+            from AnimKey.mods.maya_compat import QtWidgets
+            if cmds.about(batch=True) or not QtWidgets.QApplication.mouseButtons():
+                self.finish()
+
+    def _curve_edited(self, *_):
+        if not self.closed and not self.busy:
+            # S/Set Key goes through the same native forwarding code as Animo.
+            if kernel.get_key_count(self.proxy.name(), kernel.TR_ATTRS):
+                self.tick(force=True)
+            else:
+                self._defer_refresh()
+
+    def _time_changed(self, *_):
+        if not self.closed and not self.busy:
+            self.reposition()
+
+    def save_relationship_to_disk(self):
+        if self.mode != "standard" or not self.proxy.name() or not self.sel:
+            return
+        kernel.LiveTempPivot.save_relationship_to_disk(self)
+        data = kernel.load_offsets()
+        record = data["single_offsets"].get(self.sel[0]) if len(self.sel) == 1 else next(
+            (g["offset_data"] for g in data["multi_offsets"] if sorted(g["objects"]) == sorted(self.sel)), None)
+        if record:
+            data["last_selection_ids"] = cmds.ls(self.sel, uuid=True) or []
+            record["object_ids"] = sorted(cmds.ls(self.sel, uuid=True) or [])
+            record["ref_id"] = (cmds.ls(self.ref_obj, uuid=True) or [None])[0]
+            kernel.save_offsets(data)
+            _saved_pivots[self.anchor.name()] = record
+
+    def apply_stored_offset(self, selection):
+        data = kernel.load_offsets()
+        ids = sorted(cmds.ls(selection, uuid=True) or [])
+        candidates = list(data["single_offsets"].values()) + [g.get("offset_data") for g in data["multi_offsets"]]
+        record = next((r for r in candidates if isinstance(r, dict) and r.get("object_ids") == ids), None)
+        if not record:
+            return False
+        record = dict(record)
+        ref = cmds.ls(record.get("ref_id") or "", long=True) or []
+        record["ref_obj"] = ref[0] if ref else selection[-1]
+        memory = {"single_offsets": {selection[0]: record} if len(selection) == 1 else {},
+                  "multi_offsets": [{"objects": selection, "offset_data": record}] if len(selection) > 1 else []}
+        kernel._memory_override = memory
+        try:
+            return kernel.LiveTempPivot.apply_stored_offset(self, selection)
+        finally:
+            kernel._memory_override = None
 
     def _editing(self):
         if cmds.about(batch=True):
@@ -163,27 +326,11 @@ class PivotSession:
         if self._editing() or "Pivot" in attr:
             self.recache()
             return
-        self.busy = True
         try:
-            if not self.chunk:
-                cmds.undoInfo(openChunk=True, chunkName="AnimKey Temp Pivot gesture")
-                self.chunk = True
-            matrix = tf.world(self.proxy.name())
-            desired = [(r, relative * matrix) for r, relative in self.cache if r.name()]
-            # Resolve parents before children, using the same precomputed world
-            # targets. This avoids applying the delta twice to descendants.
-            for ref, target in sorted(desired, key=lambda pair: pair[0].name().count("|")):
-                tf.set_world(ref.name(), target)
+            self.tick(force=True)
         except Exception as exc:
             cmds.warning("AnimKey Temp Pivot: {}".format(exc))
             self.finish()
-        finally:
-            self.busy = False
-        if cmds.about(batch=True) and not self.gesture:
-            self.finish()
-        elif not self.gesture:
-            # Idle coalescing also closes edits made in the Channel Box.
-            maya.utils.executeDeferred(self.finish)
 
     def finish(self, *_):
         self.gesture = False
@@ -193,20 +340,42 @@ class PivotSession:
                 cmds.autoKeyframe()
             finally:
                 self.busy = False
+        if self.chunk and self.dirty and (self.objects_had_keys or self.keys_set_this_session):
+            self.busy = True
+            try:
+                self._key_targets()
+            finally:
+                self.busy = False
+        if self.chunk and (self.dirty or self.keyed_pending) and (self.objects_had_keys or self.keys_set_this_session):
+            self.busy = True
+            try:
+                for node in self.sel:
+                    kernel.run_euler_filter(node)
+            finally:
+                self.busy = False
         if self.chunk:
             cmds.undoInfo(closeChunk=True)
             self.chunk = False
         if self.closed:
             return
+        self.dirty = False
+        self.keyed_pending = False
+        self.pending_reapply = False
         if not cmds.about(batch=True):
             try:
                 self.orientation = tuple(cmds.manipPivot(query=True, orientation=True))
             except RuntimeError:
                 pass
-        if self.mode == "last":
-            self.reposition()
-        else:
+        with _unrecorded():
             self.recache()
+            self.save_relationship_to_disk()
+
+    def _key_targets(self):
+        for node in self.sel:
+            attrs = [attr for attr in kernel.TR_ATTRS if not kernel.is_attr_locked(node, attr)
+                     and cmds.getAttr(node + "." + attr, keyable=True)]
+            if attrs:
+                cmds.setKeyframe(node, attribute=attrs)
 
     def _release(self,*_):
         maya.utils.executeDeferred(self.finish)
@@ -218,7 +387,8 @@ class PivotSession:
         def refresh():
             self.pending = False
             if not self.closed:
-                self.reposition()
+                with _unrecorded():
+                    self.recache()
         maya.utils.executeDeferred(refresh)
 
     def _undo(self, *_):
@@ -233,12 +403,23 @@ class PivotSession:
         if not self.busy:
             maya.utils.executeDeferred(self.close)
 
-    def close(self):
+    def close(self, save=True, restore_selection=True):
         global _session, _previous_targets
         if self.closed:
             return
+        if save and self.proxy and self.proxy.name():
+            if kernel.get_key_count(self.proxy.name(), kernel.TR_ATTRS):
+                self.tick(force=True)
+            if self.chunk:
+                self.finish()
+            self._sync_refs()
+            self.save_relationship_to_disk()
         self.closed = True
         self.busy = True
+        if self.timer:
+            self.timer.stop()
+            self.timer.deleteLater()
+            self.timer = None
         if self.chunk:
             cmds.undoInfo(closeChunk=True)
             self.chunk = False
@@ -250,14 +431,6 @@ class PivotSession:
         self.callbacks = []
         _previous_targets = self.targets[:]
         with _unrecorded():
-            if self.proxy and self.proxy.name():
-                pivot = cmds.xform(self.proxy.name(), query=True, objectSpace=True, rotatePivot=True)
-                anchor = self.anchor.name()
-                if anchor:
-                    if any(abs(v) > 1e-9 for v in list(pivot) + list(self.orientation)):
-                        _saved_pivots[anchor] = (pivot, self.orientation)
-                    else:
-                        _saved_pivots.pop(anchor, None)
             for editor, old, locked in self.editors:
                 try:
                     cmds.animCurveEditor(editor, edit=True, unlockMainConnection=True, mainListConnection=old)
@@ -275,7 +448,7 @@ class PivotSession:
             if self.parent and self.parent.name():
                 cmds.delete(self.parent.name())
             names = [r.name() for r in self.targets if r.name()]
-            if names:
+            if names and restore_selection:
                 cmds.select(names, replace=True)
             if not cmds.about(batch=True):
                 cmds.setToolTo("moveSuperContext")
@@ -294,6 +467,14 @@ def activate_temp_pivot(objects=None, pivot_mode="standard", edit_pivot=True):
     if not nodes:
         nodes = [r.name() for r in _previous_targets if r.name()]
     if not nodes:
+        kernel._storage_path = _memory_path()
+        memory = kernel.load_offsets()
+        if memory.get("last_selection_ids"):
+            for identity in memory["last_selection_ids"]:
+                nodes.extend(tf.transforms(cmds.ls(identity, long=True) or []))
+        else:
+            nodes = tf.transforms(memory.get("last_selection", []))
+    if not nodes:
         cmds.warning("AnimKey Temp Pivot: select at least one transform.")
         return False
     _session = PivotSession(nodes, pivot_mode)
@@ -305,18 +486,38 @@ def activate_temp_pivot(objects=None, pivot_mode="standard", edit_pivot=True):
     return True
 
 
-def deactivate_temp_pivot():
+def deactivate_temp_pivot(restore_selection=True):
     if _session:
-        _session.close()
+        _session.close(restore_selection=restore_selection)
     return True
 
 
 def begin_gesture():
     """Open before the native manipulator command enters Maya's undo queue."""
-    if is_active() and not _session.chunk:
-        cmds.undoInfo(openChunk=True, chunkName="AnimKey Temp Pivot gesture")
-        _session.chunk = True
+    if is_active():
+        _session.open_manip_chunk()
         _session.gesture = True
+        _session.time_change_cooldown = 0
+        _session.awaiting_real_manipulation = False
+
+
+@contextmanager
+def gesture():
+    """Use the same gesture transaction for scripts and native manipulators."""
+    begin_gesture()
+    session = _session
+    try:
+        yield session.proxy.name()
+    except Exception:
+        session.close_manip_chunk()
+        session.gesture = False
+        cmds.undo()
+        with _unrecorded():
+            session.recache()
+        raise
+    else:
+        session.tick(force=True)
+        session.finish()
 
 
 def _install_gesture_filter():
@@ -359,6 +560,16 @@ def reset_temp_pivot_offsets(objects=None):
             if not cmds.about(batch=True):
                 cmds.manipPivot(orientation=(0, 0, 0))
             _saved_pivots.pop(_session.anchor.name(), None)
+            _session._sync_refs()
+            data = kernel.load_offsets()
+            ids = sorted(cmds.ls(_session.sel, uuid=True) or [])
+            data["single_offsets"] = {name: record for name, record in data["single_offsets"].items()
+                                      if not isinstance(record, dict) or record.get("object_ids") != ids}
+            data["multi_offsets"] = [group for group in data["multi_offsets"]
+                                     if group.get("offset_data", {}).get("object_ids") != ids]
+            kernel.save_offsets(data)
+            if _session.mode in ("standard", "last"):
+                cmds.matchTransform(_session.proxy.name(), _session.anchor.name(), pos=True, rot=True)
             _session.recache()
         finally:
             _session.busy = False

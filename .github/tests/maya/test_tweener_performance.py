@@ -12,7 +12,7 @@ except RuntimeError:
 import maya.cmds as cmds
 
 from AnimKey.core import animation_curve_transfer
-from AnimKey.sliders import tweener
+from AnimKey.sliders import tweener, tweener_world_space
 
 
 class TweenerPerformanceTests(unittest.TestCase):
@@ -20,14 +20,52 @@ class TweenerPerformanceTests(unittest.TestCase):
         cmds.file(new=True, force=True)
 
     def tearDown(self):
-        tweener._restore_api_preview()
-        if tweener._is_dragging:
-            try:
-                cmds.undoInfo(closeChunk=True)
-            except Exception:
-                pass
-        tweener._is_dragging = False
-        tweener._tween_cache = []
+        tweener.cancel()
+
+    def test_fixed_weighted_tangents_survive_preview_undo_redo(self):
+        control = cmds.createNode("transform", name="tangentProbe")
+        self._key(control, "translateX", ((0, 0), (5, 2), (10, 10)))
+        curve = cmds.keyframe(control + ".tx", query=True, name=True)[0]
+        cmds.keyTangent(curve, edit=True, weightedTangents=True)
+        cmds.keyTangent(curve, edit=True, time=(5, 5), lock=False,
+                        inAngle=14, outAngle=-23, inWeight=2, outWeight=3)
+        cmds.currentTime(5)
+        before = animation_curve_transfer.capture_curve(curve, layer_name="BaseAnimation")
+        cmds.flushUndo()
+        tweener.prepare_tween_data([control], ["translateX"])
+        for value in (20, 70, 30):
+            tweener.execute(value)
+        tweener.reset()
+        after = animation_curve_transfer.capture_curve(curve, layer_name="BaseAnimation")
+        for flag in ("inAngle", "outAngle", "inWeight", "outWeight", "inTangentType", "outTangentType"):
+            # The value changed, but the existing fixed tangent vectors did not.
+            self.assertEqual(cmds.keyTangent(curve, query=True, time=(5, 5), **{flag: True}),
+                             self._tangent_after_undo_redo(curve, flag))
+        cmds.undo()
+        self.assertEqual(animation_curve_transfer.capture_curve(curve, layer_name="BaseAnimation"), before)
+        cmds.redo()
+        self.assertEqual(animation_curve_transfer.capture_curve(curve, layer_name="BaseAnimation"), after)
+
+    @staticmethod
+    def _tangent_after_undo_redo(curve, flag):
+        cmds.undo()
+        result = cmds.keyTangent(curve, query=True, time=(5, 5), **{flag: True})
+        cmds.redo()
+        return result
+
+    def test_interrupted_gesture_and_scene_replacement_release_chunk(self):
+        control = cmds.createNode("transform", name="interruptedTween")
+        self._key(control, "translateX", ((0, 0), (10, 10)))
+        cmds.currentTime(5)
+        tweener.prepare_tween_data([control], ["translateX"])
+        tweener.execute(20)
+        tweener.prepare_tween_data([control], ["translateX"])
+        self.assertEqual(cmds.keyframe(control + ".tx", query=True, timeChange=True), [0., 10.])
+        tweener.execute(70)
+        cmds.file(new=True, force=True)
+        self.assertFalse(tweener._is_dragging)
+        self.assertEqual(tweener._tween_cache, [])
+        self.assertFalse(cmds.undoInfo(query=True, chunkName=True))
 
     @staticmethod
     def _key(control, attribute, values):
@@ -35,6 +73,22 @@ class TweenerPerformanceTests(unittest.TestCase):
             cmds.setKeyframe(
                 control, attribute=attribute, time=frame, value=value
             )
+
+    def test_worldspace_sampling_restores_time_after_query_failure(self):
+        control = cmds.createNode("transform", name="brokenWorldTween")
+        cmds.currentTime(7, edit=True)
+
+        with mock.patch.object(
+            tweener_world_space.cmds,
+            "xform",
+            side_effect=RuntimeError("forced matrix query failure"),
+        ):
+            with self.assertRaises(RuntimeError):
+                tweener_world_space.get_world_matrix(control, time=20)
+
+        self.assertAlmostEqual(
+            cmds.currentTime(query=True), 7.0, places=5
+        )
 
     def test_unkeyed_preview_preserves_units_and_single_undo(self):
         control = cmds.createNode("transform", name="tweenControl")

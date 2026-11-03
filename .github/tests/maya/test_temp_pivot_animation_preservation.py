@@ -1,196 +1,119 @@
+"""Animation preservation contracts for the proxy-based Temp Pivot rewrite."""
 import unittest
-
 import maya.standalone
-
 try:
-    maya.standalone.initialize(name="python")
+    maya.standalone.initialize(name='python')
 except RuntimeError:
     pass
-
 import maya.cmds as cmds
-
-from AnimKey.buttons import tempPivot
-from AnimKey.core.animation_curve_transfer import resolve_anim_curve
+from AnimKey.buttons import tempPivot as pivot
+from AnimKey.core import temp_tools as tt, animation_curve_transfer as transfer
 
 
 class TempPivotAnimationPreservationTests(unittest.TestCase):
     def setUp(self):
-        cmds.file(new=True, force=True)
-        tempPivot._temp_pivot_restore_state = None
+        pivot.deactivate_temp_pivot(restore_selection=False)
+        cmds.file(new=True,force=True)
+        pivot._saved_pivots.clear()
 
-    def _create_control(self):
-        control = cmds.polyCube(name="tempPivotControl")[0]
-        for frame, tx, ry in ((1, 5.0, 0.0), (6, 6.0, 45.0), (12, 4.0, 90.0)):
-            cmds.currentTime(frame, edit=True)
-            cmds.setAttr(control + ".translateX", tx)
-            cmds.setAttr(control + ".rotateY", ry)
-            cmds.setKeyframe(control, attribute="translateX")
-            cmds.setKeyframe(control, attribute="rotateY")
-        return control
+    def tearDown(self):
+        pivot.deactivate_temp_pivot(restore_selection=False)
 
-    @staticmethod
-    def _matrices(node):
-        result = {}
-        for frame in range(1, 13):
-            cmds.currentTime(frame, edit=True)
-            result[frame] = cmds.xform(node, query=True, worldSpace=True, matrix=True)
-        return result
+    def animated(self):
+        node=cmds.createNode('transform',name='control')
+        for frame,value in ((1,2),(6,6),(12,3)):
+            cmds.setKeyframe(node,attribute='translateX',time=frame,value=value)
+        cmds.keyTangent(node,attribute='translateX',weightedTangents=True)
+        cmds.currentTime(6)
+        return node
 
-    def _assert_matrices_match(self, expected, node, frames=None):
-        actual = self._matrices(node)
-        frames = list(expected) if frames is None else list(frames)
-        for frame in frames:
-            expected_matrix = expected[frame]
-            for expected_value, actual_value in zip(expected_matrix, actual[frame]):
-                self.assertAlmostEqual(expected_value, actual_value, places=5)
+    def test_activation_without_edit_preserves_all_curves_and_adds_no_bake_layer(self):
+        node=self.animated()
+        before=transfer.capture_curve(node+'.tx')
+        layers=cmds.ls(type='animLayer') or []
+        pivot.activate_temp_pivot([node],edit_pivot=False)
+        for frame in (1,6,12): cmds.currentTime(frame)
+        pivot.deactivate_temp_pivot()
+        self.assertEqual(transfer.capture_curve(node+'.tx'),before)
+        self.assertEqual(cmds.ls(type='animLayer') or [],layers)
 
-    @staticmethod
-    def _pivot_values(node):
-        return {
-            "rotatePivot": cmds.getAttr(node + ".rotatePivot")[0],
-            "scalePivot": cmds.getAttr(node + ".scalePivot")[0],
-            "rotatePivotTranslate": cmds.getAttr(node + ".rotatePivotTranslate")[0],
-            "scalePivotTranslate": cmds.getAttr(node + ".scalePivotTranslate")[0],
-        }
+    def test_edit_only_changes_current_frame_and_keeps_other_key_values_and_tangents(self):
+        node=self.animated()
+        curve=transfer.resolve_anim_curve(node+'.tx')
+        before={frame:(cmds.keyframe(curve,query=True,time=(frame,frame),valueChange=True),
+                       cmds.keyTangent(curve,query=True,time=(frame,frame),inTangentType=True),
+                       cmds.keyTangent(curve,query=True,time=(frame,frame),outTangentType=True)) for frame in (1,12)}
+        pivot.activate_temp_pivot([node],edit_pivot=False)
+        with pivot.gesture() as helper:
+            cmds.setAttr(helper+'.tx',cmds.getAttr(helper+'.tx')+3)
+        self.assertAlmostEqual(cmds.getAttr(node+'.tx'),9)
+        for frame,expected in before.items():
+            actual=(cmds.keyframe(curve,query=True,time=(frame,frame),valueChange=True),
+                    cmds.keyTangent(curve,query=True,time=(frame,frame),inTangentType=True),
+                    cmds.keyTangent(curve,query=True,time=(frame,frame),outTangentType=True))
+            self.assertEqual(actual,expected)
 
-    @staticmethod
-    def _set_pivot_values(node, values):
-        for attr, value in values.items():
-            cmds.setAttr(node + "." + attr, *value, type="double3")
+    def test_active_additive_layer_receives_keys_without_changing_base_curve(self):
+        node=self.animated()
+        base=transfer.resolve_anim_curve(node+'.tx')
+        base_values=cmds.keyframe(base,query=True,valueChange=True)
+        layer=cmds.animLayer('artistLayer')
+        cmds.animLayer(layer,edit=True,attribute=node+'.translateX',selected=True,preferred=True)
+        cmds.setKeyframe(node,attribute='translateX',time=6,value=8,animLayer=layer)
+        before=cmds.getAttr(node+'.tx')
+        pivot.activate_temp_pivot([node],edit_pivot=False)
+        with pivot.gesture() as helper:
+            cmds.setAttr(helper+'.tx',cmds.getAttr(helper+'.tx')+2)
+        self.assertAlmostEqual(cmds.getAttr(node+'.tx'),before+2)
+        self.assertEqual(cmds.keyframe(base,query=True,valueChange=True),base_values)
+        self.assertIsNotNone(transfer.resolve_anim_curve(node+'.tx',layer_name=layer))
 
-    def _expected_without_temp_pivot(self, node, state):
-        edited_pivots = self._pivot_values(node)
-        tempPivot._restore_object_pivots(state, preserve_current_pose=False)
-        expected = self._matrices(node)
-        self._set_pivot_values(node, edited_pivots)
-        return expected
+    def test_locked_scale_and_unrelated_locked_axis_remain_unchanged(self):
+        node=cmds.createNode('transform',name='rig')
+        for attr in ('scaleX','scaleY','scaleZ','translateX'): cmds.setAttr(node+'.'+attr,lock=True)
+        pivot.activate_temp_pivot([node],edit_pivot=False)
+        with pivot.gesture() as helper: cmds.setAttr(helper+'.ty',3)
+        self.assertEqual(cmds.getAttr(node+'.tx'),0)
+        self.assertAlmostEqual(cmds.getAttr(node+'.ty'),3)
+        self.assertEqual(cmds.getAttr(node+'.scale')[0],(1,1,1))
 
-    def _edit_pivot(self, control):
-        cmds.currentTime(1, edit=True)
-        state = tempPivot._capture_temp_pivot_state([control])
-        cmds.xform(
-            control,
-            objectSpace=True,
-            preserve=True,
-            pivots=(3.0, -2.0, 1.0),
-        )
-        for frame, ry in ((1, 0.0), (6, 55.0), (12, 110.0)):
-            cmds.currentTime(frame, edit=True)
-            cmds.setAttr(control + ".rotateY", ry)
-            cmds.setKeyframe(control, attribute="rotateY")
-        return state
+    def test_joint_orientation_pivots_and_scaled_parent_keep_world_delta(self):
+        parent=cmds.createNode('transform',name='parent')
+        cmds.setAttr(parent+'.scale',2,3,4)
+        node=cmds.createNode('joint',name='joint',parent=parent)
+        cmds.setAttr(node+'.jointOrient',12,25,5)
+        cmds.setAttr(node+'.translate',2,3,4)
+        expected=list(tt.matrix(node));expected[13]+=3
+        pivot.activate_temp_pivot([node],edit_pivot=False)
+        with pivot.gesture() as helper:
+            cmds.xform(helper,worldSpace=True,translation=[v+d for v,d in zip(cmds.xform(helper,query=True,worldSpace=True,translation=True),(0,3,0))])
+        for a,b in zip(list(tt.matrix(node)),expected): self.assertAlmostEqual(a,b,places=5)
+        for actual,expected in zip(cmds.getAttr(node+'.jointOrient')[0],(12,25,5)):
+            self.assertAlmostEqual(actual,expected)
 
-    def test_restores_original_pivot_without_changing_animation(self):
-        control = self._create_control()
-        state = self._edit_pivot(control)
-        expected_matrices = self._matrices(control)
-        expected_outside_range = self._expected_without_temp_pivot(control, state)
-        base_curve = resolve_anim_curve(
-            control + ".rotateY", layer_name="BaseAnimation"
-        )
-        original_values = cmds.keyframe(
-            base_curve, query=True, timeChange=True, valueChange=True
-        )
+    def test_cancelling_gesture_restores_targets_and_the_undo_preference(self):
+        node=self.animated()
+        before=transfer.capture_curve(node+'.tx')
+        pivot.activate_temp_pivot([node],edit_pivot=False)
+        with self.assertRaises(RuntimeError):
+            with pivot.gesture() as helper:
+                cmds.setAttr(helper+'.tx',50)
+                raise RuntimeError('cancel')
+        self.assertTrue(cmds.undoInfo(query=True,state=True))
+        self.assertEqual(transfer.capture_curve(node+'.tx'),before)
+        self.assertAlmostEqual(cmds.getAttr(node+'.tx'),6)
 
-        layer, keyed_channels = tempPivot._bake_temp_pivot_compensation(state)
-
-        self.assertTrue(layer)
-        self.assertGreater(keyed_channels, 0)
-        self.assertEqual(
-            cmds.xform(control, query=True, objectSpace=True, rotatePivot=True),
-            state["object_pivots"][control]["rotate_pivot"],
-        )
-        self.assertEqual(
-            cmds.keyframe(
-                base_curve, query=True, timeChange=True, valueChange=True
-            ),
-            original_values,
-        )
-        self._assert_matrices_match(expected_matrices, control, range(6, 13))
-        self._assert_matrices_match(expected_outside_range, control, range(1, 6))
-
-        layer_curves = cmds.animLayer(layer, query=True, animCurves=True) or []
-        layer_times = []
-        for curve in layer_curves:
-            layer_times.extend(cmds.keyframe(curve, query=True, timeChange=True) or [])
-        self.assertGreaterEqual(min(layer_times), 5.0)
-        self.assertLessEqual(max(layer_times), 13.0)
-
-    def test_preserves_animation_when_an_additive_layer_is_active(self):
-        control = self._create_control()
-        action_layer = cmds.animLayer("animLayerAction", override=False)
-        cmds.animLayer(action_layer, edit=True, attribute=control + ".rotateY")
-        cmds.animLayer(action_layer, edit=True, selected=True, preferred=True)
-        for frame, value in ((1, 0.0), (6, 15.0), (12, -10.0)):
-            cmds.setKeyframe(
-                control,
-                attribute="rotateY",
-                time=(frame, frame),
-                value=value,
-                animLayer=action_layer,
-            )
-
-        state = self._edit_pivot(control)
-        expected_matrices = self._matrices(control)
-        expected_outside_range = self._expected_without_temp_pivot(control, state)
-
-        layer, keyed_channels = tempPivot._bake_temp_pivot_compensation(state)
-
-        self.assertTrue(layer)
-        self.assertGreater(keyed_channels, 0)
-        self.assertTrue(cmds.animLayer(action_layer, query=True, selected=True))
-        self._assert_matrices_match(expected_matrices, control, range(6, 13))
-        self._assert_matrices_match(expected_outside_range, control, range(1, 6))
-
-    def test_does_not_create_a_bake_layer_when_the_pivot_was_not_edited(self):
-        control = self._create_control()
-        state = tempPivot._capture_temp_pivot_state([control])
-
-        layer, keyed_channels = tempPivot._bake_temp_pivot_compensation(state)
-
-        self.assertIsNone(layer)
-        self.assertEqual(keyed_channels, 0)
-
-    def test_merge_compensation_preserves_motion_and_outside_keys(self):
-        for use_layer in (False, True):
-            cmds.file(new=True, force=True)
-            control = self._create_control()
-            destination = "BaseAnimation"
-            if use_layer:
-                destination = cmds.animLayer("Action", override=False)
-                cmds.animLayer(destination, edit=True, attribute=control + ".rotateY")
-                cmds.animLayer(destination, edit=True, selected=True, preferred=True)
-                cmds.setKeyframe(control, attribute="rotateY", time=1,
-                                 value=0.0, animLayer=destination)
-            state = self._edit_pivot(control)
-            expected = self._matrices(control)
-            outside = self._expected_without_temp_pivot(control, state)
-            layer, count = tempPivot._bake_temp_pivot_compensation(state)
-            self.assertGreater(count, 0)
-            target = tempPivot._merge_temp_pivot_compensation(layer, state)
-            self.assertEqual(target, destination)
-            self.assertFalse(cmds.objExists(layer))
-            self._assert_matrices_match(expected, control, range(6, 13))
-            self._assert_matrices_match(outside, control, range(1, 6))
-
-    def test_range_detection_survives_switching_to_a_new_animation_layer(self):
-        control = self._create_control()
-        state = tempPivot._capture_temp_pivot_state([control])
-
-        layer = cmds.animLayer("pivotSessionLayer", override=False)
-        cmds.animLayer(layer, edit=True, attribute=control + ".rotateY")
-        cmds.animLayer(layer, edit=True, selected=True, preferred=True)
-        cmds.setKeyframe(
-            control,
-            attribute="rotateY",
-            time=(8, 8),
-            value=12.0,
-            animLayer=layer,
-        )
-
-        self.assertEqual(tempPivot._temp_pivot_changed_key_times(state), [8.0])
-        self.assertEqual(tempPivot._temp_pivot_sample_times([control], state), [8.0])
+    def test_rename_target_does_not_affect_a_new_object_with_the_old_name(self):
+        node=self.animated()
+        pivot.activate_temp_pivot([node],edit_pivot=False)
+        node=cmds.rename(node,'renamed')
+        replacement=cmds.createNode('transform',name='control')
+        # Creating another node changes the selection in some Maya builds.
+        if not pivot.is_active(): pivot.activate_temp_pivot([node],edit_pivot=False)
+        with pivot.gesture() as helper:
+            cmds.setAttr(helper+'.ty',2)
+        self.assertAlmostEqual(cmds.getAttr(node+'.ty'),2)
+        self.assertEqual(cmds.getAttr(replacement+'.ty'),0)
 
 
-if __name__ == "__main__":
-    unittest.main()
+if __name__=='__main__': unittest.main()

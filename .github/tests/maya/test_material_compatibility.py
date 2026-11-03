@@ -45,6 +45,9 @@ class MaterialCompatibilityTests(unittest.TestCase):
         self.window.show()
         APP.processEvents()
         APP.processEvents()
+        surface.reveal._animation.setCurrentTime(surface.reveal.DURATION_MS)
+        surface._capture_timer.stop()
+        surface._capture_backdrop()
         return surface
 
     def test_unsupported_native_blur_still_gets_a_blurred_application_backdrop(self):

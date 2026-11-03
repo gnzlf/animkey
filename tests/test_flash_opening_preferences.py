@@ -1,4 +1,4 @@
-"""Opening motion stays circular and can be disabled from Recovery."""
+"""Opening motion stays circular and is a Settings option; Recovery can skip scene copies."""
 import json
 import os
 from pathlib import Path
@@ -122,28 +122,69 @@ class FlashOpeningPreferencesTests(unittest.TestCase):
         reveal._animation.setCurrentTime(180)
         self.assertEqual(window.pos(), target)
 
-    def test_recovery_switch_saves_the_choice_and_updates_existing_flash_panel(self):
+    def test_settings_switch_saves_the_choice_and_updates_existing_flash_panel(self):
+        from AnimKey.core import settings
+        with mock.patch.object(settings.ui, "get_maya_main_window", return_value=None):
+            window = self.keep(settings.SettingsWindow())
+        window.show()
+        APP.processEvents()
+        switch = window.opening_animations_switch
+        self.assertTrue(switch.isChecked())
+        self.panel.show_panel()
+        QtTest.QTest.mouseClick(switch, QtCore.Qt.LeftButton)
+        self.assertFalse(opening_animations_enabled())
+        self.assert_settled()
+        stored = json.loads(Path(configMod.get_preferences_path()).read_text())
+        self.assertIs(stored["ui_opening_animations_enabled"], False)
+        configMod.get_config()._load_config()
+        self.assertFalse(opening_animations_enabled())
+        QtTest.QTest.mouseClick(switch, QtCore.Qt.LeftButton)
+        self.assertTrue(opening_animations_enabled())
+
+    def _recovery_window(self):
         with mock.patch.object(animCrash.RecoveryWindow, "_refresh"), \
                 mock.patch.object(animCrash, "get_scene_folder", return_value=self.folder.name):
             owner = self.keep(QtWidgets.QWidget())
             recovery = self.keep(animCrash.RecoveryWindow(parent=owner))
             recovery.show()
             APP.processEvents()
-            self.assertTrue(recovery.opening_animations_switch.isChecked())
-            self.panel.show_panel()
-            QtTest.QTest.mouseClick(recovery.opening_animations_switch, QtCore.Qt.LeftButton)
-            self.assertFalse(opening_animations_enabled())
-            self.assert_settled()
-            stored = json.loads(Path(configMod.get_preferences_path()).read_text())
-            self.assertIs(stored["ui_opening_animations_enabled"], False)
-            configMod.get_config()._load_config()
-            self.assertFalse(opening_animations_enabled())
-            QtTest.QTest.mouseClick(recovery.opening_animations_switch, QtCore.Qt.LeftButton)
-            self.assertTrue(opening_animations_enabled())
-            # Drain the existing Recovery initial-refresh timer before closing.
-            loop = QtCore.QEventLoop()
-            QtCore.QTimer.singleShot(120, loop.quit)
-            (getattr(loop, 'exec', None) or loop.exec_)()
+        return recovery
+
+    def _drain_recovery_timer(self):
+        loop = QtCore.QEventLoop()
+        QtCore.QTimer.singleShot(120, loop.quit)
+        (getattr(loop, 'exec', None) or loop.exec_)()
+
+    def test_recovery_no_longer_owns_opening_animations(self):
+        recovery = self._recovery_window()
+        self.assertFalse(hasattr(recovery, "opening_animations_switch"))
+        self._drain_recovery_timer()
+
+    def test_save_scenes_switch_selects_animation_only_recovery(self):
+        recovery = self._recovery_window()
+        switch = recovery.save_scenes_switch
+        self.assertTrue(switch.isChecked())
+        self.assertGreater(animCrash.Config.scene_snapshot_interval(), 0.0)
+        QtTest.QTest.mouseClick(switch, QtCore.Qt.LeftButton)
+        self.assertFalse(animCrash.Config.scene_snapshots_enabled())
+        self.assertEqual(animCrash.Config.scene_snapshot_interval(), 0.0)
+        self.assertFalse(recovery.scene_snapshot_combo.isEnabled())
+        self.assertEqual(recovery.save_mode_label.text(), "Animation only")
+        stored = json.loads(Path(configMod.get_preferences_path()).read_text())
+        self.assertIs(stored["crash_recovery_save_scenes"], False)
+        # An automatic tick must never write a scene file while off.
+        animCrash.RecoverySystem._scene_snapshot_dirty = True
+        with mock.patch.object(animCrash, "save_scene_snapshot") as save:
+            self.assertIsNone(animCrash.RecoverySystem._save_scene_snapshot_if_due())
+        save.assert_not_called()
+        QtTest.QTest.mouseClick(switch, QtCore.Qt.LeftButton)
+        self.assertTrue(animCrash.Config.scene_snapshots_enabled())
+        self.assertTrue(recovery.scene_snapshot_combo.isEnabled())
+        self._drain_recovery_timer()
+
+    def test_legacy_scene_off_interval_migrates_to_animation_only(self):
+        configMod.get_config().set("crash_recovery_scene_snapshot_minutes", 0)
+        self.assertFalse(animCrash.Config.scene_snapshots_enabled())
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ except RuntimeError:
     pass
 
 from AnimKey.core import settings
+from AnimKey.mods import material_palette
 from AnimKey.core.settings_style import SettingsSwitch, STYLESHEET, WindowControl, apply_native_backdrop
 
 
@@ -146,8 +147,8 @@ class MaterialSettingsTests(unittest.TestCase):
         sample = after.pixelColor(10, 120)
         self.assertGreater(sample.alpha(), 0)
         self.assertLess(sample.alpha(), 220)
-        self.assertGreater(min(sample.red(), sample.green(), sample.blue()), 80)
-        self.assertLess(max(sample.red(), sample.green(), sample.blue()), 160)
+        for actual, expected in zip(sample.getRgb()[:3], material_palette.SURFACE_RGBA[:3]):
+            self.assertAlmostEqual(actual, expected, delta=2)
 
     def test_all_lazy_tabs_render_and_preserve_state(self):
         window = self._window()

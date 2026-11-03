@@ -140,6 +140,7 @@ class TumbleHelperTests(unittest.TestCase):
         tumble_helper._active = False
         tumble_helper._pending = False
         tumble_helper._script_jobs = []
+        tumble_helper._running = False
 
     def test_native_selection_pivot_and_stable_disabled_mode_without_camera_edits(self):
         original = {
@@ -203,7 +204,7 @@ class TumbleHelperTests(unittest.TestCase):
             "objectTumble": False, "autoSetPivot": False, "localTumble": 1,
         })
         self.assertFalse(tumble_helper.is_active())
-        self.assertFalse(tumble_helper._script_jobs)
+        self.assertTrue(tumble_helper._script_jobs)
 
     def test_disabled_startup_repairs_legacy_cursor_pivot_without_snapshot(self):
         self._patch_legacy_context()
@@ -245,7 +246,7 @@ class TumbleHelperTests(unittest.TestCase):
         events = {call.kwargs["event"][0] for call in jobs.call_args_list}
         self.assertEqual(events, {"ToolChanged", "SceneOpened", "NewSceneOpened"})
 
-    def test_reload_retains_jobs_so_disable_can_remove_them(self):
+    def test_reload_retains_jobs_so_shutdown_can_remove_them(self):
         self._patch_legacy_context()
         with mock.patch.object(tumble_helper.cmds, "scriptJob", return_value=1) as jobs:
             tumble_helper.apply(True)
@@ -253,9 +254,38 @@ class TumbleHelperTests(unittest.TestCase):
             importlib.reload(tumble_helper)
             self.assertTrue(tumble_helper.is_active())
             self.assertEqual(tumble_helper._script_jobs, handles)
-            tumble_helper.apply(False)
+            tumble_helper.shutdown()
             self.assertEqual(sum("kill" in call.kwargs for call in jobs.call_args_list), len(handles))
+        self.assertFalse(tumble_helper._script_jobs)
+        self.assertFalse(tumble_helper.is_active())
+
+    def test_shutdown_cancels_already_queued_repairs(self):
+        self._patch_legacy_context()
+        tumble_helper.apply(False)
+        tumble_helper.shutdown()
+        with mock.patch.object(tumble_helper, "refresh") as refresh:
+            tumble_helper._run_deferred()
+        refresh.assert_not_called()
+
+    def test_disabled_mode_repairs_settings_reloaded_by_maya(self):
+        self._patch_legacy_context()
+        tumble_helper.apply(False)
+        self.settings.update(objectTumble=True, localTumble=2, autoSetPivot=True)
+        tumble_helper._run_deferred()
         self._assert_disabled()
+
+    def test_preference_edits_do_not_add_to_or_clear_animation_undo(self):
+        self._patch_legacy_context()
+        cmds.file(new=True, force=True)
+        node = cmds.createNode("transform")
+        cmds.flushUndo()
+        cmds.setAttr(node + ".translateX", 10)
+        for enabled in (True, False):
+            tumble_helper.apply(enabled)
+        self.assertTrue(cmds.undoInfo(query=True, state=True))
+        cmds.undo()
+        self.assertEqual(cmds.getAttr(node + ".translateX"), 0)
+        self.assertTrue(cmds.undoInfo(query=True, undoQueueEmpty=True))
 
     def test_frame_selection_then_orbit_keeps_target_centered_in_both_modes(self):
         self._patch_legacy_context()

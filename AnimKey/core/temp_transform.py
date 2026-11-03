@@ -62,13 +62,44 @@ def writable(node):
 
 
 def apply_world(node,matrix):
-    """Apply a matrix and correct Maya's pivot-dependent translation residual."""
+    """Apply a matrix and correct Maya's pivot-dependent translation residual.
+
+    ``xform -matrix`` may rewrite rotatePivotTranslate/scalePivotTranslate on
+    nodes with offset pivots and a rotateAxis. Those compensation values must
+    stay as they were (the rig keeps its own), so the residual is solved
+    through translate only; otherwise baked translate values are wrong.
+    """
     values = list(matrix)
+    pivot_translates = {}
+    for attr in ("rotatePivotTranslate", "scalePivotTranslate"):
+        plug = node + "." + attr
+        if not cmds.getAttr(plug, lock=True) and not cmds.listConnections(plug, source=True, destination=False):
+            pivot_translates[attr] = cmds.getAttr(plug)[0]
     cmds.xform(node,worldSpace=True,matrix=values)
+    for attr, value in pivot_translates.items():
+        cmds.setAttr(node + "." + attr, *value)
     evaluated = list(world(node))
     delta = [values[i]-evaluated[i] for i in (12,13,14)]
     if any(abs(v)>1e-10 for v in delta):
         cmds.move(*delta,node,relative=True,worldSpace=True)
+
+
+TRANSFORM_ATTRS = TR + ("scaleX", "scaleY", "scaleZ", "shearXY", "shearXZ", "shearYZ", "visibility")
+
+
+def unlocked_duplicate(node, name):
+    """Parent-only copy with every transform channel unlocked.
+
+    Rig controls often lock scale/visibility; a plain duplicate inherits those
+    locks, which breaks any solve or visibility change on the copy.
+    """
+    copy = cmds.duplicate(node, parentOnly=True, inputConnections=False, name=name)[0]
+    copy = (cmds.ls(copy, long=True) or [copy])[0]
+    for attr in TRANSFORM_ATTRS:
+        plug = copy + "." + attr
+        if cmds.objExists(plug):
+            cmds.setAttr(plug, lock=False)
+    return copy
 
 
 def set_world(node, matrix, attrs=None):
@@ -80,11 +111,8 @@ def set_world(node, matrix, attrs=None):
     attrs = writable(node) if attrs is None else attrs
     if not attrs:
         return
-    scratch = cmds.duplicate(node, parentOnly=True, name="AnimKey_PoseSolve#",
-                             inputConnections=False)[0]
+    scratch = unlocked_duplicate(node, "AnimKey_PoseSolve#")
     try:
-        for attr in TR + ("scaleX", "scaleY", "scaleZ", "shearXY", "shearXZ", "shearYZ"):
-            cmds.setAttr(scratch + "." + attr, lock=False)
         apply_world(scratch,matrix)
         values = {a: cmds.getAttr(scratch + "." + a) for a in attrs}
         # Choose equivalent Euler values near the current pose, without filtering

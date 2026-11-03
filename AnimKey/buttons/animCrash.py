@@ -26,7 +26,6 @@ from AnimKey.mods.maya_compat import (
 from AnimKey.mods.storage import atomic_write_json
 from AnimKey.core.animation_curve_transfer import capture_curve, paste_curve
 from AnimKey.core.settings_style import SettingsSwitch
-from AnimKey.core.window_reveal import opening_animations_enabled, set_opening_animations_enabled
 
 
 QT_NO_BUTTON = getattr(QtCore.Qt, "NoButton", None)
@@ -101,7 +100,38 @@ class Config:
         return max(0, min(minutes, 120))
 
     @classmethod
+    def scene_snapshots_enabled(cls):
+        """Whether automatic recovery also writes complete Maya scene copies.
+
+        Off = animation-only recovery (light JSON checkpoints, no .mb files).
+        Users who had chosen "Scene: Off" keep that behaviour.
+        """
+        try:
+            from AnimKey.mods import configMod
+            value = configMod.get_config().get("crash_recovery_save_scenes", None)
+        except Exception:
+            value = None
+        if value is None:
+            return cls.scene_snapshot_minutes() > 0
+        return bool(value)
+
+    @classmethod
+    def set_scene_snapshots_enabled(cls, enabled):
+        try:
+            from AnimKey.mods import configMod
+            configMod.get_config().set("crash_recovery_save_scenes", bool(enabled))
+        except Exception:
+            pass
+        if enabled and cls.scene_snapshot_minutes() <= 0:
+            cls.set_scene_snapshot_minutes(10)
+        if RecoverySystem.is_active():
+            RecoverySystem._schedule_tick(Config.IDLE_DELAY)
+        return bool(enabled)
+
+    @classmethod
     def scene_snapshot_interval(cls):
+        if not cls.scene_snapshots_enabled():
+            return 0.0
         return float(cls.scene_snapshot_minutes() * 60)
 
     @classmethod
@@ -1656,7 +1686,6 @@ class RecoveryWindow(ContextPopupWindow):
             "Automatic complete-scene recovery copy interval"
         )
         for label, minutes in (
-            ("Scene: Off", 0),
             ("Scene: 5 min", 5),
             ("Scene: 10 min", 10),
             ("Scene: 15 min", 15),
@@ -1667,7 +1696,7 @@ class RecoveryWindow(ContextPopupWindow):
             Config.scene_snapshot_minutes()
         )
         self.scene_snapshot_combo.setCurrentIndex(
-            interval_index if interval_index >= 0 else 2
+            interval_index if interval_index >= 0 else 1
         )
         self.scene_snapshot_combo.setStyleSheet("""
             QComboBox {
@@ -1705,19 +1734,26 @@ class RecoveryWindow(ContextPopupWindow):
         
         container_layout.addWidget(header)
 
-        motion_row = QtWidgets.QHBoxLayout()
-        motion_row.setContentsMargins(14, 8, 14, 0)
-        self.opening_animations_switch = SettingsSwitch("Opening animations")
-        self.opening_animations_switch.setObjectName("openingAnimationsSwitch")
-        self.opening_animations_switch.setToolTip(
-            "Animate opening windows, slider menus and Flash Buttons. "
-            "Turn off to show them immediately."
+        # Opening animations moved to Settings > General > Interface.
+        scenes_row = QtWidgets.QHBoxLayout()
+        scenes_row.setContentsMargins(14, 8, 14, 0)
+        self.save_scenes_switch = SettingsSwitch("Save Maya scenes")
+        self.save_scenes_switch.setObjectName("saveScenesSwitch")
+        self.save_scenes_switch.setToolTip(
+            "On: also keep complete Maya scene copies (.mb) at the chosen interval.\n"
+            "Off: save only the animation (light checkpoints, no scene files)."
         )
-        self.opening_animations_switch.setChecked(opening_animations_enabled())
-        self.opening_animations_switch.toggled.connect(set_opening_animations_enabled)
-        motion_row.addWidget(self.opening_animations_switch)
-        motion_row.addStretch()
-        container_layout.addLayout(motion_row)
+        scenes_enabled = Config.scene_snapshots_enabled()
+        self.save_scenes_switch.setChecked(scenes_enabled)
+        self.scene_snapshot_combo.setEnabled(scenes_enabled)
+        self.save_scenes_switch.toggled.connect(self._on_save_scenes_toggled)
+        scenes_row.addWidget(self.save_scenes_switch)
+        self.save_mode_label = QtWidgets.QLabel()
+        self.save_mode_label.setProperty("muted", True)
+        scenes_row.addWidget(self.save_mode_label)
+        scenes_row.addStretch()
+        container_layout.addLayout(scenes_row)
+        self._update_save_mode_label(scenes_enabled)
         
         # Content
         content = QtWidgets.QWidget()
@@ -2059,6 +2095,19 @@ class RecoveryWindow(ContextPopupWindow):
     def _on_scene_snapshot_interval_changed(self, *args):
         minutes = self.scene_snapshot_combo.currentData()
         Config.set_scene_snapshot_minutes(minutes)
+
+    def _update_save_mode_label(self, scenes_enabled):
+        self.save_mode_label.setText(
+            "Animation + scene copies" if scenes_enabled else "Animation only"
+        )
+
+    def _on_save_scenes_toggled(self, enabled):
+        Config.set_scene_snapshots_enabled(enabled)
+        if enabled:
+            # Persist the interval shown in the combo.
+            Config.set_scene_snapshot_minutes(self.scene_snapshot_combo.currentData())
+        self.scene_snapshot_combo.setEnabled(bool(enabled))
+        self._update_save_mode_label(bool(enabled))
     
     def _refresh(self, *args):
         self.checkpoints = get_checkpoints(self.current_folder)

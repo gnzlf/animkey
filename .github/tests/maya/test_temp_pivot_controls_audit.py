@@ -1,351 +1,131 @@
+"""Scene ownership and transaction audit for the new Temp Controls engine."""
 import os
 import tempfile
 import unittest
 from unittest import mock
-
 import maya.standalone
-
 try:
-    maya.standalone.initialize(name="python")
+    maya.standalone.initialize(name='python')
 except RuntimeError:
     pass
-
 import maya.cmds as cmds
+from AnimKey.buttons import tempControls as temp
+from AnimKey.core import temp_tools as tt
 
-from AnimKey.buttons import tempPivot
 
-
-class TempPivotControlsAuditTests(unittest.TestCase):
+class TempControlsOwnershipTests(unittest.TestCase):
     def setUp(self):
-        cmds.file(new=True, force=True)
-        cmds.playbackOptions(minTime=1, maxTime=12)
-        tempPivot._temp_pivot_restore_state = None
-        tempPivot._temp_pivot_window = None
+        cmds.file(new=True,force=True)
+        self.folder=tempfile.TemporaryDirectory();self.addCleanup(self.folder.cleanup)
+        patch=mock.patch.object(temp,'_memory_path',return_value=os.path.join(self.folder.name,'memory.json'))
+        patch.start();self.addCleanup(patch.stop)
 
-    def tearDown(self):
-        tempPivot._stop_temp_pivot_monitor()
-        tempPivot.delete_temp_system()
-
-    @staticmethod
-    def _world_matrices(node):
-        values = {}
-        for frame in range(1, 13):
-            cmds.currentTime(frame, edit=True)
-            values[frame] = cmds.xform(node, query=True, worldSpace=True, matrix=True)
-        return values
-
-    def _assert_world_matrices(self, node, expected):
-        actual = self._world_matrices(node)
-        for frame, expected_matrix in expected.items():
-            for expected_value, actual_value in zip(expected_matrix, actual[frame]):
-                self.assertAlmostEqual(expected_value, actual_value, places=5)
-
-    @staticmethod
-    def _animated_cube(name, base_x, delta_x=0.0):
-        node = cmds.polyCube(name=name)[0]
-        for frame, rotate_y in ((1, 0.0), (6, 45.0), (12, 90.0)):
-            cmds.currentTime(frame, edit=True)
-            cmds.setAttr(node + ".translateX", base_x + delta_x * (frame - 1) / 11.0)
-            cmds.setAttr(node + ".rotateY", rotate_y)
-            cmds.setKeyframe(node, attribute="translateX")
-            cmds.setKeyframe(node, attribute="rotateY")
+    def source(self,name):
+        node=cmds.createNode('transform',name=name)
+        cmds.setKeyframe(node,attribute='tx',time=1,value=2)
+        cmds.setKeyframe(node,attribute='tx',time=6,value=8)
+        cmds.currentTime(1)
         return node
 
-    def test_individual_controls_preserve_motion_and_smart_bake(self):
-        first = self._animated_cube("tempFirst", 1.0, 3.0)
-        second = self._animated_cube("tempSecond", 8.0, -2.0)
-        original_first = self._world_matrices(first)
-        original_second = self._world_matrices(second)
+    def test_partial_creation_failure_rolls_back_entire_batch(self):
+        a=self.source('a');b=self.source('b')
+        before=set(cmds.ls())
+        original=temp._bind;calls=[]
+        def bind(system):
+            calls.append(system)
+            if len(calls)==2: raise RuntimeError('second source failed')
+            return original(system)
+        with mock.patch.object(temp,'_bind',side_effect=bind):
+            with self.assertRaises(RuntimeError): temp.create([a,b])
+        self.assertEqual(set(cmds.ls()),before)
 
-        controls = tempPivot.create_individual_controls([first, second])
+    def test_renamed_source_curve_and_owner_are_resolved_by_identity(self):
+        source=self.source('original')
+        curve=cmds.listConnections(source+'.tx',source=True,type='animCurve')[0]
+        root=temp.create([source])[0]
+        source=cmds.rename(source,'newName');curve=cmds.rename(curve,'newCurve');root=cmds.rename(root,'newSystem')
+        replacement=cmds.createNode('transform',name='original');cmds.setAttr(replacement+'.tx',99)
+        temp.clear([root],revert=True)
+        self.assertTrue(cmds.isConnected(curve+'.output',source+'.tx'))
+        self.assertEqual(cmds.getAttr(replacement+'.tx'),99)
 
-        self.assertEqual(len(controls), 2)
-        self.assertEqual(
-            set(tempPivot.get_controlled_objects()),
-            set(cmds.ls([first, second], long=True)),
-        )
-        self._assert_world_matrices(first, original_first)
-        self._assert_world_matrices(second, original_second)
+    def test_clearing_one_system_leaves_the_other_and_foreign_names_intact(self):
+        a=self.source('a');b=self.source('b')
+        roots=temp.create([a,b])
+        foreign=cmds.createNode('transform',name='TEMP_CTRL_userRig')
+        temp.clear([roots[0]],revert=True)
+        self.assertTrue(cmds.objExists(roots[1]));self.assertTrue(cmds.objExists(foreign))
+        self.assertEqual(len(temp.list_systems()),1)
 
-        control = controls[0]
-        for frame, value in ((1, 0.0), (6, 2.0), (12, -1.0)):
-            cmds.currentTime(frame, edit=True)
-            cmds.setAttr(control + ".translateZ", value)
-            cmds.setKeyframe(control, attribute="translateZ")
-        expected_first = self._world_matrices(first)
+    def test_clear_revert_is_one_undoable_transaction(self):
+        source=self.source('source')
+        root=temp.create([source])[0]
+        cmds.flushUndo();temp.clear([root],revert=True)
+        self.assertEqual(temp.list_systems(),[])
+        cmds.undo()
+        self.assertEqual(len(temp.list_systems()),1)
+        self.assertTrue(cmds.getAttr(temp.list_systems()[0]+'.isEnabled'))
 
-        cmds.select(control, replace=True)
-        baked_layer = tempPivot.smart_bake_and_delete()
+    def test_failed_bake_rolls_back_to_live_controls(self):
+        source=self.source('source');root=temp.create([source])[0]
+        connection=cmds.listConnections(source+'.tx',source=True,plugs=True)
+        with mock.patch.object(temp,'_bake_sources',side_effect=RuntimeError('bake failed')):
+            with self.assertRaises(RuntimeError): temp.clear([root],revert=False)
+        self.assertTrue(cmds.objExists(root));self.assertTrue(cmds.getAttr(root+'.isEnabled'))
+        self.assertEqual(cmds.listConnections(source+'.tx',source=True,plugs=True),connection)
 
-        self.assertTrue(baked_layer)
-        self.assertEqual(
-            tempPivot.get_controlled_objects(),
-            cmds.ls(second, long=True),
-        )
-        self._assert_world_matrices(first, expected_first)
+    def test_undo_disabled_does_not_mutate_live_system_on_bake(self):
+        source=self.source('source');root=temp.create([source])[0]
+        cmds.undoInfo(state=False)
+        try:
+            with self.assertRaises(RuntimeError): temp.clear([root],revert=False)
+            self.assertFalse(cmds.undoInfo(query=True,state=True))
+            self.assertTrue(cmds.objExists(root))
+            self.assertTrue(cmds.getAttr(root+'.isEnabled'))
+        finally: cmds.undoInfo(state=True)
 
-    def test_group_pivot_modes_and_follow_toggle(self):
-        first = self._animated_cube("groupFirst", 0.0, 3.0)
-        second = self._animated_cube("groupSecond", 10.0, 3.0)
+    def test_parented_joint_and_locked_axis_keep_source_channels(self):
+        parent=self.source('parent')
+        joint=cmds.createNode('joint',name='rigJoint',parent=parent)
+        cmds.setAttr(joint+'.jointOrient',10,20,0);cmds.setAttr(joint+'.ty',2)
+        cmds.setAttr(joint+'.tx',lock=True)
+        expected=tt.sample([joint],[1,3,6])[joint]
+        root=temp.create([joint],frames=True)[0]
+        for time,values in expected.items():
+            for a,b in zip(list(tt.matrix(joint,time)),values): self.assertAlmostEqual(a,b,places=5)
+        temp.clear([root],revert=False)
+        self.assertTrue(cmds.getAttr(joint+'.tx',lock=True))
+        self.assertEqual(cmds.getAttr(joint+'.jointOrient')[0],(10,20,0))
 
-        center_control = tempPivot.create_group_control(
-            [first, second], pivot_mode="center", follow=True
-        )
-        cmds.currentTime(1, edit=True)
-        self.assertAlmostEqual(
-            cmds.xform(center_control, query=True, worldSpace=True, rotatePivot=True)[0],
-            5.0,
-            places=5,
-        )
-        cmds.currentTime(6, edit=True)
-        self.assertAlmostEqual(
-            cmds.xform(center_control, query=True, worldSpace=True, rotatePivot=True)[0],
-            5.0 + 3.0 * 5.0 / 11.0,
-            places=5,
-        )
-        self.assertTrue(cmds.getAttr(center_control + ".follow"))
+    def test_namespaces_do_not_merge_systems_or_sources(self):
+        for namespace in ('a','b'): cmds.namespace(add=namespace)
+        a=self.source('a:control');b=self.source('b:control')
+        roots=temp.create([a,b])
+        self.assertEqual(len(roots),2)
+        temp.clear([roots[0]],revert=True)
+        self.assertEqual(temp._links(roots[1],'sourceNodes'),[tt.resolve(b)])
 
-        tempPivot.delete_temp_system()
-        cmds.currentTime(1, edit=True)
-        last_control = tempPivot.create_group_control(
-            [first, second], pivot_mode="last", follow=False
-        )
-        cmds.currentTime(1, edit=True)
-        start_position = cmds.xform(
-            last_control, query=True, worldSpace=True, rotatePivot=True
-        )
-        self.assertAlmostEqual(start_position[0], 10.0, places=5)
-        cmds.currentTime(6, edit=True)
-        later_position = cmds.xform(
-            last_control, query=True, worldSpace=True, rotatePivot=True
-        )
-        self.assertAlmostEqual(later_position[0], start_position[0], places=5)
-        self.assertFalse(cmds.getAttr(last_control + ".follow"))
+    def test_selected_range_bake_preserves_keys_outside_that_range(self):
+        source=self.source('source');root=temp.create([source],frames=True)[0]
+        receiver=temp.controls(root)[0]
+        cmds.setKeyframe(receiver,attribute='ty',time=3,value=4)
+        with mock.patch.object(tt.ws,'_get_selected_time_range',return_value=(2,4)):
+            temp.clear([root],revert=False)
+        self.assertEqual(cmds.getAttr(source+'.tx',time=1),2)
+        self.assertEqual(cmds.getAttr(source+'.tx',time=6),8)
+        self.assertEqual(cmds.getAttr(source+'.ty',time=1),0)
+        self.assertEqual(cmds.getAttr(source+'.ty',time=6),0)
 
-    def test_temp_controls_bake_with_an_animation_layer(self):
-        control = self._animated_cube("layeredControl", 4.0, 2.0)
-        action_layer = cmds.animLayer("tempActionLayer", override=False)
-        cmds.animLayer(action_layer, edit=True, attribute=control + ".rotateY")
-        cmds.animLayer(action_layer, edit=True, selected=True, preferred=True)
-        for frame, value in ((1, 0.0), (6, 15.0), (12, -10.0)):
-            cmds.setKeyframe(
-                control,
-                attribute="rotateY",
-                time=(frame, frame),
-                value=value,
-                animLayer=action_layer,
-            )
-
-        temp_control = tempPivot.create_individual_controls([control])[0]
-        for frame, value in ((1, 0.0), (6, 1.5), (12, -0.5)):
-            cmds.currentTime(frame, edit=True)
-            cmds.setAttr(temp_control + ".translateZ", value)
-            cmds.setKeyframe(temp_control, attribute="translateZ")
-        expected = self._world_matrices(control)
-
-        cmds.select(temp_control, replace=True)
-        baked_layer = tempPivot.smart_bake_and_delete()
-
-        self.assertTrue(baked_layer)
-        self.assertTrue(cmds.animLayer(action_layer, query=True, selected=True))
-        self._assert_world_matrices(control, expected)
-
-    def test_smart_bake_only_changes_the_temp_control_key_range(self):
-        control = self._animated_cube("rangeControl", 2.0, 6.0)
-        original = self._world_matrices(control)
-        temp_control = tempPivot.create_individual_controls([control])[0]
-
-        for frame, value in ((6, 2.0), (8, -1.0)):
-            cmds.currentTime(frame, edit=True)
-            cmds.setAttr(temp_control + ".translateZ", value)
-            cmds.setKeyframe(temp_control, attribute="translateZ")
-        expected = self._world_matrices(control)
-
-        cmds.currentTime(8, edit=True)
-        cmds.select(temp_control, replace=True)
-        baked_layer = tempPivot.smart_bake_and_delete()
-
-        self.assertTrue(baked_layer)
-        self._assert_world_matrices(
-            control,
-            {frame: expected[frame] for frame in range(6, 9)},
-        )
-        self._assert_world_matrices(
-            control,
-            {frame: original[frame] for frame in (1, 2, 3, 4, 5, 9, 10, 11, 12)},
-        )
-
-        layer_times = []
-        for curve in cmds.animLayer(baked_layer, query=True, animCurves=True) or []:
-            layer_times.extend(
-                cmds.keyframe(curve, query=True, timeChange=True) or []
-            )
-        self.assertGreaterEqual(min(layer_times), 5.0)
-        self.assertLessEqual(max(layer_times), 9.0)
-
-    def test_keyless_temp_control_bakes_only_the_current_frame(self):
-        control = self._animated_cube("singleFrameControl", 3.0, 4.0)
-        original = self._world_matrices(control)
-        temp_control = tempPivot.create_individual_controls([control])[0]
-
-        cmds.currentTime(6, edit=True)
-        cmds.setAttr(temp_control + ".translateZ", 2.5)
-        expected_at_six = cmds.xform(
-            control, query=True, worldSpace=True, matrix=True
-        )
-        cmds.select(temp_control, replace=True)
-        baked_layer = tempPivot.smart_bake_and_delete()
-
-        self.assertTrue(baked_layer)
-        cmds.currentTime(6, edit=True)
-        actual_at_six = cmds.xform(
-            control, query=True, worldSpace=True, matrix=True
-        )
-        for expected_value, actual_value in zip(expected_at_six, actual_at_six):
-            self.assertAlmostEqual(expected_value, actual_value, places=5)
-        self._assert_world_matrices(
-            control,
-            {frame: original[frame] for frame in (1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12)},
-        )
-
-    def test_creation_range_uses_animation_keys_instead_of_the_whole_shot(self):
-        cmds.playbackOptions(minTime=1, maxTime=100)
-        control = cmds.polyCube(name="creationRangeControl")[0]
-        for frame, value in ((20, 1.0), (30, 5.0)):
-            cmds.setKeyframe(
-                control,
-                attribute="translateX",
-                time=(frame, frame),
-                value=value,
-            )
-
-        self.assertEqual(
-            tempPivot._temp_control_creation_range([control]),
-            (20.0, 30.0),
-        )
-
-    def test_delete_temp_system_restores_animation_without_baking(self):
-        control = self._animated_cube("cancelControl", 2.0, 4.0)
-        expected = self._world_matrices(control)
-
-        temp_control = tempPivot.create_individual_controls([control])[0]
-        cmds.currentTime(6, edit=True)
-        cmds.setAttr(temp_control + ".translateZ", 3.0)
-        cmds.setKeyframe(temp_control, attribute="translateZ")
-
-        self.assertTrue(tempPivot.delete_temp_system())
-
-        self.assertFalse(tempPivot.get_controlled_objects())
-        self.assertFalse(tempPivot.get_tagged())
-        self._assert_world_matrices(control, expected)
-
-    def test_joint_and_parented_control_preserve_world_motion_on_bake(self):
-        parent = cmds.group(empty=True, name="tempParent")
-        cmds.select(clear=True)
-        joint = cmds.joint(name="tempJoint")
-        cmds.parent(joint, parent)
-        cmds.setAttr(joint + ".jointOrientX", 15.0)
-        for frame, parent_y, child_y in ((1, 0.0, 0.0), (6, 20.0, 30.0), (12, 40.0, -15.0)):
-            cmds.currentTime(frame, edit=True)
-            cmds.setAttr(parent + ".rotateY", parent_y)
-            cmds.setAttr(joint + ".rotateY", child_y)
-            cmds.setKeyframe(parent, attribute="rotateY")
-            cmds.setKeyframe(joint, attribute="rotateY")
-
-        temp_control = tempPivot.create_individual_controls([joint])[0]
-        for frame, value in ((1, 0.0), (6, 1.0), (12, -2.0)):
-            cmds.currentTime(frame, edit=True)
-            cmds.setAttr(temp_control + ".translateX", value)
-            cmds.setKeyframe(temp_control, attribute="translateX")
-        expected = self._world_matrices(joint)
-
-        cmds.select(temp_control, replace=True)
-        baked_layer = tempPivot.smart_bake_and_delete()
-
-        self.assertTrue(baked_layer)
-        self._assert_world_matrices(joint, expected)
-
-    def test_locked_transform_axis_does_not_break_temp_control(self):
-        control = self._animated_cube("lockedAxisControl", 4.0, 0.0)
-        cmds.setAttr(control + ".translateX", lock=True)
-
-        temp_controls = tempPivot.create_individual_controls([control])
-
-        self.assertEqual(len(temp_controls), 1)
-        self.assertTrue(cmds.getAttr(control + ".translateX", lock=True))
-        self.assertFalse(
-            cmds.isConnected(
-                control.split("|")[-1] + "_TEMP_decomp.outputTranslateX",
-                control + ".translateX",
-            )
-        )
-        self.assertTrue(
-            cmds.listConnections(
-                control + ".rotateY", source=True, destination=False
-            )
-        )
-
-    def test_temp_pivot_offsets_reset_to_the_default_pivot(self):
-        control = self._animated_cube("storedPivot", 3.0)
-        with tempfile.TemporaryDirectory() as folder:
-            path = os.path.join(folder, "temp_pivot_offsets.json")
-            with mock.patch.object(tempPivot, "_temp_pivot_prefs_path", return_value=path):
-                self.assertTrue(
-                    tempPivot._save_temp_pivot_offsets_for_objects(
-                        [control], [8.0, -2.0, 4.0]
-                    )
-                )
-                self.assertEqual(
-                    tempPivot._stored_temp_pivot_position([control]),
-                    [8.0, -2.0, 4.0],
-                )
-                self.assertTrue(tempPivot.reset_temp_pivot_offsets([control]))
-                self.assertEqual(
-                    tempPivot._stored_temp_pivot_position([control]),
-                    cmds.xform(
-                        control, query=True, worldSpace=True, rotatePivot=True
-                    ),
-                )
-
-    def test_group_pivot_offset_follows_the_last_selected_reference(self):
-        first = cmds.polyCube(name="offsetFirst")[0]
-        reference = cmds.polyCube(name="offsetReference")[0]
-        cmds.xform(first, worldSpace=True, translation=(1.0, 0.0, 0.0))
-        cmds.xform(reference, worldSpace=True, translation=(10.0, 0.0, 0.0))
-
-        with tempfile.TemporaryDirectory() as folder:
-            path = os.path.join(folder, "temp_pivot_offsets.json")
-            with mock.patch.object(tempPivot, "_temp_pivot_prefs_path", return_value=path):
-                self.assertTrue(
-                    tempPivot._save_temp_pivot_offsets_for_objects(
-                        [first, reference], [12.0, 3.0, -2.0]
-                    )
-                )
-                cmds.xform(first, worldSpace=True, translation=(50.0, 0.0, 0.0))
-                cmds.xform(reference, worldSpace=True, translation=(15.0, 0.0, 0.0))
-
-                stored = tempPivot._stored_temp_pivot_position(
-                    [first, reference], pivot_mode="last"
-                )
-
-        for expected, actual in zip((17.0, 3.0, -2.0), stored):
-            self.assertAlmostEqual(expected, actual, places=5)
-
-    def test_group_ui_toggle_updates_both_group_only_subcontrols(self):
-        window = mock.Mock()
-        window.pivot_options_widget = mock.Mock()
-        window.follow_checkbox = mock.Mock()
-
-        tempPivot.TempPivotWindow._toggle_pivot_options(window, checked=True)
-        window.pivot_options_widget.setVisible.assert_called_once_with(False)
-        window.follow_checkbox.setVisible.assert_called_once_with(False)
-
-        window.pivot_options_widget.reset_mock()
-        window.follow_checkbox.reset_mock()
-        tempPivot.TempPivotWindow._toggle_pivot_options(window, checked=False)
-        window.pivot_options_widget.setVisible.assert_called_once_with(True)
-        window.follow_checkbox.setVisible.assert_called_once_with(True)
+    def test_legacy_inputs_are_not_silently_wrapped_in_a_new_system(self):
+        source=cmds.createNode('transform',name='legacySource')
+        driver=cmds.createNode('decomposeMatrix',name='legacyDriver')
+        cmds.addAttr(driver,longName='tempTag',dataType='string')
+        cmds.setAttr(driver+'.tempTag','TEMP_CTRL_MATRIX_V2',type='string')
+        cmds.connectAttr(driver+'.outputTranslateX',source+'.translateX')
+        with self.assertRaisesRegex(ValueError,'legacy Temp Control'):
+            temp.create([source])
+        self.assertTrue(cmds.isConnected(driver+'.outputTranslateX',source+'.translateX'))
+        self.assertEqual(temp.list_systems(),[])
 
 
-if __name__ == "__main__":
-    unittest.main()
+if __name__=='__main__': unittest.main()

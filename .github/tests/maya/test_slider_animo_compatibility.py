@@ -28,6 +28,42 @@ from AnimKey.sliders import (
 
 
 class SliderAnimoCompatibilityTests(unittest.TestCase):
+    def test_blend_to_frame_keeps_existing_fixed_tangents(self):
+        from AnimKey.sliders import blend_to_frame
+        node = cmds.createNode("transform")
+        self._base_keys(node, "translateX", ((0, 0), (5, 2), (10, 10)))
+        cmds.keyTangent(node + ".tx", edit=True, time=(5, 5), lock=False, inAngle=13, outAngle=-20)
+        before = cmds.keyTangent(node + ".tx", query=True, time=(5, 5), inAngle=True)
+        cmds.currentTime(5)
+        blend_to_frame.prepare_blend_data([node], ["translateX"])
+        blend_to_frame.execute(50)
+        blend_to_frame.reset()
+        self.assertEqual(cmds.keyTangent(node + ".tx", query=True, time=(5, 5), inAngle=True), before)
+
+    def tearDown(self):
+        from AnimKey.sliders.slider_utils import cancel_slider_gesture
+        cancel_slider_gesture()
+
+    def test_cmds_slider_cancel_restores_curve_and_never_edits_new_scene(self):
+        from AnimKey.sliders.slider_utils import cancel_slider_gesture
+        node = cmds.createNode("transform", name="cancelSlider")
+        self._base_keys(node, "translateX", ((0, 2), (10, 10), (20, 20)))
+        cmds.currentTime(10)
+        cmds.flushUndo()
+        blend_to_default.prepare_blend_data([node], ["translateX"])
+        blend_to_default.execute(75)
+        self.assertNotEqual(cmds.getAttr(node + ".tx"), 10.)
+        cancel_slider_gesture()
+        self.assertEqual(cmds.getAttr(node + ".tx"), 10.)
+        self.assertFalse(cmds.undoInfo(query=True, chunkName=True))
+        blend_to_default.prepare_blend_data([node], ["translateX"])
+        blend_to_default.execute(50)
+        cmds.file(new=True, force=True)
+        replacement = cmds.createNode("transform", name="cancelSlider")
+        blend_to_default.reset()  # Late release from the old widget.
+        self.assertEqual(cmds.getAttr(replacement + ".tx"), 0.)
+        self.assertFalse(blend_to_default._is_dragging)
+
     def setUp(self):
         cmds.file(new=True, force=True)
 

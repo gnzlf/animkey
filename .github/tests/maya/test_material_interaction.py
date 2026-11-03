@@ -50,6 +50,9 @@ class MaterialInteractionTests(unittest.TestCase):
         self.window.show()
         APP.processEvents()
         APP.processEvents()
+        surface.reveal._animation.setCurrentTime(surface.reveal.DURATION_MS)
+        surface._capture_timer.stop()
+        surface._capture_backdrop()
         return surface
 
     def finish_fade(self, surface):

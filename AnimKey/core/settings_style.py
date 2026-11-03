@@ -87,6 +87,13 @@ QScrollBar::handle:vertical { background: #626571; border-radius: 4px; min-heigh
 QScrollBar::handle:vertical:hover { background: #9296a2; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QScrollBar:horizontal { height: 8px; background: transparent; margin: 0 3px; }
+QScrollBar::handle:horizontal { background: #626571; border-radius: 4px; min-width: 28px; }
+QScrollBar::handle:horizontal:hover { background: #9296a2; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
+QAbstractScrollArea::corner { background: transparent; border: none; }
+QDialog, QMessageBox, QInputDialog { background: #2f3136; }
 QTableWidget { background: rgba(8,12,19,85); alternate-background-color: rgba(255,255,255,6); border: 1px solid rgba(222,233,250,65); border-radius: 8px; color: #e9ecf0; }
 QHeaderView::section { background: rgba(255,255,255,12); color: #d3dbe7; border: none; border-bottom: 1px solid rgba(222,233,250,45); padding: 9px 6px; }
 QTableWidget::item { padding: 6px; }

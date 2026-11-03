@@ -88,6 +88,6 @@ def verify():
         app.quit()
 
 
-QtCore.QTimer.singleShot(200, verify)
-QtCore.QTimer.singleShot(max(500, args.hold_ms), app.quit)
+QtCore.QTimer.singleShot(500, verify)
+QtCore.QTimer.singleShot(max(700, args.hold_ms), app.quit)
 (getattr(app, 'exec', None) or app.exec_)()

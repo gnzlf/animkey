@@ -96,27 +96,6 @@ def _namespace(node):
     return short_name.rsplit(":", 1)[0]
 
 
-def _is_shape(node):
-    try:
-        return bool(cmds.objectType(node, isAType="shape"))
-    except Exception:
-        return False
-
-
-def _shape_types(node):
-    try:
-        shapes = cmds.listRelatives(node, shapes=True, fullPath=True, noIntermediate=True) or []
-    except Exception:
-        shapes = []
-    return [_node_type(shape) for shape in shapes]
-
-
-def _has_visible_asset_shape(node):
-    """True for visible prop/geo shapes, while avoiding most rig controls."""
-    ignored_shape_types = {"nurbsCurve", "locator", "annotationShape"}
-    return any(shape_type and shape_type not in ignored_shape_types for shape_type in _shape_types(node))
-
-
 def _is_descendant_of(node, parent):
     return node == parent or node.startswith(parent + "|")
 
@@ -203,189 +182,294 @@ def _should_stop_before_parent(node, parent, start_namespace):
     return False
 
 
-def _branch_objects(node):
-    """Return node plus its descendants for a found external prop branch."""
-    branch = []
-    _append_unique(branch, node)
+def _namespace_root_from_path(long_path, down_one_level=False):
+    """
+    Topmost ancestor that still belongs to the node's namespace.
+
+    Pure string work on the long DAG path, so it costs no Maya calls. A
+    namespaced (referenced) rig ends where its namespace ends, which also
+    keeps shared scene groups and other rigs out of the isolate set.
+    """
+    parts = long_path.split("|")
+    namespace = _namespace(parts[-1])
+    index = len(parts) - 1
+    while index - 1 >= 1 and _namespace(parts[index - 1]) == namespace:
+        index -= 1
+    if down_one_level and index < len(parts) - 1:
+        index += 1
+    return "|".join(parts[:index + 1])
+
+
+def _namespace_top_nodes(namespace):
+    """Every top-level DAG branch of a namespace (rig_grp, geo_grp, ...)."""
+    if not namespace:
+        return []
     try:
-        descendants = cmds.listRelatives(node, allDescendents=True, fullPath=True) or []
+        nodes = cmds.ls(namespace + ":*", long=True, type="transform") or []
     except Exception:
-        descendants = []
-    descendants.sort(key=lambda item: item.count("|"))
-    for descendant in descendants:
-        _append_unique(branch, descendant)
-    return branch
+        return []
 
-
-def _append_branch(items, node):
-    for branch_node in _branch_objects(node):
-        _append_unique(items, branch_node)
-
-
-def _is_external_parented_branch(node, rig_root, rig_namespace):
-    if node == rig_root or _is_shape(node):
-        return False
-
-    node_namespace = _namespace(node)
-
-    if node_namespace and node_namespace != rig_namespace:
-        node_type = _node_type(node)
-        if node_type in ("joint", "ikHandle", "effector", "constraint", "objectSet"):
-            return False
-        return True
-
-    # Same-namespace/no-namespace props can happen when an imported asset is
-    # parented under the rig. Include geometry-like branches, but avoid adding
-    # nurbsCurve controls.
-    node_type = _node_type(node)
-    if node_type in ("joint", "ikHandle", "effector", "constraint", "objectSet"):
-        return False
-
-    if _has_visible_asset_shape(node):
-        return True
-
-    return False
-
-
-def _is_external_constrained_target(node, rig_namespace, rig_root):
-    """True for constrained props/assets driven by the rig."""
-    if not node or _is_shape(node):
-        return False
-
-    if rig_root and _is_descendant_of(node, rig_root):
-        return False
-
-    node_type = _node_type(node)
-    if node_type in ("joint", "ikHandle", "effector", "constraint", "objectSet"):
-        return False
-
-    node_namespace = _namespace(node)
-    if node_namespace != rig_namespace:
-        return True
-
-    return _has_visible_asset_shape(node)
-
-
-def _constraint_external_objects_for_nodes(nodes, rig_namespace, rig_root=None):
-    """Find external transforms constrained by any of the given rig nodes."""
-    extras = []
-    if not nodes:
-        return extras
-
-    try:
-        constraints = cmds.listConnections(
-            nodes,
-            source=False,
-            destination=True,
-            type="constraint",
-        ) or []
-    except Exception:
-        constraints = []
-
-    seen_constraints = set()
-    for constraint in constraints:
-        if constraint in seen_constraints:
+    tops = []
+    for node in nodes:
+        if not isinstance(node, str):
             continue
-        seen_constraints.add(constraint)
+        parts = node.split("|")
+        if len(parts) > 2 and _namespace(parts[-2]) == namespace:
+            continue
+        tops.append(node)
+    return tops
 
-        possible_nodes = []
-        try:
-            possible_nodes.extend(cmds.listRelatives(constraint, parent=True, fullPath=True) or [])
-        except Exception:
-            pass
-        try:
-            possible_nodes.extend(cmds.listConnections(constraint, source=False, destination=True, type="transform") or [])
-        except Exception:
-            pass
 
-        for possible in possible_nodes:
+def _parent_path(node):
+    if not isinstance(node, str) or "|" not in node:
+        return ""
+    return node.rsplit("|", 1)[0]
+
+
+class _IsolateRoots(object):
+    """Minimal set of DAG roots to isolate (Maya shows their children)."""
+
+    def __init__(self, expand_namespaces=True):
+        self.roots = []
+        self.expand_namespaces = expand_namespaces
+        self._expanded_namespaces = set()
+        self._root_cache = {}
+
+    def contains(self, node):
+        return any(_is_descendant_of(node, root) for root in self.roots)
+
+    def _resolve(self, node):
+        if node not in self._root_cache:
             try:
-                long_nodes = cmds.ls(possible, long=True) or []
+                self._root_cache[node] = get_root_node(node)
             except Exception:
-                long_nodes = []
-            for long_node in long_nodes:
-                if _is_external_constrained_target(long_node, rig_namespace, rig_root):
-                    _append_branch(extras, long_node)
+                self._root_cache[node] = None
+        return self._root_cache[node]
 
-    return extras
+    def add_node(self, node):
+        """Add the whole rig that ``node`` belongs to."""
+        if not isinstance(node, str) or not node or self.contains(node):
+            return False
+        return self.add_root(self._resolve(node))
+
+    def add_root(self, root):
+        if not isinstance(root, str) or not root or self.contains(root):
+            return False
+        self.roots = [r for r in self.roots if not _is_descendant_of(r, root)]
+        self.roots.append(root)
+        if self.expand_namespaces:
+            self.expand_namespace(_namespace(root))
+        return True
+
+    def expand_namespace(self, namespace):
+        if not namespace or namespace in self._expanded_namespaces:
+            return False
+        self._expanded_namespaces.add(namespace)
+        changed = False
+        for top in _namespace_top_nodes(namespace):
+            changed = self.add_root(top) or changed
+        return changed
 
 
-def _find_parented_external_objects(search_root, rig_root):
+def _skin_link_groups():
     """
-    Return only top external branches parented under the selected rig.
+    [influences + skinned geometry] per skinCluster.
 
-    This avoids traversing and adding the whole rig. It looks for direct child
-    branches whose namespace differs from the rig or that are visible geometry.
+    Lets a click on separated geometry find its skeleton/rig (and the other
+    way around) for rigs without a namespace. Skins whose geometry lives in
+    the skinCluster's own namespace are skipped: namespace expansion already
+    covers them, which keeps referenced scenes fast.
     """
-    extras = []
-    rig_namespace = _namespace(rig_root)
     try:
-        descendants = cmds.listRelatives(
-            search_root,
-            allDescendents=True,
-            fullPath=True,
+        skins = cmds.ls(type="skinCluster") or []
+    except Exception:
+        return []
+
+    groups = []
+    for skin in skins:
+        if not isinstance(skin, str):
+            continue
+        try:
+            geometry = list(cmds.skinCluster(skin, query=True, geometry=True) or [])
+            skin_namespace = _namespace(skin)
+            if skin_namespace and all(_namespace(geo) == skin_namespace for geo in geometry):
+                continue
+            influences = list(cmds.skinCluster(skin, query=True, influence=True) or [])
+            members = cmds.ls(influences + geometry, long=True) or []
+        except Exception:
+            continue
+        members = [m for m in members if isinstance(m, str)]
+        if len(members) > 1:
+            groups.append(members)
+    return groups
+
+
+def _constraint_link_groups():
+    """
+    [driven, driver] for every constraint that may link two rigs/props.
+
+    One batched listConnections for the whole scene; constraints internal to
+    one referenced rig are discarded by namespace before any extra call.
+    """
+    try:
+        constraints = cmds.ls(type="constraint") or []
+        if not constraints:
+            return []
+        pairs = cmds.listConnections(
+            constraints,
+            source=True,
+            destination=False,
+            connections=True,
+            plugs=False,
             type="transform",
         ) or []
     except Exception:
-        descendants = []
+        return []
 
-    descendants.sort(key=lambda item: item.count("|"))
-    covered_external_branches = []
-    internal_rig_nodes = [rig_root]
+    long_cache = {}
 
-    for node in descendants:
-        if any(_is_descendant_of(node, branch_root) for branch_root in covered_external_branches):
+    def to_long(name):
+        if name not in long_cache:
+            try:
+                found = cmds.ls(name, long=True) or []
+            except Exception:
+                found = []
+            long_cache[name] = found[0] if len(found) == 1 else None
+        return long_cache[name]
+
+    groups = []
+    seen = set()
+    for index in range(0, len(pairs) - 1, 2):
+        plug, driver = pairs[index], pairs[index + 1]
+        if not isinstance(plug, str) or not isinstance(driver, str):
+            continue
+        if ".target[" not in plug:
+            continue
+        constraint = plug.split(".", 1)[0]
+        key = (constraint, driver)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        constraint_namespace = _namespace(constraint)
+        if constraint_namespace and constraint_namespace == _namespace(driver):
             continue
 
-        if _is_external_parented_branch(node, rig_root, rig_namespace):
-            _append_branch(extras, node)
-            covered_external_branches.append(node)
+        constraint_long = to_long(constraint)
+        driver_long = to_long(driver)
+        driven = _parent_path(constraint_long)
+        if driven and driver_long:
+            groups.append([driven, driver_long])
+    return groups
+
+
+def _apply_link_groups(state, groups):
+    """When a group touches the isolated rigs, pull in the rest of it."""
+    changed = False
+    for group in groups:
+        inside = [node for node in group if state.contains(node)]
+        if not inside or len(inside) == len(group):
             continue
+        for node in group:
+            if not state.contains(node):
+                changed = state.add_node(node) or changed
+    return changed
 
-        if _namespace(node) == rig_namespace:
-            internal_rig_nodes.append(node)
 
-    for constrained_obj in _constraint_external_objects_for_nodes(internal_rig_nodes, rig_namespace, rig_root):
-        _append_unique(extras, constrained_obj)
+def _is_attachment_parent(parent):
+    """A control, joint or mesh a prop is parented to (not a plain group)."""
+    if _node_type(parent) == "joint":
+        return True
+    try:
+        return bool(cmds.listRelatives(parent, shapes=True, fullPath=True))
+    except Exception:
+        return False
 
-    return extras
+
+def _climb_attachment_parents(state):
+    """Selected a sword parented under a hand control -> add the character."""
+    changed = False
+    for root in list(state.roots):
+        parent = _parent_path(root)
+        if parent and _is_attachment_parent(parent):
+            changed = state.add_node(parent) or changed
+    return changed
+
+
+def _expand_descendant_namespaces(state):
+    """Props parented inside a rig also bring their other top groups."""
+    try:
+        nodes = cmds.ls(state.roots, dag=True, long=True, type="transform") or []
+    except Exception:
+        return False
+    namespaces = set()
+    for node in nodes:
+        if isinstance(node, str):
+            namespaces.add(_namespace(node))
+    changed = False
+    for namespace in namespaces:
+        changed = state.expand_namespace(namespace) or changed
+    return changed
+
+
+def _collect_isolate_roots(selected_objects, include_parented=False):
+    state = _IsolateRoots(expand_namespaces=not down_one_level_var)
+    for selected_object in selected_objects:
+        try:
+            if not cmds.objectType(selected_object, isAType="dagNode"):
+                continue
+        except Exception:
+            continue
+        state.add_root(get_root_node(selected_object, down_one_level=down_one_level_var))
+
+    if not state.roots or down_one_level_var:
+        return state.roots
+
+    skin_groups = None
+    constraint_groups = None
+    for _ in range(8):
+        if skin_groups is None:
+            skin_groups = _skin_link_groups()
+        changed = _apply_link_groups(state, skin_groups)
+        if include_parented:
+            changed = _climb_attachment_parents(state) or changed
+            changed = _expand_descendant_namespaces(state) or changed
+            if constraint_groups is None:
+                constraint_groups = _constraint_link_groups()
+            changed = _apply_link_groups(state, constraint_groups) or changed
+        if not changed:
+            break
+    return state.roots
 
 
 def get_root_node(node, down_one_level=False):
     """
-    Get the root node of a hierarchy.
-    
-    Args:
-        node: The node to find the root for
-        down_one_level: If True, returns the node one level down from root
-    
-    Returns:
-        The root node (or parent of root if down_one_level is True)
+    Get the root node of a rig/hierarchy.
+
+    Namespaced nodes resolve to the top of their namespace inside the DAG
+    path (no Maya calls). Others climb until the next parent is a shared
+    group that holds other rigs.
     """
     previous_node = None
-    
+
     # Get the full name of the node to avoid duplicate name conflicts
     node = cmds.ls(node, long=True)[0]
     start_namespace = _namespace(node)
-    
+    if start_namespace:
+        return _namespace_root_from_path(node, down_one_level)
+
     while True:
         parents = cmds.listRelatives(node, parent=True, fullPath=True)
-        
+
         if not parents:
-            # If down_one_level is enabled, we want the node previous to the root node
-            # If we're at the root node and down_one_level is enabled, return previous_node
-            # If down_one_level is not enabled, simply return the current node
             return (previous_node or node) if down_one_level else node
 
         parent = parents[0]
 
         if _should_stop_before_parent(node, parent, start_namespace):
             return previous_node if down_one_level and previous_node else node
-        
-        # Save the current node before moving to the next parent node
+
         previous_node = node
-        
-        # Update the current node to the parent node for the next iteration
         node = parent
 
 
@@ -409,18 +493,10 @@ def execute(*args):
         cmds.warning("AnimKey: No objects selected.")
         return False
     try:
-        isolate_objects = []
-        selected_roots = []
-        for selected_object in selected_objects:
-            if not cmds.objectType(selected_object, isAType="dagNode"):
-                continue
-            root = get_root_node(selected_object, down_one_level=down_one_level_var)
-            _append_unique(isolate_objects, root)
-            _append_unique(selected_roots, root)
-        if include_parented_objects_enabled():
-            for root in selected_roots:
-                for obj in _find_parented_external_objects(root, root):
-                    _append_unique(isolate_objects, obj)
+        isolate_objects = _collect_isolate_roots(
+            selected_objects,
+            include_parented=include_parented_objects_enabled(),
+        )
         if not _load_isolate_objects(panel, isolate_objects):
             cmds.warning("AnimKey: Could not isolate the selected objects in this viewport.")
             return False
