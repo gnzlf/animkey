@@ -7,6 +7,7 @@ hint (modifiers / right click). It replaces Qt's small grey tooltip there.
 Event filters are installed only on the toolbar's own buttons, and menus are
 hooked when the toolbar opens them, so Maya's other widgets are untouched.
 """
+import os
 import re
 
 from AnimKey.mods.maya_compat import QtCore, QtGui, QtWidgets
@@ -16,6 +17,61 @@ DEFAULT_ACCENT = "#5bc0be"
 SHOW_DELAY_MS = 380
 MENU_DELAY_MS = 220
 MAX_CARD_WIDTH = 360
+GIF_WIDTH = 480
+
+# Settings keys (stored in AnimKey's config, edited in Settings > General > Popups).
+ENABLED_KEY = "help_popups_enabled"
+DELAY_KEY = "help_popups_delay_ms"
+OPACITY_KEY = "help_popups_opacity"
+
+GIF_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "data", "Gifs", "toolbar")
+
+# Toolbar button objectName -> demo GIF in data/Gifs/toolbar.
+BUTTON_GIFS = {
+    "ISO": "isolate.gif",
+    "OPP": "select_opposite.gif",
+    "TRL": "motion_trail.gif",
+    "RST": "reset_values.gif",
+    "OFF": "animation_offset.gif",
+    "HIR": "select_hierarchy.gif",
+}
+
+
+def _setting(key, default):
+    try:
+        from AnimKey.mods import configMod
+        return configMod.get_setting(key, default)
+    except Exception:
+        return default
+
+
+def popups_enabled():
+    return bool(_setting(ENABLED_KEY, True))
+
+
+def popup_delay_ms():
+    try:
+        return max(0, min(5000, int(_setting(DELAY_KEY, SHOW_DELAY_MS))))
+    except (TypeError, ValueError):
+        return SHOW_DELAY_MS
+
+
+def popup_opacity():
+    """Card opacity 0.2..1.0 (stored as percent)."""
+    try:
+        percent = float(_setting(OPACITY_KEY, 100))
+    except (TypeError, ValueError):
+        percent = 100.0
+    return max(20.0, min(100.0, percent)) / 100.0
+
+
+def button_gif(key):
+    name = BUTTON_GIFS.get(key)
+    if not name:
+        return None
+    path = os.path.join(GIF_DIR, name)
+    return path if os.path.isfile(path) else None
 
 
 # ---------------------------------------------------------------------------
@@ -209,12 +265,12 @@ def button_entry(button):
     """(title, description, hint, accent) for a toolbar button, or None."""
     key = button.objectName()
     if key in BUTTON_HELP:
-        return BUTTON_HELP[key]
+        return BUTTON_HELP[key] + (button_gif(key),)
     parsed = _plain_tooltip(button.toolTip())
     if not parsed:
         return None
     title, description, hint = parsed
-    return title, description, hint, DEFAULT_ACCENT
+    return title, description, hint, DEFAULT_ACCENT, None
 
 
 def menu_entry(owner, action):
@@ -234,7 +290,7 @@ def menu_entry(owner, action):
     accent = BUTTON_HELP.get(owner, (None, None, None, DEFAULT_ACCENT))[3]
     title = action.text().replace("&", "").strip()
     title = _LEADING_DECORATION_RE.sub("", title).strip() or label
-    return title, description, None, accent
+    return title, description, None, accent, None
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +319,15 @@ class HelpCard(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(margin + 20, margin + 14, margin + 18, margin + 16)
         layout.setSpacing(6)
+
+        # Demo animation above the text (only for buttons that have a GIF).
+        self.preview = QtWidgets.QLabel()
+        self.preview.setAlignment(QtCore.Qt.AlignCenter)
+        self.preview.setStyleSheet("background: transparent;")
+        self.preview.setVisible(False)
+        layout.addWidget(self.preview)
+        self._movie = None
+        self._gif = None
 
         self.title = QtWidgets.QLabel()
         self.description = QtWidgets.QLabel()
@@ -294,8 +359,43 @@ class HelpCard(QtWidgets.QWidget):
         self.title.setStyleSheet("color: #f4f5f7; background: transparent;")
         self.description.setStyleSheet("color: #c9ced6; background: transparent;")
 
+    def _set_gif(self, path):
+        if path == self._gif and self._movie is not None:
+            return
+        self.stop_movie()
+        self._gif = None
+        if self._movie is not None:
+            self._movie.deleteLater()
+            self._movie = None
+        self.preview.clear()
+        if not path:
+            self.preview.setVisible(False)
+            return
+        movie = QtGui.QMovie(path, parent=self)
+        if not movie.isValid():
+            self.preview.setVisible(False)
+            return
+        movie.setCacheMode(QtGui.QMovie.CacheNone)
+        size = QtGui.QImageReader(path).size()
+        if size.isValid() and size.width() > 0:
+            size = QtCore.QSize(GIF_WIDTH, int(round(size.height() * GIF_WIDTH / float(size.width()))))
+        else:
+            size = QtCore.QSize(GIF_WIDTH, int(GIF_WIDTH * 0.4))
+        movie.setScaledSize(size)
+        self.preview.setFixedSize(size)
+        self.preview.setMovie(movie)
+        self.preview.setVisible(True)
+        self._movie = movie
+        self._gif = path
+
+    def stop_movie(self):
+        if self._movie is not None:
+            self._movie.stop()
+
     def set_entry(self, entry):
-        title, description, hint, accent = entry
+        title, description, hint, accent = entry[:4]
+        gif = entry[4] if len(entry) > 4 else None
+        self._set_gif(gif)
         self._accent = QtGui.QColor(accent or DEFAULT_ACCENT)
         self.title.setText(title or "")
         self.description.setText(description or "")
@@ -303,13 +403,18 @@ class HelpCard(QtWidgets.QWidget):
         self.hint.setText(hint or "")
         self.hint.setVisible(bool(hint))
         self.hint.setStyleSheet("color: {}; background: transparent;".format(self._accent.lighter(115).name()))
-        inner = MAX_CARD_WIDTH - 2 * self.SHADOW - 38
+        chrome = 2 * self.SHADOW + 38
+        if self._movie is not None:
+            width = self.preview.width() + chrome
+            inner = self.preview.width()
+        else:
+            inner = MAX_CARD_WIDTH - chrome
+            natural = max(self.title.fontMetrics().horizontalAdvance(title or ""),
+                          self.description.fontMetrics().horizontalAdvance(description or ""),
+                          self.hint.fontMetrics().horizontalAdvance(hint or ""))
+            width = min(MAX_CARD_WIDTH, max(200, natural + 2 * self.SHADOW + 40))
         for label in (self.title, self.description, self.hint):
             label.setMaximumWidth(inner)
-        natural = max(self.title.fontMetrics().horizontalAdvance(title or ""),
-                      self.description.fontMetrics().horizontalAdvance(description or ""),
-                      self.hint.fontMetrics().horizontalAdvance(hint or ""))
-        width = min(MAX_CARD_WIDTH, max(200, natural + 2 * self.SHADOW + 40))
         self.setFixedWidth(width)
         self.layout().activate()
         self.setFixedHeight(self.layout().heightForWidth(width) if self.layout().hasHeightForWidth()
@@ -317,15 +422,25 @@ class HelpCard(QtWidgets.QWidget):
 
     def show_at(self, point):
         self.move(point)
+        opacity = popup_opacity()
+        if self._movie is not None:
+            self._movie.jumpToFrame(0)
+            self._movie.start()
         if not self.isVisible():
             self.setWindowOpacity(0.0)
             self.show()
             self._fade.stop()
             self._fade.setStartValue(0.0)
-            self._fade.setEndValue(1.0)
+            self._fade.setEndValue(opacity)
             self._fade.start()
         else:
+            self._fade.stop()
+            self.setWindowOpacity(opacity)
             self.update()
+
+    def hideEvent(self, event):
+        self.stop_movie()
+        super(HelpCard, self).hideEvent(event)
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
@@ -388,6 +503,9 @@ class HelpPopupController(QtCore.QObject):
             self._card.hide()
 
     def _schedule(self, delay, entry, place):
+        if not popups_enabled():
+            self.hide()
+            return
         self._pending = (entry, place)
         self._timer.start(delay)
 
@@ -438,7 +556,7 @@ class HelpPopupController(QtCore.QObject):
         if kind == QtCore.QEvent.Enter:
             entry = button_entry(obj) if obj.isEnabled() else None
             if entry:
-                self._schedule(SHOW_DELAY_MS, entry, self._place_below(obj))
+                self._schedule(popup_delay_ms(), entry, self._place_below(obj))
         elif kind in (QtCore.QEvent.Leave, QtCore.QEvent.MouseButtonPress,
                       QtCore.QEvent.MouseButtonDblClick, QtCore.QEvent.Hide,
                       QtCore.QEvent.Wheel, QtCore.QEvent.ContextMenu):
@@ -478,7 +596,9 @@ class HelpPopupController(QtCore.QObject):
         if not entry:
             self.hide()
             return
-        self._schedule(MENU_DELAY_MS, entry, self._place_beside(menu, action))
+        # Menu entries follow the same setting, a little quicker than buttons.
+        delay = int(popup_delay_ms() * MENU_DELAY_MS / float(SHOW_DELAY_MS))
+        self._schedule(delay, entry, self._place_beside(menu, action))
 
     def _place_beside(self, menu, action):
         def place(card):

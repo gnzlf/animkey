@@ -2862,8 +2862,19 @@ def snapshot_mirror_settings(*args):
     from AnimKey.core.executionGuard import require_animkey_context
     if not require_animkey_context("AnimKey.buttons.mirror.snapshot_mirror_settings"):
         return None
-    from AnimKey.core import reference_transfer as transfer
-    return transfer.snapshot(cmds.ls(selection=True) or [])
+    from AnimKey.core import mirror_engine as engine
+    selected = cmds.ls(selection=True, long=True) or []
+    if not selected:
+        cmds.warning("AnimKey: Select a control of the rig to snapshot.")
+        return None
+    done = set()
+    for control in selected:
+        rig_id = get_rig_identifier([control])
+        if rig_id not in done:
+            done.add(rig_id)
+            engine.build_table(control, force=True)
+    cmds.inViewMessage(amg="AnimKey: Mirror snapshot saved", pos="topCenter", fade=True)
+    return len(done)
 
 
 def _safe_getattr(node, attr, default=None):
@@ -4275,18 +4286,21 @@ def _apply_mirror_to_control(ctrl, opposite, sym_plane, snapshot,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def mirror(*args):
-    from AnimKey.core import reference_transfer as transfer
-    selected = cmds.ls(selection=True) or []
+    """Selected controls drive their opposites: pose, highlighted range or Graph Editor keys."""
+    from AnimKey.core import mirror_engine as engine
+    selected = cmds.ls(selection=True, long=True) or []
     start, end, has_range = _time_slider_or_playback_range()
-    return transfer.mirror_action(selected, time_range=(start, end) if has_range else None)
+    return engine.run(selected, mode="to_opposite",
+                      time_range=(start, end) if has_range else None)
 
 
 def _mirror_to_side(target_side, controls=None, attrs_filter=None):
-    from AnimKey.core import reference_transfer as transfer
-    selected = list(controls) if controls else (cmds.ls(selection=True) or [])
+    from AnimKey.core import mirror_engine as engine
+    selected = list(controls) if controls else (cmds.ls(selection=True, long=True) or [])
     start, end, has_range = _time_slider_or_playback_range()
-    return transfer.mirror_action(selected, time_range=(start, end) if has_range else None,
-                                  target_side=target_side)
+    return engine.run(selected, target_side=target_side,
+                      time_range=(start, end) if has_range else None,
+                      attr_filter=set(attrs_filter) if attrs_filter else None)
 
 
 def mirror_to_left(*args):
@@ -5315,10 +5329,11 @@ def all_mirror(*args):
     from AnimKey.core.executionGuard import require_animkey_context
     if not require_animkey_context("AnimKey.buttons.mirror.all_mirror"):
         return None
-    from AnimKey.core import reference_transfer as transfer
+    from AnimKey.core import mirror_engine as engine
     start, end, has_range = _time_slider_or_playback_range()
-    return transfer.mirror_action(cmds.ls(selection=True) or [],
-        time_range=(start, end) if has_range else None, all_keys=True)
+    return engine.run(cmds.ls(selection=True, long=True) or [], mode="swap",
+                      time_range=(start, end) if has_range else None,
+                      whole_animation=True)
 
 
 class _AutoMirrorResources:
@@ -5397,11 +5412,11 @@ def _auto_mirror_callback():
             changed = [control for index, control in enumerate(selected)
                        if signature[2][index] != previous[2][index]]
         state.in_callback = True
-        from AnimKey.core import reference_transfer as transfer
-        transfer.prepare_profiles(changed)
+        from AnimKey.core import mirror_engine as engine
+        engine.table_for([n for n in changed if cmds.objExists(n)])
         _open_animkey_undo_chunk('AnimKey Auto Mirror')
         try:
-            transfer.mirror_action(changed, pose_only=True)
+            engine.run(changed, pose_only=True, use_graph_keys=False)
             # Remember the result, so our own destination writes are never
             # mistaken for a fresh edit on the next idle event.
             state.last_signature = _auto_mirror_signature(selected)
@@ -5503,10 +5518,9 @@ def delete_mirror_snapshot(*args):
     if not selected:
         cmds.warning("AnimKey: Select a control to identify the rig.")
         return
-    from AnimKey.core import reference_transfer as transfer
-    transfer.remove_snapshot(selected)
+    from AnimKey.core import mirror_engine as engine
     rig_name = get_rig_identifier(selected)
-    removed = False
+    removed = engine.delete_table(rig_name)
     for path in _mirror_snapshot_candidates(rig_name):
         if os.path.exists(path):
             os.remove(path)
@@ -5573,35 +5587,78 @@ def clear_mirror_cache():
     global _mirror_cache
     _mirror_cache = {}
 
+def _exception_targets():
+    from AnimKey.core import mirror_engine as engine
+    selected = cmds.ls(selection=True, long=True) or []
+    if not selected:
+        cmds.warning("AnimKey: Select controls and highlight channels in the Channel Box.")
+        return None, None
+    attrs = engine.selected_channels(selected)
+    if not attrs:
+        cmds.warning("AnimKey: Highlight the channels in the Channel Box first.")
+        return None, None
+    return selected, sorted(attrs)
+
+
+def _set_exception(rule, label):
+    from AnimKey.core import mirror_engine as engine
+    selected, attrs = _exception_targets()
+    if not selected:
+        return None
+    engine.set_exception(selected, attrs, rule)
+    cmds.inViewMessage(amg="AnimKey Mirror: {} {}".format(label, ", ".join(attrs)),
+                       pos="topCenter", fade=True)
+    return attrs
+
+
 def add_mirror_invert_exception(*args):
+    """Highlighted channels get the opposite sign from the measured one."""
     from AnimKey.core.executionGuard import require_animkey_context
     if not require_animkey_context("AnimKey.buttons.mirror.add_mirror_invert_exception"):
         return None
-    cmds.warning("AnimKey: Exceptions are handled by the calibrated snapshot. Run Snapshot Mirror.")
+    return _set_exception("invert", "invert")
 
 def add_mirror_keep_exception(*args):
+    """Highlighted channels are never written by the mirror."""
     from AnimKey.core.executionGuard import require_animkey_context
     if not require_animkey_context("AnimKey.buttons.mirror.add_mirror_keep_exception"):
         return None
-    cmds.warning("AnimKey: Exceptions are handled by the calibrated snapshot. Run Snapshot Mirror.")
+    return _set_exception("keep", "keep")
 
 def remove_mirror_exception(*args):
     from AnimKey.core.executionGuard import require_animkey_context
     if not require_animkey_context("AnimKey.buttons.mirror.remove_mirror_exception"):
         return None
-    cmds.warning("AnimKey: No exceptions needed. The calibrated snapshot maps the rig automatically.")
+    return _set_exception(None, "removed exception on")
 
 def clear_all_exceptions(*args):
     from AnimKey.core.executionGuard import require_animkey_context
     if not require_animkey_context("AnimKey.buttons.mirror.clear_all_exceptions"):
         return None
-    cmds.warning("AnimKey: No exceptions needed. The calibrated snapshot maps the rig automatically.")
+    from AnimKey.core import mirror_engine as engine
+    selected = cmds.ls(selection=True, long=True) or []
+    if not selected:
+        cmds.warning("AnimKey: Select a control of the rig.")
+        return None
+    engine.clear_exceptions(selected)
+    cmds.inViewMessage(amg="AnimKey Mirror: exceptions cleared", pos="topCenter", fade=True)
 
 def show_exceptions(*args):
     from AnimKey.core.executionGuard import require_animkey_context
     if not require_animkey_context("AnimKey.buttons.mirror.show_exceptions"):
         return None
-    cmds.warning("AnimKey: Exceptions are handled automatically by the mirror profile.")
+    from AnimKey.core import mirror_engine as engine
+    selected = cmds.ls(selection=True, long=True) or []
+    if not selected:
+        cmds.warning("AnimKey: Select a control of the rig.")
+        return None
+    exceptions = engine.list_exceptions(selected)
+    if not exceptions:
+        print("AnimKey Mirror: no exceptions for this rig.")
+    for control, attrs in sorted(exceptions.items()):
+        print("AnimKey Mirror: {} -> {}".format(
+            control, ", ".join("{}={}".format(a, r) for a, r in sorted(attrs.items()))))
+    return exceptions
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

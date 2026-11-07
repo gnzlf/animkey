@@ -12,17 +12,6 @@
 
 import maya.cmds as cmds
 from AnimKey.sliders.slider_utils import apply_slider_value
-from AnimKey.buttons.mirror import (
-    find_opposite_name,
-    load_snapshot,
-    is_attribute_modifiable,
-    ATTRIBUTES_TO_IGNORE,
-    clear_mirror_cache,
-    get_opposite_control,
-    compute_mirror_values,
-    get_rig_identifier,
-    _load_or_build_basic_snapshot,
-)
 
 
 # Global cache for mirror blend data
@@ -34,75 +23,42 @@ def _shortest_angle_delta(target, source):
     return ((target - source + 180.0) % 360.0) - 180.0
 
 
+def is_attribute_modifiable(control, attr):
+    try:
+        return cmds.getAttr(control + "." + attr, settable=True) or \
+            bool(cmds.keyframe(control + "." + attr, query=True, keyframeCount=True))
+    except Exception:
+        return False
+
+
 def prepare_mirror_blend_data(objs=None):
     """
-    Prepare mirror blend data cache for current selection.
-    
-    Captures:
-    - Current pose values for all selected controls
-    - Mirrored pose values (what they would be after mirror)
-    
-    Args:
-        objs: List of objects to process. If None, uses current selection.
-    
-    Returns:
-        dict: Cache with original and mirrored values
+    Capture, per destination channel, its current value and the value the
+    Mirror button would give it. Uses AnimKey's mirror engine, so the slider
+    at 100% matches Mirror exactly (pairs, exceptions, channel filter).
     """
     global _mirror_blend_data_cache
     _mirror_blend_data_cache = {}
-    
-    # Clear cached mirror values from the previous slider drag.
-    clear_mirror_cache()
-    
-    objects = objs if objs else cmds.ls(selection=True)
+    from AnimKey.core import mirror_engine as engine
+
+    objects = [o for o in (objs if objs else cmds.ls(selection=True, long=True) or [])
+               if cmds.objExists(o)]
     if not objects:
         return _mirror_blend_data_cache
-    
-    profiles = {}
-    
-    # Process each selected control
-    for control in objects:
-        if not cmds.objExists(control):
+
+    pairs, tables = engine.plan_pairs(objects, mode="to_opposite")
+    attr_filter = engine.selected_channels(objects)
+    for source, target, attr, rule in engine._channel_jobs(pairs, tables, attr_filter):
+        source_value = engine._get(source + "." + attr)
+        target_attr = target + "." + attr
+        original = engine._get(target_attr)
+        if source_value is None or original is None:
             continue
-        rig_name = get_rig_identifier([control])
-        if rig_name not in profiles:
-            profiles[rig_name] = _load_or_build_basic_snapshot(
-                [control], rig_name=rig_name
-            )[0]
-        snapshot = profiles.get(rig_name)
-        
-        opposite_name = get_opposite_control(control, snapshot) or find_opposite_name(control)
-        is_central = (opposite_name is None or not cmds.objExists(opposite_name))
-
-        target = control if is_central else opposite_name
-        mirrored_values = compute_mirror_values(
-            control, target=target, snapshot=snapshot, is_central=is_central
-        )
-
-        for attr, mirrored_value in mirrored_values.items():
-            if attr in ATTRIBUTES_TO_IGNORE:
-                continue
-            target_attr = f"{target}.{attr}"
-            try:
-                original_blend_value = cmds.getAttr(target_attr)
-                if isinstance(original_blend_value, (list, tuple)):
-                    if len(original_blend_value) == 1:
-                        original_blend_value = original_blend_value[0]
-                    else:
-                        continue
-                if not isinstance(original_blend_value, (int, float)):
-                    continue
-
-                _mirror_blend_data_cache[target_attr] = {
-                    "original": original_blend_value,
-                    "mirrored": mirrored_value,
-                    "opposite": None,
-                    "is_central": is_central,
-                    "attr": attr
-                }
-            except Exception:
-                continue
-    
+        _mirror_blend_data_cache[target_attr] = {
+            "original": original,
+            "mirrored": engine.mirrored_value(source_value, rule),
+            "attr": attr,
+        }
     return _mirror_blend_data_cache
 
 

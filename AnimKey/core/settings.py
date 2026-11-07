@@ -807,6 +807,8 @@ class SettingsWindow(QtWidgets.QWidget):
         interface_layout.addWidget(self.opening_animations_switch)
         layout.addWidget(interface_group)
 
+        layout.addWidget(self._create_popups_group())
+
         # Channel Box helpers
         channel_box_group = QtWidgets.QGroupBox("Channel Box")
         channel_box_layout = QtWidgets.QVBoxLayout(channel_box_group)
@@ -899,6 +901,75 @@ class SettingsWindow(QtWidgets.QWidget):
             self.tab_widget.addTab(self._scroll_page(tab), "General")
         return tab
         
+    def _create_popups_group(self):
+        """Help popups shown when hovering toolbar buttons (text + demo GIF)."""
+        from AnimKey.core import help_popup
+
+        group = QtWidgets.QGroupBox("Popups")
+        group_layout = QtWidgets.QVBoxLayout(group)
+        group_layout.setContentsMargins(12, 16, 12, 12)
+        group_layout.setSpacing(10)
+
+        self.popups_switch = SettingsSwitch("Show help popups on toolbar buttons")
+        self.popups_switch.setObjectName("helpPopupsSwitch")
+        self.popups_switch.setToolTip(
+            "Hovering a toolbar button shows what it does, with a short demo "
+            "animation on the main buttons."
+        )
+        self.popups_switch.setChecked(help_popup.popups_enabled())
+        group_layout.addWidget(self.popups_switch)
+
+        def slider_row(label_text, minimum, maximum, step, value, suffix, accessible):
+            row = QtWidgets.QHBoxLayout()
+            label = QtWidgets.QLabel(label_text)
+            label.setFixedWidth(130)
+            row.addWidget(label)
+            slider = QtWidgets.QSlider(Qt.Horizontal)
+            slider.setFixedHeight(28)
+            slider.setRange(minimum, maximum)
+            slider.setSingleStep(step)
+            slider.setPageStep(step * 5)
+            slider.setValue(value)
+            slider.setAccessibleName(accessible)
+            row.addWidget(slider, 1)
+            spin = QtWidgets.QSpinBox()
+            spin.setRange(minimum, maximum)
+            spin.setSingleStep(step)
+            spin.setSuffix(suffix)
+            spin.setValue(value)
+            spin.setFixedWidth(84)
+            spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+            spin.setAlignment(Qt.AlignCenter)
+            slider.valueChanged.connect(spin.setValue)
+            spin.valueChanged.connect(slider.setValue)
+            row.addWidget(spin)
+            group_layout.addLayout(row)
+            return slider, (label, slider, spin)
+
+        self.popups_delay_slider, delay_widgets = slider_row(
+            "Delay to appear", 0, 2000, 50, help_popup.popup_delay_ms(), " ms", "Popup delay")
+        self.popups_opacity_slider, opacity_widgets = slider_row(
+            "Opacity", 20, 100, 5, int(round(help_popup.popup_opacity() * 100)), " %", "Popup opacity")
+
+        self.popups_delay_slider.valueChanged.connect(
+            lambda value: config.set_setting(help_popup.DELAY_KEY, int(value)))
+        self.popups_opacity_slider.valueChanged.connect(
+            lambda value: config.set_setting(help_popup.OPACITY_KEY, int(value)))
+
+        dependent = delay_widgets + opacity_widgets
+
+        def on_toggled(enabled):
+            config.set_setting(help_popup.ENABLED_KEY, bool(enabled))
+            for widget in dependent:
+                widget.setEnabled(bool(enabled))
+            if not enabled:
+                help_popup.hide()
+
+        self.popups_switch.toggled.connect(on_toggled)
+        for widget in dependent:
+            widget.setEnabled(self.popups_switch.isChecked())
+        return group
+
     def _browse_backup_folder(self):
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Animation Backup Folder")
         if folder:
