@@ -74,19 +74,14 @@ def _safe_warning(message):
 
 
 def _timeline_control():
-    slider_global = "gPlayBackSlider"
-    expressions = (
-        "global string ${0}; ${0}".format(slider_global),
-        "$animKeyTimelineControl=${}".format(slider_global),
-    )
-    for expression in expressions:
-        try:
-            slider = mel.eval(expression)
-        except Exception:
-            continue
-        if slider:
-            return slider
-    return None
+    try:
+        slider = mel.eval(
+            "global string $gPlayBackSlider; "
+            "$animKeyTimelineControl = $gPlayBackSlider;"
+        )
+    except Exception:
+        return None
+    return slider or None
 
 
 def get_time_range_selected():

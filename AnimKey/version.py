@@ -1,3 +1,3 @@
 """Single source of truth for the installed AnimKey version."""
 
-__version__ = "1.2.11"
+__version__ = "1.2.12"
