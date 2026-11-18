@@ -2,8 +2,11 @@
 
 Independent Maya implementation based on the supplied behavioural specs.
 Scene message links own all rig associations; original animation networks stay
-connected to holding plugs while a system is active. Bake writes an override
-layer, so Revert never destroys the animator's original layers or curves.
+connected to holding plugs while a system is active, so Revert restores them
+untouched. Bake is a smart bake onto the rig's own curves: original keys keep
+their timing and keys are added only where the curve must change to match the
+temporary controls exactly. Channels driven by animation layers or other graphs
+fall back to an owned override layer so those networks are never rewritten.
 """
 import json
 import os
@@ -552,42 +555,193 @@ def _detach(system):
         cmds.setAttr(control+".visibility",False)
 
 
-def _bake_rig(system, samples, parent_samples):
-    """Bake to an owned override layer; preserve all prior animation graphs."""
-    layer = cmds.animLayer("TempControls_Bake_AnimKey#",override=True)
-    tf.message(system,"bakeLayers",layer,multi=True)
-    members = records(system)
-    attrs_by_record = [json.loads(tf.string(r,"channels")) for r in members]
-    previous_selection = cmds.ls(selection=True,long=True) or []
+# Smart bake: largest difference (in channel display units) allowed between
+# the baked rig curve and the motion produced by the temporary controls.
+SMART_BAKE_TOLERANCE = 1e-5
+SMART_BAKE_MAX_PASSES = 200
+
+
+def _solve_rig_values(members, attrs_by_record, samples, parent_samples):
+    """Local channel values that reproduce every captured world pose.
+
+    Returns one ``{attr: [(frame, value), ...]}`` per member. Each source is
+    solved against its captured parent matrix, so parents baked in the same
+    gesture cannot feed back into their children.
+    """
+    solved = [{attr: [] for attr in attrs} for attrs in attrs_by_record]
     solvers = []
     solver_parents = []
     try:
-        for record, attrs in zip(members,attrs_by_record):
+        for record in members:
             source = _first(record,"source")
             solver = tf.unlocked_duplicate(source,"AnimKey_BakeSolve#")
-            solvers.append(solver)
-            # Solve against captured parent matrices. Maya can leave a freshly
-            # keyed layer one evaluation behind when its child is solved in
-            # the same frame; an independent parent avoids that dependency.
             parent = _create_node("transform",name="AnimKey_BakeParentSolve#")
             solver_parents.append(parent)
-            solver = cmds.parent(solver,parent,relative=True)[0]
-            solvers[-1] = solver
-            for attr in attrs:
-                cmds.animLayer(layer,edit=True,attribute=source+"."+attr)
+            solvers.append(cmds.parent(solver,parent,relative=True)[0])
         with tf.sampling():
             for (frame, matrices), (_, parents) in zip(samples,parent_samples):
                 cmds.currentTime(frame,edit=True)
-                # Parent rig objects can themselves be driven in this bake.
-                ordered = sorted(range(len(members)),key=lambda i: _first(members[i],"source").count("|"))
-                for i in ordered:
-                    source = _first(members[i],"source")
-                    solver = solvers[i]
+                for i, attrs in enumerate(attrs_by_record):
                     cmds.xform(solver_parents[i],worldSpace=True,matrix=parents[i])
-                    tf.apply_world(solver,matrices[i])
-                    for attr in attrs_by_record[i]:
-                        cmds.setKeyframe(source,attribute=attr,animLayer=layer,time=frame,
-                                         value=cmds.getAttr(solver+"."+attr),noResolve=True)
+                    tf.apply_world(solvers[i],matrices[i])
+                    for attr in attrs:
+                        solved[i][attr].append((frame,cmds.getAttr(solvers[i]+"."+attr)))
+    finally:
+        if solver_parents:
+            cmds.delete(solver_parents)
+        leftover = [s for s in solvers if cmds.objExists(s)]
+        if leftover:
+            cmds.delete(leftover)
+    return solved
+
+
+def _direct_curve(plug, internal=()):
+    """The plug's own animCurve, None when unanimated, False for other graphs.
+
+    Layers, pairBlends, expressions and curves shared with other rig plugs
+    are left to the layer bake so their networks are never rewritten.
+    ``internal`` lists this system's own nodes (holders, reference copies),
+    which also read the curve and do not count as sharing it.
+    """
+    incoming = cmds.listConnections(plug,source=True,destination=False,skipConversionNodes=True) or []
+    if not incoming:
+        return None
+    curve = incoming[0]
+    if not cmds.nodeType(curve).startswith("animCurveT"):
+        return False
+    outputs = cmds.listConnections(curve+".output",source=False,destination=True,skipConversionNodes=True) or []
+    owners = {n for n in (cmds.ls(outputs,long=True) or []) if n not in internal}
+    if len(owners) > 1:
+        return False
+    return curve
+
+
+def _curve_value(curve, frame):
+    values = cmds.keyframe(curve,query=True,eval=True,time=(frame,frame)) or []
+    return values[0] if values else None
+
+
+def _continuous_rotations(source, series, reference):
+    """Keep solved Euler rotations continuous (no 360 degree flips).
+
+    ``reference`` holds the rig's current values at the first frame, so the
+    bake stays on the same rotation branch the animator already uses.
+    """
+    import math
+    axes = [a for a in ("rotateX","rotateY","rotateZ") if a in series]
+    if not axes:
+        return
+    if len(axes) == 3:
+        order = cmds.getAttr(source+".rotateOrder")
+        previous = om.MEulerRotation(*[math.radians(reference.get(a,0.0) or 0.0) for a in axes],order)
+        for index in range(len(series["rotateX"])):
+            frame = series["rotateX"][index][0]
+            euler = om.MEulerRotation(*[math.radians(series[a][index][1]) for a in axes],order)
+            euler = euler.closestSolution(previous)
+            for axis, value in zip(axes,(euler.x,euler.y,euler.z)):
+                series[axis][index] = (frame,math.degrees(value))
+            previous = euler
+        return
+    for axis in axes:
+        previous = reference.get(axis)
+        values = series[axis]
+        for index, (frame, value) in enumerate(values):
+            if previous is not None:
+                value += 360.0 * round((previous - value) / 360.0)
+            values[index] = (frame,value)
+            previous = value
+
+
+def _set_bake_key(curve, frame, value, key_frames):
+    """Edit the key at ``frame`` or add one (auto tangents) on ``curve`` itself.
+
+    Keying the curve node, never the plug, keeps the key out of whatever
+    animation layer happens to be selected in Maya's UI.
+    """
+    if any(abs(frame - k) < 1e-6 for k in key_frames):
+        cmds.keyframe(curve,edit=True,time=(frame,frame),valueChange=value)
+        return
+    cmds.setKeyframe(curve,time=(frame,),value=value)
+    try:
+        cmds.keyTangent(curve,edit=True,time=(frame,frame),inTangentType="auto",outTangentType="auto")
+    except RuntimeError:
+        pass
+    key_frames.append(frame)
+
+
+def _curve_evaluator(curve):
+    """Fast read-only evaluation of ``curve`` in display units."""
+    import maya.api.OpenMayaAnim as oma
+    selection = om.MSelectionList()
+    selection.add(curve)
+    curve_fn = oma.MFnAnimCurve(selection.getDependNode(0))
+    curve_type = cmds.nodeType(curve)
+    unit = om.MTime.uiUnit()
+
+    def evaluate(frame):
+        value = curve_fn.evaluate(om.MTime(float(frame),unit))
+        if curve_type == "animCurveTA":
+            return om.MAngle(value,om.MAngle.kRadians).asUnits(om.MAngle.uiUnit())
+        if curve_type == "animCurveTL":
+            return om.MDistance(value,om.MDistance.kCentimeters).asUnits(om.MDistance.uiUnit())
+        return value
+    return evaluate
+
+
+def _smart_bake_channel(curve, series, tolerance=SMART_BAKE_TOLERANCE):
+    """Write ``series`` onto the rig's own curve with as few keys as possible.
+
+    The original keys inside the baked range are kept (new values); a key is
+    added only where the curve still differs from the temporary-control
+    motion, until every sampled frame matches within ``tolerance``.
+    Returns the number of keys added.
+    """
+    if not series:
+        return 0
+    frames = [f for f,_ in series]
+    target = dict(series)
+    start, end = frames[0], frames[-1]
+    existing = [k for k in (cmds.keyframe(curve,query=True,timeChange=True) or []) if start - 1e-6 <= k <= end + 1e-6]
+    # Sub-frame keys between samples have no captured pose; the baked result
+    # is defined on the sampled frames only.
+    stray = [k for k in existing if not any(abs(k - f) < 1e-6 for f in frames)]
+    for frame in stray:
+        cmds.cutKey(curve,time=(frame,frame),clear=True)
+    key_frames = [k for k in existing if k not in stray]
+    before = len(key_frames)
+    for frame in sorted(set([start,end] + key_frames)):
+        _set_bake_key(curve,frame,target[frame],key_frames)
+    evaluate = _curve_evaluator(curve)
+    for _ in range(SMART_BAKE_MAX_PASSES):
+        keys = sorted(key_frames)
+        # Worst frame of every gap between neighbouring keys, in one pass.
+        worst = {}
+        gap = 0
+        for frame in frames:
+            while gap + 1 < len(keys) and frame >= keys[gap + 1] - 1e-6:
+                gap += 1
+            if abs(frame - keys[gap]) < 1e-6:
+                continue
+            error = abs(evaluate(frame) - target[frame])
+            if error > tolerance and error > worst.get(gap,(None,0.0))[1]:
+                worst[gap] = (frame,error)
+        if not worst:
+            break
+        for frame, _error in worst.values():
+            _set_bake_key(curve,frame,target[frame],key_frames)
+    return len(key_frames) - before
+
+
+def _layer_bake_channels(system, channels):
+    """Previous behaviour for channels driven by layers or other graphs."""
+    layer = cmds.animLayer("TempControls_Bake_AnimKey#",override=True)
+    tf.message(system,"bakeLayers",layer,multi=True)
+    try:
+        for source, attr, _series in channels:
+            cmds.animLayer(layer,edit=True,attribute=source+"."+attr)
+        for source, attr, series in channels:
+            for frame, value in series:
+                cmds.setKeyframe(source,attribute=attr,animLayer=layer,time=frame,value=value,noResolve=True)
         curves = cmds.animLayer(layer,query=True,animCurves=True) or []
         rotations = [c for c in curves if cmds.nodeType(c) == "animCurveTA"]
         if rotations:
@@ -596,12 +750,61 @@ def _bake_rig(system, samples, parent_samples):
         if cmds.objExists(layer):
             cmds.delete(layer)
         raise
+    return layer
+
+
+def _bake_rig(system, samples, parent_samples):
+    """Smart bake onto the rig's own curves, keeping the visible motion.
+
+    No animation layer is created for ordinary keyed (or unanimated)
+    channels: their original keys stay where they were, and new keys are
+    added only where the curve could not otherwise match the temporary
+    controls. Channels driven by layers or other graphs fall back to an
+    owned override layer so those networks are preserved.
+    """
+    members = records(system)
+    attrs_by_record = [json.loads(tf.string(r,"channels")) for r in members]
+    previous_selection = cmds.ls(selection=True,long=True) or []
+    try:
+        solved = _solve_rig_values(members,attrs_by_record,samples,parent_samples)
+        layer_channels = []
+        start_frame = samples[0][0] if samples else None
+        scene_has_layers = bool(cmds.ls(type="animLayer"))
+        internal = set(cmds.ls([system] + (cmds.listRelatives(system,allDescendents=True,fullPath=True) or [])
+                               + list(tf.linked(system,"packNodes")),long=True) or [])
+        for record, attrs, series in zip(members,attrs_by_record,solved):
+            source = _first(record,"source")
+            curves = {attr: _direct_curve(source+"."+attr,internal) for attr in attrs}
+            reference = {}
+            for attr in attrs:
+                if curves[attr] and start_frame is not None:
+                    reference[attr] = _curve_value(curves[attr],start_frame)
+                else:
+                    reference[attr] = cmds.getAttr(source+"."+attr)
+            _continuous_rotations(source,series,reference)
+            for attr in attrs:
+                if cmds.getAttr(source+"."+attr,lock=True):
+                    continue
+                curve = curves[attr]
+                if curve is None and series[attr]:
+                    values = [value for _frame, value in series[attr]]
+                    if max(values) - min(values) <= SMART_BAKE_TOLERANCE:
+                        # Still constant: no keys, only its (possibly new) value.
+                        plug = source+"."+attr
+                        if abs(cmds.getAttr(plug) - values[0]) > SMART_BAKE_TOLERANCE:
+                            cmds.setAttr(plug,values[0])
+                        continue
+                if curve is None and series[attr] and not scene_has_layers:
+                    # Unanimated channel: give it its own base curve first.
+                    frame, value = series[attr][0]
+                    cmds.setKeyframe(source,attribute=attr,time=frame,value=value)
+                    curve = _direct_curve(source+"."+attr)
+                if not curve:
+                    layer_channels.append((source,attr,series[attr]))
+                else:
+                    _smart_bake_channel(curve,series[attr])
+        layer = _layer_bake_channels(system,layer_channels) if layer_channels else None
     finally:
-        if solver_parents:
-            cmds.delete(solver_parents)
-        leftover = [s for s in solvers if cmds.objExists(s)]
-        if leftover:
-            cmds.delete(leftover)
         if previous_selection:
             cmds.select(previous_selection,replace=True)
     return layer

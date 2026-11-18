@@ -24,6 +24,7 @@ from AnimKey.sliders.slider_utils import (
     get_value_at_time,
     should_process_attribute,
     slider_attribute_is_editable,
+    split_contiguous_frames,
 )
 
 
@@ -36,13 +37,23 @@ WAVE_FREQUENCY = 0.5
 WAVE_MAX_AMPLITUDE = 5.0
 
 
+def _segmented_targets(targets):
+    """One record per contiguous selected key group (see split_contiguous_frames)."""
+    for target in targets:
+        for segment in split_contiguous_frames(target['keyframes'], target['frames']):
+            record = dict(target)
+            record['frames'] = segment
+            yield record
+
+
 def prepare_curve_data(objs=None, attrs=None):
     """Prepare curve data cache for current selection."""
     global _curve_data_cache, _processing_context
     _curve_data_cache = {}
     
     _processing_context = get_processing_context(explicit_attributes=attrs is not None)
-    for target in get_slider_target_records(objs, attrs, _processing_context):
+    for target in _segmented_targets(
+            get_slider_target_records(objs, attrs, _processing_context)):
         attr_full = target['attr_full']
         curve = target['curve']
         frames_to_process = target['frames']

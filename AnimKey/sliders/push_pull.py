@@ -13,6 +13,8 @@
 
 import maya.cmds as cmds
 from AnimKey.sliders.slider_utils import (
+    split_contiguous_frames,
+    get_slider_objects,
     apply_slider_value,
     finalize_slider_value,
     get_frames_to_process,
@@ -42,7 +44,7 @@ def prepare_push_pull_data(objs=None, attrs=None):
     _processing_context = get_processing_context(explicit_attributes=attrs is not None)
     selected_channels = _processing_context.get('selected_channels')
     
-    objects = objs if objs else cmds.ls(selection=True)
+    objects = get_slider_objects(objs)
     if not objects:
         return _push_pull_data_cache
     
@@ -74,40 +76,43 @@ def prepare_push_pull_data(objs=None, attrs=None):
             if not frames_to_process:
                 continue
 
-            guide_start, guide_end = get_selection_guide_frames(all_keyframes, frames_to_process)
-            if guide_start is None or guide_end is None or guide_start == guide_end:
-                continue
+            for segment_frames in split_contiguous_frames(
+                    all_keyframes, frames_to_process):
+                # Each contiguous Graph Editor key group uses its own guides.
+                guide_start, guide_end = get_selection_guide_frames(all_keyframes, segment_frames)
+                if guide_start is None or guide_end is None or guide_start == guide_end:
+                    continue
 
-            try:
-                start_value = get_value_at_time(attr_full, guide_start)
-                end_value = get_value_at_time(attr_full, guide_end)
-            except Exception:
-                continue
-
-            if isinstance(start_value, (list, tuple)) or isinstance(end_value, (list, tuple)):
-                continue
-            
-            for frame in frames_to_process:
                 try:
-                    original_value = get_value_at_time(attr_full, frame)
-                    
-                    if isinstance(original_value, (list, tuple)):
-                        continue
-
-                    t = (frame - guide_start) / float(guide_end - guide_start)
-                    linear_value = start_value + (end_value - start_value) * t
-                    
-                    cache_key = f"{attr_full}@{frame}"
-                    _push_pull_data_cache[cache_key] = {
-                        "originalValue": original_value,
-                        "linearValue": linear_value,
-                        "attr_full": attr_full,
-                        "attr": attr,
-                        "frame": frame
-                    }
+                    start_value = get_value_at_time(attr_full, guide_start)
+                    end_value = get_value_at_time(attr_full, guide_end)
                 except Exception:
                     continue
-    
+
+                if isinstance(start_value, (list, tuple)) or isinstance(end_value, (list, tuple)):
+                    continue
+            
+                for frame in segment_frames:
+                    try:
+                        original_value = get_value_at_time(attr_full, frame)
+                    
+                        if isinstance(original_value, (list, tuple)):
+                            continue
+
+                        t = (frame - guide_start) / float(guide_end - guide_start)
+                        linear_value = start_value + (end_value - start_value) * t
+                    
+                        cache_key = f"{attr_full}@{frame}"
+                        _push_pull_data_cache[cache_key] = {
+                            "originalValue": original_value,
+                            "linearValue": linear_value,
+                            "attr_full": attr_full,
+                            "attr": attr,
+                            "frame": frame
+                        }
+                    except Exception:
+                        continue
+
     return _push_pull_data_cache
 
 

@@ -20,6 +20,74 @@ _SLIDER_KEY_EXISTS_CACHE = {}
 _SLIDER_EDITABLE_ATTR_CACHE = {}
 _SELECTED_CURVE_CACHE = {}
 _SELECTED_CURVE_FRAME_CACHE = {}
+_CURVE_FLOAT_INPUT_CACHE = {}
+
+
+def curve_uses_float_input(curve):
+    """True for driven-key curves (animCurveUA/UL/UT/UU).
+
+    Their keys live on a driver value instead of time, so Maya ignores
+    ``time=``/``timeChange`` for them and expects ``float=``/``floatChange``.
+    """
+    if not curve or '.' in str(curve):
+        return False
+    cached = _CURVE_FLOAT_INPUT_CACHE.get(curve)
+    if cached is None:
+        try:
+            cached = bool(cmds.nodeType(curve).startswith('animCurveU'))
+        except Exception:
+            cached = False
+        _CURVE_FLOAT_INPUT_CACHE[curve] = cached
+    return cached
+
+
+def curve_key_range(curve, frame):
+    """``time=`` or ``float=`` keyword selecting one key of ``curve``."""
+    key = 'float' if curve_uses_float_input(curve) else 'time'
+    return {key: (frame, frame)}
+
+
+def curve_key_inputs(curve, selected=False):
+    """Key positions: frames, or driver values for driven keys."""
+    flag = 'floatChange' if curve_uses_float_input(curve) else 'timeChange'
+    try:
+        kwargs = {'query': True, flag: True}
+        if selected:
+            kwargs['selected'] = True
+        return cmds.keyframe(curve, **kwargs) or []
+    except Exception:
+        return []
+
+
+def split_contiguous_frames(all_keyframes, frames):
+    """Split selected keys into runs of neighbouring keys on their curve.
+
+    A Time Slider range is always one run.  Graph Editor selections can hold
+    separate groups (e.g. 10-14 and 30-34); shape tools such as Linear, Flat,
+    Scale, Wave and Ease must treat each group against its own neighbours
+    instead of one span across the whole curve.
+    """
+    keyframes = _as_unique_sorted_frames(all_keyframes)
+    selected = _as_unique_sorted_frames(frames)
+    if not selected:
+        return []
+    if not keyframes:
+        return [selected]
+    runs = []
+    current = []
+    previous_index = None
+    for frame in selected:
+        match = _find_matching_frame(frame, keyframes)
+        index = keyframes.index(match) if match is not None else None
+        if current and (index is None or previous_index is None
+                        or index != previous_index + 1):
+            runs.append(current)
+            current = []
+        current.append(frame)
+        previous_index = index
+    if current:
+        runs.append(current)
+    return runs
 
 
 def _animation_offset_is_active():
@@ -239,7 +307,7 @@ def get_graph_editor_selection():
         
         for curve in anim_curves:
             # Get selected keyframe times for this curve
-            selected_times = cmds.keyframe(curve, query=True, selected=True, timeChange=True)
+            selected_times = curve_key_inputs(curve, selected=True)
             
             if selected_times:
                 driven_plugs = _anim_curve_driven_plugs(curve)
@@ -413,7 +481,8 @@ def get_processing_context(explicit_attributes=False):
     """
     global _COMPOSITE_LAYER_PREVIEW_TARGETS
     global _ACTIVE_LAYER_TARGET_CACHE, _SLIDER_KEY_EXISTS_CACHE
-    global _SLIDER_EDITABLE_ATTR_CACHE
+    global _SLIDER_EDITABLE_ATTR_CACHE, _CURVE_FLOAT_INPUT_CACHE
+    _CURVE_FLOAT_INPUT_CACHE = {}
     _COMPOSITE_LAYER_PREVIEW_TARGETS = set()
     _ACTIVE_LAYER_TARGET_CACHE = {}
     _SLIDER_KEY_EXISTS_CACHE = {}
@@ -476,10 +545,7 @@ def _slider_attr_matches(candidate, requested):
 
 
 def _curve_keyframes(curve):
-    try:
-        return _as_unique_sorted_frames(cmds.keyframe(curve, query=True) or [])
-    except Exception:
-        return []
+    return _as_unique_sorted_frames(curve_key_inputs(curve))
 
 
 def get_slider_target_records(objs=None, attrs=None, context=None,
@@ -495,18 +561,21 @@ def get_slider_target_records(objs=None, attrs=None, context=None,
     if context is None:
         context = get_processing_context(explicit_attributes=attrs is not None)
 
-    objects = list(objs) if objs else (cmds.ls(selection=True, long=True) or [])
+    explicit_objects = list(objs) if objs else []
+    objects = explicit_objects or (cmds.ls(selection=True, long=True) or [])
     requested_attrs = list(attrs or [])
     selected_channels = list(context.get('selected_channels') or [])
     records = []
     seen = set()
 
-    def include_plug(curve, plug, selected_frames=None):
+    def include_plug(curve, plug, selected_frames=None, object_filter=None):
         if not plug or '.' not in plug:
             return
         obj, attr = plug.rsplit('.', 1)
         attr = attr.split('[', 1)[0]
-        if objects and not any(_same_slider_object(obj, item) for item in objects):
+        object_filter = objects if object_filter is None else object_filter
+        if object_filter and not any(
+                _same_slider_object(obj, item) for item in object_filter):
             return
         if requested_attrs and not any(
                 _slider_attr_matches(attr, item) for item in requested_attrs):
@@ -545,10 +614,14 @@ def get_slider_target_records(objs=None, attrs=None, context=None,
 
     graph_entries = get_graph_editor_curve_entries()
     if graph_entries:
+        # Selected Graph Editor keys are the whole instruction.  They may sit
+        # on a pinned control, a blendShape weight or a shape attribute that
+        # is not part of the viewport selection.
         for entry in graph_entries:
             curve = entry.get('curve')
             for plug in entry.get('driven_plugs') or []:
-                include_plug(curve, plug, entry.get('frames') or [])
+                include_plug(curve, plug, entry.get('frames') or [],
+                             object_filter=explicit_objects)
         return records
 
     # For Time Slider/current-frame edits use only animated curves on the
@@ -577,6 +650,29 @@ def get_slider_target_records(objs=None, attrs=None, context=None,
                 if cmds.objExists(attr_full):
                     include_plug(None, attr_full)
     return records
+
+
+def get_slider_objects(objs=None):
+    """Objects a slider gesture works on.
+
+    Explicit objects win.  With keys selected in the Graph Editor the owners
+    of those curves are used (pinned controls, blendShape nodes, shapes,
+    driven-key targets), even when they are not selected in the viewport.
+    Otherwise the viewport selection is used, as before.
+    """
+    if objs:
+        return list(objs)
+    owners = []
+    for entry in _GRAPH_EDITOR_CURVE_ENTRIES:
+        for plug in entry.get('driven_plugs') or []:
+            if '.' not in plug:
+                continue
+            node = plug.rsplit('.', 1)[0]
+            if node and node not in owners:
+                owners.append(node)
+    if owners:
+        return owners
+    return cmds.ls(selection=True) or []
 
 
 def get_slider_candidate_attributes(obj, selected_channels=None, context=None,
@@ -860,7 +956,7 @@ def get_keyframes_for_attribute(attr_full, attr=None, context=None):
     active_layer, active_curve = _active_layer_target(attr_full)
     try:
         if selected_curve:
-            keyframes.extend(cmds.keyframe(selected_curve, query=True) or [])
+            keyframes.extend(curve_key_inputs(selected_curve))
         elif active_layer and active_layer != 'BaseAnimation' and not active_curve:
             # Never fall through to BaseAnimation while a non-base layer is
             # active but does not own this channel yet.
@@ -1117,10 +1213,11 @@ def get_value_at_time(attr_full, time, curve=None):
             get_selected_curve_for_attribute(attr_full)
         )
         if selected_curve:
-            values = cmds.keyframe(selected_curve, query=True, time=(time, time), valueChange=True)
+            key_range = curve_key_range(selected_curve, time)
+            values = cmds.keyframe(selected_curve, query=True, valueChange=True, **key_range)
             if values:
                 return values[0]
-            values = cmds.keyframe(selected_curve, query=True, time=(time, time), eval=True)
+            values = cmds.keyframe(selected_curve, query=True, eval=True, **key_range)
             if values:
                 return values[0]
         return cmds.getAttr(attr_full, time=time)
@@ -1216,7 +1313,9 @@ def has_key_at_frame(attr_full, frame, curve=None):
                 target = active_curve
             else:
                 target = attr_full
-        values = cmds.keyframe(target, query=True, time=(frame, frame), valueChange=True)
+        key_range = (curve_key_range(target, frame) if target != attr_full
+                     else {'time': (frame, frame)})
+        values = cmds.keyframe(target, query=True, valueChange=True, **key_range)
         return bool(values)
     except Exception:
         return False
@@ -1235,15 +1334,19 @@ def apply_slider_value(attr_full, frame, value, current_time=None, curve=None):
     # over the currently preferred layer, otherwise two selected layer curves
     # on one plug can be redirected into whichever layer Maya last selected.
     if curve:
+        key_range = curve_key_range(curve, frame)
         key_signature = (curve, round(float(frame), 6))
         key_exists = _SLIDER_KEY_EXISTS_CACHE.get(key_signature)
         if key_exists is None:
             key_exists = bool(cmds.keyframe(
-                curve, query=True, time=(frame, frame), valueChange=True,
+                curve, query=True, valueChange=True, **key_range
             ) or [])
             _SLIDER_KEY_EXISTS_CACHE[key_signature] = key_exists
         if key_exists:
-            cmds.keyframe(curve, edit=True, time=(frame, frame), valueChange=value)
+            cmds.keyframe(curve, edit=True, valueChange=value, **key_range)
+        elif curve_uses_float_input(curve):
+            cmds.setKeyframe(curve, float=(frame,), value=value)
+            _SLIDER_KEY_EXISTS_CACHE[key_signature] = True
         else:
             cmds.setKeyframe(curve, time=(frame,), value=value)
             _SLIDER_KEY_EXISTS_CACHE[key_signature] = True
@@ -1278,23 +1381,27 @@ def apply_slider_value(attr_full, frame, value, current_time=None, curve=None):
         get_selected_curve_for_attribute(attr_full)
     )
     if selected_curve:
+        key_range = curve_key_range(selected_curve, frame)
         key_signature = (selected_curve, round(float(frame), 6))
         key_exists = _SLIDER_KEY_EXISTS_CACHE.get(key_signature)
         if key_exists is None:
             key_exists = bool(cmds.keyframe(
                 selected_curve,
                 query=True,
-                time=(frame, frame),
                 valueChange=True,
+                **key_range
             ) or [])
             _SLIDER_KEY_EXISTS_CACHE[key_signature] = key_exists
         if key_exists:
             cmds.keyframe(
                 selected_curve,
                 edit=True,
-                time=(frame, frame),
                 valueChange=value,
+                **key_range
             )
+        elif curve_uses_float_input(selected_curve):
+            cmds.setKeyframe(selected_curve, float=(frame,), value=value)
+            _SLIDER_KEY_EXISTS_CACHE[key_signature] = True
         else:
             # A layer curve stores its own local contribution. Creating the
             # key directly avoids feeding that local value to the composite
@@ -1378,14 +1485,15 @@ def finalize_slider_value(attr_full, frame, value, current_time=None, curve=None
         get_selected_curve_for_attribute(attr_full)
     )
     if selected_curve:
+        key_range = curve_key_range(selected_curve, frame)
         keyed_values = cmds.keyframe(
             selected_curve,
             query=True,
-            time=(frame, frame),
             valueChange=True,
+            **key_range
         ) or []
         if keyed_values:
-            cmds.keyframe(selected_curve, edit=True, time=(frame, frame), valueChange=value)
+            cmds.keyframe(selected_curve, edit=True, valueChange=value, **key_range)
         else:
             # Slider previews now create their key immediately.  A missing key
             # here means the cache entry was never applied and must stay clean.
@@ -1601,9 +1709,11 @@ def get_slider_value(attr_full, frame, current_time=None, curve=None):
             get_selected_curve_for_attribute(attr_full)
         )
         target = selected_curve or attr_full
-        values = cmds.keyframe(target, query=True, time=(frame, frame), valueChange=True)
+        key_range = (curve_key_range(selected_curve, frame) if selected_curve
+                     else {'time': (frame, frame)})
+        values = cmds.keyframe(target, query=True, valueChange=True, **key_range)
         if not values and selected_curve:
-            values = cmds.keyframe(target, query=True, time=(frame, frame), eval=True)
+            values = cmds.keyframe(target, query=True, eval=True, **key_range)
     except Exception:
         pass
     if values:

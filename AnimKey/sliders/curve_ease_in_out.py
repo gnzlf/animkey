@@ -28,6 +28,8 @@ from AnimKey.sliders.slider_utils import (
     get_value_at_time,
     should_process_attribute,
     slider_attribute_is_editable,
+    split_contiguous_frames,
+    curve_key_range,
 )
 
 
@@ -81,9 +83,10 @@ def _bounded_lerp(original_value, target_value, amount):
 def _capture_tangents(attr_full, frame, curve=None):
     try:
         target = curve or get_curve_target(attr_full, frame)
+        key_range = curve_key_range(target, frame)
         return {
-            "itt": (cmds.keyTangent(target, q=True, time=(frame, frame), itt=True) or [None])[0],
-            "ott": (cmds.keyTangent(target, q=True, time=(frame, frame), ott=True) or [None])[0],
+            "itt": (cmds.keyTangent(target, q=True, itt=True, **key_range) or [None])[0],
+            "ott": (cmds.keyTangent(target, q=True, ott=True, **key_range) or [None])[0],
         }
     except Exception:
         return {}
@@ -100,7 +103,8 @@ def _restore_tangents(attr_full, frame, tangent_data, curve=None):
     if not kwargs:
         return
     try:
-        cmds.keyTangent(curve or get_curve_target(attr_full, frame), edit=True, time=(frame, frame), **kwargs)
+        target = curve or get_curve_target(attr_full, frame)
+        cmds.keyTangent(target, edit=True, **dict(curve_key_range(target, frame), **kwargs))
     except Exception:
         pass
 
@@ -113,9 +117,10 @@ def _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True, curve
         kwargs["ott"] = "plateau"
     if not kwargs:
         return
+    target = curve or get_curve_target(attr_full, frame)
+    key_range = curve_key_range(target, frame)
     try:
-        target = curve or get_curve_target(attr_full, frame)
-        cmds.keyTangent(target, edit=True, time=(frame, frame), **kwargs)
+        cmds.keyTangent(target, edit=True, **dict(key_range, **kwargs))
     except Exception:
         try:
             kwargs = {}
@@ -123,28 +128,23 @@ def _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True, curve
                 kwargs["itt"] = "clamped"
             if out_tangent:
                 kwargs["ott"] = "clamped"
-            cmds.keyTangent(target, edit=True, time=(frame, frame), **kwargs)
+            cmds.keyTangent(target, edit=True, **dict(key_range, **kwargs))
         except Exception:
             pass
 
 
 def _apply_anti_overshoot_tangents(cache, direction):
+    """Plateau tangents on the eased (selected) key only.
+
+    The guide keys around the selection belong to the animator and are not
+    selected, so their tangents are never changed.
+    """
     attr_full = cache.get("attr_full")
     frame = cache.get("frame")
     curve = cache.get("curve")
-    if not attr_full or frame is None:
+    if not attr_full or frame is None or direction not in ("in", "out"):
         return
-
-    if direction == "out":
-        _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True, curve=curve)
-        guide_frame = cache.get("easeOutGuideFrame")
-        if guide_frame is not None:
-            _set_safe_tangent(attr_full, guide_frame, in_tangent=True, out_tangent=False, curve=curve)
-    elif direction == "in":
-        _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True, curve=curve)
-        guide_frame = cache.get("easeInGuideFrame")
-        if guide_frame is not None:
-            _set_safe_tangent(attr_full, guide_frame, in_tangent=False, out_tangent=True, curve=curve)
+    _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True, curve=curve)
 
 
 def _restore_cached_tangents(cache):
@@ -166,12 +166,22 @@ def _proximity_for_frame_index(index, count, target_side):
     return 1.0 - t
 
 
+def _segmented_targets(targets):
+    """One record per contiguous selected key group (see split_contiguous_frames)."""
+    for target in targets:
+        for segment in split_contiguous_frames(target['keyframes'], target['frames']):
+            record = dict(target)
+            record['frames'] = segment
+            yield record
+
+
 def prepare_curve_data(objs=None, attrs=None):
     """Prepare curve data cache for ease in/out."""
     global _curve_data_cache, _processing_context
     _curve_data_cache = {}
     _processing_context = get_processing_context(explicit_attributes=attrs is not None)
-    for target in get_slider_target_records(objs, attrs, _processing_context):
+    for target in _segmented_targets(
+            get_slider_target_records(objs, attrs, _processing_context)):
         attr_full = target['attr_full']
         curve = target['curve']
         frames_to_process = target['frames']
@@ -208,8 +218,6 @@ def prepare_curve_data(objs=None, attrs=None):
                     "frame": frame,
                     "tangents": {
                         frame: _capture_tangents(attr_full, frame, curve=curve),
-                        guide_start_frame: _capture_tangents(attr_full, guide_start_frame, curve=curve),
-                        guide_end_frame: _capture_tangents(attr_full, guide_end_frame, curve=curve),
                     },
                 }
             except Exception:

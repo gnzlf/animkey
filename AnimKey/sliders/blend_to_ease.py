@@ -16,6 +16,9 @@
 
 import maya.cmds as cmds
 from AnimKey.sliders.slider_utils import (
+    curve_key_range,
+    split_contiguous_frames,
+    get_slider_objects,
     apply_slider_value,
     finalize_slider_value,
     get_frames_to_process,
@@ -76,9 +79,10 @@ def _bounded_lerp(original_value, target_value, amount):
 def _capture_tangents(attr_full, frame):
     try:
         target = get_curve_target(attr_full, frame)
+        key_range = curve_key_range(target, frame)
         return {
-            "itt": (cmds.keyTangent(target, q=True, time=(frame, frame), itt=True) or [None])[0],
-            "ott": (cmds.keyTangent(target, q=True, time=(frame, frame), ott=True) or [None])[0],
+            "itt": (cmds.keyTangent(target, q=True, itt=True, **key_range) or [None])[0],
+            "ott": (cmds.keyTangent(target, q=True, ott=True, **key_range) or [None])[0],
         }
     except Exception:
         return {}
@@ -95,7 +99,8 @@ def _restore_tangents(attr_full, frame, tangent_data):
     if not kwargs:
         return
     try:
-        cmds.keyTangent(get_curve_target(attr_full, frame), edit=True, time=(frame, frame), **kwargs)
+        target = get_curve_target(attr_full, frame)
+        cmds.keyTangent(target, edit=True, **dict(curve_key_range(target, frame), **kwargs))
     except Exception:
         pass
 
@@ -108,9 +113,10 @@ def _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True):
         kwargs["ott"] = "plateau"
     if not kwargs:
         return
+    target = get_curve_target(attr_full, frame)
+    key_range = curve_key_range(target, frame)
     try:
-        target = get_curve_target(attr_full, frame)
-        cmds.keyTangent(target, edit=True, time=(frame, frame), **kwargs)
+        cmds.keyTangent(target, edit=True, **dict(key_range, **kwargs))
     except Exception:
         try:
             kwargs = {}
@@ -118,27 +124,22 @@ def _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True):
                 kwargs["itt"] = "clamped"
             if out_tangent:
                 kwargs["ott"] = "clamped"
-            cmds.keyTangent(target, edit=True, time=(frame, frame), **kwargs)
+            cmds.keyTangent(target, edit=True, **dict(key_range, **kwargs))
         except Exception:
             pass
 
 
 def _apply_anti_overshoot_tangents(cache, direction):
+    """Plateau tangents on the eased (selected) key only.
+
+    The guide keys around the selection are not selected, so their tangents
+    belong to the animator and are never changed.
+    """
     attr_full = cache.get("attr_full")
     frame = cache.get("frame")
-    if not attr_full or frame is None:
+    if not attr_full or frame is None or direction not in ("in", "out"):
         return
-
-    if direction == "out":
-        _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True)
-        guide_frame = cache.get("easeOutGuideFrame")
-        if guide_frame is not None:
-            _set_safe_tangent(attr_full, guide_frame, in_tangent=True, out_tangent=False)
-    elif direction == "in":
-        _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True)
-        guide_frame = cache.get("easeInGuideFrame")
-        if guide_frame is not None:
-            _set_safe_tangent(attr_full, guide_frame, in_tangent=False, out_tangent=True)
+    _set_safe_tangent(attr_full, frame, in_tangent=True, out_tangent=True)
 
 
 def _restore_cached_tangents(cache):
@@ -164,7 +165,7 @@ def prepare_blend_data(objs=None, attrs=None):
     _processing_context = get_processing_context(explicit_attributes=attrs is not None)
     selected_channels = _processing_context.get('selected_channels')
     
-    objects = objs if objs else cmds.ls(selection=True)
+    objects = get_slider_objects(objs)
     if not objects:
         return _blend_ease_data_cache
     
@@ -195,50 +196,51 @@ def prepare_blend_data(objs=None, attrs=None):
             if not frames_to_process:
                 continue
 
-            guide_start, guide_end = get_selection_guide_frames(all_keyframes, frames_to_process)
-            if guide_start is None or guide_end is None or guide_start == guide_end:
-                continue
+            for segment_frames in split_contiguous_frames(
+                    all_keyframes, frames_to_process):
+                # Each contiguous Graph Editor key group uses its own guides.
+                guide_start, guide_end = get_selection_guide_frames(all_keyframes, segment_frames)
+                if guide_start is None or guide_end is None or guide_start == guide_end:
+                    continue
 
-            try:
-                start_value = get_value_at_time(attr_full, guide_start)
-                end_value = get_value_at_time(attr_full, guide_end)
-            except Exception:
-                continue
-
-            if isinstance(start_value, (list, tuple)) or isinstance(end_value, (list, tuple)):
-                continue
-            
-            sorted_frames = sorted(frames_to_process)
-            selected_count = len(sorted_frames)
-
-            for frame_index, frame in enumerate(sorted_frames):
                 try:
-                    # Get original value
-                    original_value = get_value_at_time(attr_full, frame)
-                    if isinstance(original_value, (list, tuple)):
-                        continue
-                    
-                    cache_key = f"{attr_full}@{frame}"
-                    _blend_ease_data_cache[cache_key] = {
-                        "originalValue": original_value,
-                        "easeInTarget": start_value,
-                        "easeOutTarget": end_value,
-                        "easeInGuideFrame": guide_start,
-                        "easeOutGuideFrame": guide_end,
-                        "easeInProximity": _proximity_for_frame_index(frame_index, selected_count, "left"),
-                        "easeOutProximity": _proximity_for_frame_index(frame_index, selected_count, "right"),
-                        "attr_full": attr_full,
-                        "frame": frame,
-                        "hasKeyframe": frame in all_keyframes,
-                        "tangents": {
-                            frame: _capture_tangents(attr_full, frame),
-                            guide_start: _capture_tangents(attr_full, guide_start),
-                            guide_end: _capture_tangents(attr_full, guide_end)
-                        }
-                    }
+                    start_value = get_value_at_time(attr_full, guide_start)
+                    end_value = get_value_at_time(attr_full, guide_end)
                 except Exception:
                     continue
-    
+
+                if isinstance(start_value, (list, tuple)) or isinstance(end_value, (list, tuple)):
+                    continue
+            
+                sorted_frames = sorted(segment_frames)
+                selected_count = len(sorted_frames)
+
+                for frame_index, frame in enumerate(sorted_frames):
+                    try:
+                        # Get original value
+                        original_value = get_value_at_time(attr_full, frame)
+                        if isinstance(original_value, (list, tuple)):
+                            continue
+                    
+                        cache_key = f"{attr_full}@{frame}"
+                        _blend_ease_data_cache[cache_key] = {
+                            "originalValue": original_value,
+                            "easeInTarget": start_value,
+                            "easeOutTarget": end_value,
+                            "easeInGuideFrame": guide_start,
+                            "easeOutGuideFrame": guide_end,
+                            "easeInProximity": _proximity_for_frame_index(frame_index, selected_count, "left"),
+                            "easeOutProximity": _proximity_for_frame_index(frame_index, selected_count, "right"),
+                            "attr_full": attr_full,
+                            "frame": frame,
+                            "hasKeyframe": frame in all_keyframes,
+                            "tangents": {
+                                frame: _capture_tangents(attr_full, frame),
+                            }
+                        }
+                    except Exception:
+                        continue
+
     return _blend_ease_data_cache
 
 

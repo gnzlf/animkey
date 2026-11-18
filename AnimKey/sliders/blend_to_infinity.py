@@ -13,6 +13,7 @@
 import maya.cmds as cmds
 import math
 from AnimKey.sliders.slider_utils import (
+    get_slider_objects,
     apply_slider_value,
     finalize_slider_value,
     get_frames_to_process,
@@ -111,7 +112,7 @@ def prepare_blend_data(objs=None, attrs=None):
     _processing_context = get_processing_context(explicit_attributes=attrs is not None)
     selected_channels = _processing_context.get('selected_channels')
     
-    objects = objs if objs else cmds.ls(selection=True)
+    objects = get_slider_objects(objs)
     if not objects:
         return _blend_infinity_data_cache
     

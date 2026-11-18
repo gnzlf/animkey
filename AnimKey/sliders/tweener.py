@@ -25,6 +25,9 @@ import maya.api.OpenMayaAnim as oma
 import bisect
 
 from AnimKey.sliders.slider_utils import (
+    get_slider_objects,
+    curve_key_inputs,
+    curve_key_range,
     finalize_slider_value,
     get_curve_target,
     get_frames_to_process,
@@ -106,8 +109,8 @@ def _sample_curve_value(curve, frames, values, frame):
         evaluated = cmds.keyframe(
             curve,
             query=True,
-            time=(numeric_frame, numeric_frame),
             eval=True,
+            **curve_key_range(curve, numeric_frame)
         ) or []
         if evaluated:
             return float(evaluated[0]), True
@@ -592,9 +595,7 @@ def _prepare_curve_first_entries(records, context, current_time,
             if api_handle:
                 frames, values = _api_curve_samples(*api_handle)
             else:
-                frames = [float(value) for value in (
-                    cmds.keyframe(curve, query=True, timeChange=True) or []
-                )]
+                frames = [float(value) for value in curve_key_inputs(curve)]
                 values = [float(value) for value in (
                     cmds.keyframe(curve, query=True, valueChange=True) or []
                 )]
@@ -787,7 +788,7 @@ def prepare_tween_data(objs=None, attrs=None):
     except Exception:
         animation_curve_transfer = None
 
-    objects = objs if objs else cmds.ls(selection=True)
+    objects = get_slider_objects(objs)
     if not objects:
         return _tween_cache
 
@@ -919,13 +920,8 @@ def prepare_tween_data(objs=None, attrs=None):
                         )
                     else:
                         fast_curve_frames = [
-                            float(value) for value in (
-                                cmds.keyframe(
-                                    fast_curve_target,
-                                    query=True,
-                                    timeChange=True,
-                                ) or []
-                            )
+                            float(value) for value in
+                            curve_key_inputs(fast_curve_target)
                         ]
                         fast_curve_values = [
                             float(value) for value in (
@@ -1044,8 +1040,8 @@ def prepare_tween_data(objs=None, attrs=None):
                             result = cmds.keyTangent(
                                 curve_target,
                                 query=True,
-                                time=(prev_f,),
                                 outTangentType=True,
+                                **curve_key_range(curve_target, prev_f)
                             )
                             prev_tan = result[0] if result else None
                     except Exception:
@@ -1175,8 +1171,8 @@ def execute(percentage):
                 cmds.keyframe(
                     target,
                     edit=True,
-                    time=(frame, frame),
                     valueChange=new_val,
+                    **curve_key_range(target, frame)
                 )
             elif target != attr_full:
                 # Edit the concrete layer curve with cmds rather than an API
@@ -1287,14 +1283,17 @@ def reset():
                 tangent_target = entry.get('curve_target') or attr_full
                 try:
                     if prev_tan == 'step':
-                        cmds.keyTangent(tangent_target, edit=True, time=(frame,),
-                                        inTangentType='auto', outTangentType='step')
+                        cmds.keyTangent(tangent_target, edit=True,
+                                        inTangentType='auto', outTangentType='step',
+                                        **curve_key_range(tangent_target, frame))
                     elif prev_tan == 'stepnext':
-                        cmds.keyTangent(tangent_target, edit=True, time=(frame,),
-                                        inTangentType='stepnext', outTangentType='auto')
+                        cmds.keyTangent(tangent_target, edit=True,
+                                        inTangentType='stepnext', outTangentType='auto',
+                                        **curve_key_range(tangent_target, frame))
                     else:
-                        cmds.keyTangent(tangent_target, edit=True, time=(frame,),
-                                        inTangentType=prev_tan, outTangentType=prev_tan)
+                        cmds.keyTangent(tangent_target, edit=True,
+                                        inTangentType=prev_tan, outTangentType=prev_tan,
+                                        **curve_key_range(tangent_target, frame))
                 except Exception:
                     pass
 
